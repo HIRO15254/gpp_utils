@@ -1,9 +1,10 @@
 use eframe::egui;
 use egui::{Color32, CornerRadius, RichText, Stroke};
-use egui_plot::{Line, Plot, PlotPoints};
+use egui_plot::{Line, LineStyle, Plot, PlotPoints};
 use rand_mt::Mt19937GenRand64;
 use std::time::Instant;
 
+use gpp_utils::experiment::BasinEvaluator;
 use gpp_utils::graph_partition::{Graph, GraphGenerationMethod, GraphPartitionProblem};
 use gpp_utils::optimization::{Problem, Solver};
 use gpp_utils::smoothing::{
@@ -154,9 +155,15 @@ impl SolverEntry {
 struct SolverResult {
     label: String,
     color: Color32,
+    /// 実スコア履歴 (iteration, real_score)
     score_history: Vec<[f64; 2]>,
+    /// 平滑化スコア履歴 (iteration, smoothed_score)。平滑化なしの場合は None。
+    smoothed_score_history: Option<Vec<[f64; 2]>>,
+    /// ベイスン評価履歴 (step, real_score)。ベスト解からの降下経路。
+    basin_history: Vec<[f64; 2]>,
     final_partition: Vec<bool>,
     best_score: f64,
+    basin_score: f64,
     elapsed_ms: f64,
 }
 
@@ -177,6 +184,10 @@ struct SolverApp {
     results: Vec<SolverResult>,
     selected_result: Option<usize>,
     status: String,
+    /// 平滑化スコアラインをプロットに表示するか
+    show_smoothed_trace: bool,
+    /// ベイスン降下ラインをプロットに表示するか
+    show_basin_trace: bool,
 }
 
 impl Default for SolverApp {
@@ -195,6 +206,8 @@ impl Default for SolverApp {
             results: Vec::new(),
             selected_result: None,
             status: "Generate a graph, add solvers, then run.".into(),
+            show_smoothed_trace: true,
+            show_basin_trace: true,
         };
         app.entries.push(SolverEntry::new(SolverKind::SA, 1));
         app.entries.push(SolverEntry::new(SolverKind::EO, 2));
@@ -293,6 +306,7 @@ fn run_entry(e: &SolverEntry, prob: &GraphPartitionProblem, seed: u64, col: Colo
     let t0 = Instant::now();
     let mut r = Mt19937GenRand64::new(seed);
     let ini = prob.random_solution(&mut r);
+    let sm_seed = seed.wrapping_add(0xDEAD_BEEF);
 
     let (sol, stats) = if e.kind == SolverKind::SQA {
         let sqa = SimulatedQuantumAnnealingSolver::new(
@@ -301,8 +315,6 @@ fn run_entry(e: &SolverEntry, prob: &GraphPartitionProblem, seed: u64, col: Colo
         );
         sqa.solve(prob, ini, seed)
     } else {
-        // RandomKSmoothing 用に solver seed とは別のシードを使用
-        let sm_seed = seed.wrapping_add(0xDEAD_BEEF);
         match e.smoothing_kind {
             SmoothingKind::None =>
                 dispatch_solver(e, prob, ini, seed, &NoSmoothing),
@@ -316,13 +328,49 @@ fn run_entry(e: &SolverEntry, prob: &GraphPartitionProblem, seed: u64, col: Colo
     };
 
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
-    let h: Vec<[f64; 2]> = stats.score_history.iter().map(|&(i, s)| [i as f64, s]).collect();
+
+    // 実スコア履歴
+    let score_h: Vec<[f64; 2]> = stats.score_history.iter()
+        .map(|&(i, s)| [i as f64, s])
+        .collect();
+
+    // 平滑化スコア履歴（平滑化ありの場合のみ）
+    let smoothed_h = if e.kind.supports_smoothing() && e.smoothing_kind != SmoothingKind::None {
+        Some(stats.smoothed_score_history.iter()
+            .map(|&(i, s)| [i as f64, s])
+            .collect::<Vec<_>>())
+    } else {
+        None
+    };
+
+    // ベイスン評価：ベスト解から平滑化ランドスケープを下降
+    let (basin_score, basin_hist) = if e.kind == SolverKind::SQA {
+        BasinEvaluator::evaluate_with_history(prob, &NoSmoothing, &sol)
+    } else {
+        match e.smoothing_kind {
+            SmoothingKind::None =>
+                BasinEvaluator::evaluate_with_history(prob, &NoSmoothing, &sol),
+            SmoothingKind::KAverage =>
+                BasinEvaluator::evaluate_with_history(prob, &KAveragingSmoothing::new(e.smoothing_k), &sol),
+            SmoothingKind::RandomKAverage =>
+                BasinEvaluator::evaluate_with_history(prob, &RandomKSmoothing::new(e.smoothing_k, sm_seed), &sol),
+            SmoothingKind::WeightedAverage =>
+                BasinEvaluator::evaluate_with_history(prob, &WeightedNeighbourSmoothing::new(e.smoothing_k), &sol),
+        }
+    };
+    let basin_h: Vec<[f64; 2]> = basin_hist.iter()
+        .map(|&(i, s)| [i as f64, s])
+        .collect();
+
     SolverResult {
         label: e.label.clone(),
         color: col,
-        score_history: h,
+        score_history: score_h,
+        smoothed_score_history: smoothed_h,
+        basin_history: basin_h,
         final_partition: sol,
         best_score: stats.best_score,
+        basin_score,
         elapsed_ms: ms,
     }
 }
@@ -571,10 +619,23 @@ impl eframe::App for SolverApp {
 
         // ---- Central panel ----
         egui::CentralPanel::default().show(ctx, |ui| {
-            let plot_h = (ui.available_height() * 0.50).max(200.0);
+            let available_h = ui.available_height();
+            let plot_h     = (available_h * 0.35).max(160.0);
+            let basin_h    = (available_h * 0.20).max(120.0);
+            let bottom_h   = available_h - plot_h - basin_h - 60.0;
+
+            // --- Score Progression plot ---
             ui.horizontal(|ui| {
                 ui.heading("Score Progression");
                 ui.label(RichText::new("(log-log)").small().weak());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.checkbox(&mut self.show_basin_trace,
+                        RichText::new("Basin").small())
+                        .on_hover_text("Show basin descent from best solution (dotted)");
+                    ui.checkbox(&mut self.show_smoothed_trace,
+                        RichText::new("Smoothed").small())
+                        .on_hover_text("Show smoothed-landscape score trace (dashed)");
+                });
             });
             Plot::new("score_plot")
                 .height(plot_h)
@@ -583,49 +644,107 @@ impl eframe::App for SolverApp {
                 .legend(egui_plot::Legend::default())
                 .show(ui, |pui| {
                     for r in &self.results {
+                        // 実スコア（実線）
                         let d: Vec<[f64; 2]> = r.score_history.iter()
                             .filter(|p| p[0] > 0.0 && p[1] > 0.0)
                             .map(|p| [p[0].log10(), p[1].log10()])
                             .collect();
-                        pui.line(Line::new(PlotPoints::new(d)).name(&r.label).color(r.color).width(2.0));
+                        pui.line(Line::new(PlotPoints::new(d))
+                            .name(&r.label)
+                            .color(r.color)
+                            .width(2.0));
+
+                        // 平滑化スコア（破線・同色・薄め）
+                        if self.show_smoothed_trace {
+                            if let Some(sh) = &r.smoothed_score_history {
+                                let ds: Vec<[f64; 2]> = sh.iter()
+                                    .filter(|p| p[0] > 0.0 && p[1] > 0.0)
+                                    .map(|p| [p[0].log10(), p[1].log10()])
+                                    .collect();
+                                let faded = Color32::from_rgba_unmultiplied(
+                                    r.color.r(), r.color.g(), r.color.b(), 140);
+                                pui.line(Line::new(PlotPoints::new(ds))
+                                    .name(format!("{} (smoothed)", r.label))
+                                    .color(faded)
+                                    .width(1.5)
+                                    .style(LineStyle::Dashed { length: 8.0 }));
+                            }
+                        }
                     }
                 });
             ui.add_space(4.0);
 
-            ui.columns(2, |cols| {
-                // Results table
-                cols[0].heading("Results");
-                if self.results.is_empty() {
-                    cols[0].colored_label(Color32::GRAY, "No results yet.");
-                } else {
-                    egui::ScrollArea::vertical().id_salt("rs").show(&mut cols[0], |ui| {
-                        egui::Grid::new("rg").striped(true).min_col_width(50.0).show(ui, |ui| {
-                            ui.label(RichText::new("Run").strong());
-                            ui.label(RichText::new("Best").strong());
-                            ui.label(RichText::new("ms").strong());
-                            ui.label("");
-                            ui.end_row();
-                            for (i, r) in self.results.iter().enumerate() {
-                                let sel = self.selected_result == Some(i);
-                                ui.colored_label(r.color, &r.label);
-                                ui.label(format!("{:.2}", r.best_score));
-                                ui.label(format!("{:.0}", r.elapsed_ms));
-                                if ui.selectable_label(
-                                    sel,
-                                    if sel { "\u{25C9}" } else { "\u{25CB}" },
-                                ).on_hover_text("Show partition").clicked() {
-                                    self.selected_result = Some(i);
-                                }
-                                ui.end_row();
-                            }
-                        });
-                    });
-                }
-
-                // Graph viz
-                cols[1].heading("Graph Partition");
-                self.draw_graph(&mut cols[1]);
+            // --- Basin Descent plot ---
+            ui.horizontal(|ui| {
+                ui.heading("Basin Descent");
+                ui.label(RichText::new("(from best solution, linear)").small().weak());
             });
+            Plot::new("basin_plot")
+                .height(basin_h)
+                .x_axis_label("Step")
+                .y_axis_label("Real Score")
+                .legend(egui_plot::Legend::default())
+                .show(ui, |pui| {
+                    for r in &self.results {
+                        if !self.show_basin_trace { break; }
+                        if r.basin_history.len() < 2 { continue; }
+                        let faded = Color32::from_rgba_unmultiplied(
+                            r.color.r(), r.color.g(), r.color.b(), 180);
+                        pui.line(Line::new(PlotPoints::new(r.basin_history.clone()))
+                            .name(format!("{} basin", r.label))
+                            .color(faded)
+                            .width(1.5)
+                            .style(LineStyle::Dotted { spacing: 6.0 }));
+                    }
+                });
+            ui.add_space(4.0);
+
+            ui.with_layout(
+                egui::Layout::left_to_right(egui::Align::TOP).with_main_wrap(false),
+                |ui| {
+                    let col_w = ui.available_width() / 2.0;
+
+                    // Results table
+                    ui.allocate_ui(egui::vec2(col_w, bottom_h), |ui| {
+                        ui.heading("Results");
+                        if self.results.is_empty() {
+                            ui.colored_label(Color32::GRAY, "No results yet.");
+                        } else {
+                            egui::ScrollArea::vertical().id_salt("rs").show(ui, |ui| {
+                                egui::Grid::new("rg").striped(true).min_col_width(45.0).show(ui, |ui| {
+                                    ui.label(RichText::new("Run").strong());
+                                    ui.label(RichText::new("Best").strong());
+                                    ui.label(RichText::new("Basin").strong())
+                                        .on_hover_text("Score at local optimum reached by HC from best solution");
+                                    ui.label(RichText::new("ms").strong());
+                                    ui.label("");
+                                    ui.end_row();
+                                    for (i, r) in self.results.iter().enumerate() {
+                                        let sel = self.selected_result == Some(i);
+                                        ui.colored_label(r.color, &r.label);
+                                        ui.label(format!("{:.2}", r.best_score));
+                                        ui.label(format!("{:.2}", r.basin_score));
+                                        ui.label(format!("{:.0}", r.elapsed_ms));
+                                        if ui.selectable_label(
+                                            sel,
+                                            if sel { "\u{25C9}" } else { "\u{25CB}" },
+                                        ).on_hover_text("Show partition").clicked() {
+                                            self.selected_result = Some(i);
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                            });
+                        }
+                    });
+
+                    // Graph viz
+                    ui.allocate_ui(egui::vec2(col_w, bottom_h), |ui| {
+                        ui.heading("Graph Partition");
+                        self.draw_graph(ui);
+                    });
+                },
+            );
         });
     }
 }

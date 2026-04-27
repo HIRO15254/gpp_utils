@@ -40,8 +40,23 @@ impl BasinEvaluator {
         smoothing: &dyn Smoothing<S>,
         solution: &S,
     ) -> f64 {
+        Self::evaluate_with_history(problem, smoothing, solution).0
+    }
+
+    /// 指定したスムージング戦略でのベイスン評価を行い、下降履歴も返す。
+    ///
+    /// # Returns
+    /// `(最終実スコア, [(ステップ, 実スコア)])` — ステップ 0 が初期解。
+    pub fn evaluate_with_history<S: Clone>(
+        problem: &dyn Problem<S>,
+        smoothing: &dyn Smoothing<S>,
+        solution: &S,
+    ) -> (f64, Vec<(usize, f64)>) {
         let mut current = solution.clone();
         let mut current_smoothed = smoothing.score(problem, &current);
+        let initial_real = problem.score(solution);
+        let mut history = vec![(0usize, initial_real)];
+        let mut step = 0usize;
 
         loop {
             let neighbours = problem.neighbour(&current);
@@ -49,29 +64,23 @@ impl BasinEvaluator {
                 break;
             }
 
-            let best_neighbour_opt = neighbours
+            let best_opt = neighbours
                 .iter()
-                .map(|n| {
-                    let smoothed = smoothing.score(problem, n);
-                    (n.clone(), smoothed)
-                })
+                .map(|n| (n.clone(), smoothing.score(problem, n)))
                 .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
 
-            match best_neighbour_opt {
-                Some((best_neighbour, best_neighbour_smoothed)) => {
-                    if best_neighbour_smoothed < current_smoothed {
-                        current = best_neighbour;
-                        current_smoothed = best_neighbour_smoothed;
-                    } else {
-                        break;
-                    }
+            match best_opt {
+                Some((next, next_smoothed)) if next_smoothed < current_smoothed => {
+                    current = next;
+                    current_smoothed = next_smoothed;
+                    step += 1;
+                    history.push((step, problem.score(&current)));
                 }
-                None => break,
+                _ => break,
             }
         }
 
-        // 実スコアで評価（smoothing ではなく）
-        problem.score(&current)
+        (problem.score(&current), history)
     }
 }
 
