@@ -110,6 +110,21 @@ impl GraphPartitionProblem {
         Self { graph }
     }
 
+    /// 幾何グラフを生成し、頂点座標と共に問題インスタンスを返す（GUI可視化用）。
+    pub fn generate_geometric_with_coords(
+        node_count: usize,
+        expected_degree: f64,
+        rng: &mut Mt19937GenRand64,
+    ) -> (Self, Vec<(f64, f64)>) {
+        let (graph, coords) = Self::generate_geometric_graph(node_count, expected_degree, rng);
+        (Self { graph }, coords)
+    }
+
+    /// 内部グラフへの参照を返す（可視化用）。
+    pub fn graph(&self) -> &Graph {
+        &self.graph
+    }
+
     /// Erdős–Rényi ランダムグラフを生成する。
     fn generate_random_graph(
         node_count: usize,
