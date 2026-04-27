@@ -6,7 +6,9 @@ use std::time::Instant;
 
 use gpp_utils::graph_partition::{Graph, GraphGenerationMethod, GraphPartitionProblem};
 use gpp_utils::optimization::{Problem, Solver};
-use gpp_utils::smoothing::{KAveragingSmoothing, NoSmoothing};
+use gpp_utils::smoothing::{
+    KAveragingSmoothing, NoSmoothing, RandomKSmoothing, WeightedNeighbourSmoothing,
+};
 use gpp_utils::solvers::{
     ExtremalOptimizationSolver, HillClimbingSolver,
     SimulatedAnnealingSolver, SimulatedQuantumAnnealingSolver,
@@ -84,13 +86,24 @@ impl SolverKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum SmoothingKind { None, KAverage }
+enum SmoothingKind { None, KAverage, RandomKAverage, WeightedAverage }
 
 impl SmoothingKind {
     fn label(self) -> &'static str {
         match self {
-            Self::None     => "None",
-            Self::KAverage => "K-Average",
+            Self::None           => "None",
+            Self::KAverage       => "K-Avg (det)",
+            Self::RandomKAverage => "K-Avg (rand)",
+            Self::WeightedAverage => "Weighted",
+        }
+    }
+
+    fn tip(self) -> &'static str {
+        match self {
+            Self::None           => "No smoothing: use raw problem score",
+            Self::KAverage       => "Deterministic: average first K neighbours (fixed order)",
+            Self::RandomKAverage => "Random: sample K neighbours; if K>|d1|, extend to distance-2",
+            Self::WeightedAverage => "Blend: (K/n)×avg_neighbours + (1-K/n)×current_score",
         }
     }
 }
@@ -219,17 +232,25 @@ fn smoothing_ui(ui: &mut egui::Ui, e: &mut SolverEntry) {
     ui.horizontal(|ui| {
         ui.label("Smoothing:");
         egui::ComboBox::from_id_salt(format!("sm_{}", e.label))
-            .width(90.0)
+            .width(105.0)
             .selected_text(e.smoothing_kind.label())
             .show_ui(ui, |ui| {
-                ui.selectable_value(&mut e.smoothing_kind, SmoothingKind::None, "None")
-                    .on_hover_text("Use raw problem score (no smoothing)");
-                ui.selectable_value(&mut e.smoothing_kind, SmoothingKind::KAverage, "K-Average")
-                    .on_hover_text("Average score over K random neighbours");
+                for kind in [
+                    SmoothingKind::None,
+                    SmoothingKind::KAverage,
+                    SmoothingKind::RandomKAverage,
+                    SmoothingKind::WeightedAverage,
+                ] {
+                    ui.selectable_value(&mut e.smoothing_kind, kind, kind.label())
+                        .on_hover_text(kind.tip());
+                }
             });
-        if e.smoothing_kind == SmoothingKind::KAverage {
-            tip_slider_usize(ui, &mut e.smoothing_k, 2..=200, "K",
-                "Number of neighbours to average", false);
+        match e.smoothing_kind {
+            SmoothingKind::KAverage | SmoothingKind::RandomKAverage | SmoothingKind::WeightedAverage => {
+                tip_slider_usize(ui, &mut e.smoothing_k, 1..=200, "K",
+                    "K: neighbour count / blend weight numerator", false);
+            }
+            SmoothingKind::None => {}
         }
     });
 }
@@ -280,9 +301,17 @@ fn run_entry(e: &SolverEntry, prob: &GraphPartitionProblem, seed: u64, col: Colo
         );
         sqa.solve(prob, ini, &mut r)
     } else {
+        // RandomKSmoothing 用に solver seed とは別のシードを使用
+        let sm_seed = seed.wrapping_add(0xDEAD_BEEF);
         match e.smoothing_kind {
-            SmoothingKind::None     => dispatch_solver(e, prob, ini, &mut r, &NoSmoothing),
-            SmoothingKind::KAverage => dispatch_solver(e, prob, ini, &mut r, &KAveragingSmoothing::new(e.smoothing_k)),
+            SmoothingKind::None =>
+                dispatch_solver(e, prob, ini, &mut r, &NoSmoothing),
+            SmoothingKind::KAverage =>
+                dispatch_solver(e, prob, ini, &mut r, &KAveragingSmoothing::new(e.smoothing_k)),
+            SmoothingKind::RandomKAverage =>
+                dispatch_solver(e, prob, ini, &mut r, &RandomKSmoothing::new(e.smoothing_k, sm_seed)),
+            SmoothingKind::WeightedAverage =>
+                dispatch_solver(e, prob, ini, &mut r, &WeightedNeighbourSmoothing::new(e.smoothing_k)),
         }
     };
 
