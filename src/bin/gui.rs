@@ -52,6 +52,7 @@ fn main() -> eframe::Result<()> {
         "GPP Experiment Runner",
         options,
         Box::new(|cc| {
+            install_cjk_font(&cc.egui_ctx);
             let mut style = (*cc.egui_ctx.style()).clone();
             style.spacing.item_spacing = egui::vec2(6.0, 4.0);
             style.spacing.slider_width = 140.0;
@@ -59,6 +60,58 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(App::new()))
         }),
     )
+}
+
+/// CJK / 記号グリフを含むシステムフォントを検出し、フォールバックとして登録する。
+/// 候補が見つからなければ何もしない（egui のデフォルトのまま）。
+fn install_cjk_font(ctx: &egui::Context) {
+    const CANDIDATES: &[&str] = &[
+        // Linux (Debian/Ubuntu)
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJKjp-Regular.otf",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/ipafont-gothic/ipag.ttf",
+        "/usr/share/fonts/opentype/ipafont-gothic/ipagp.ttf",
+        "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
+        "/usr/share/fonts/truetype/takao-gothic/TakaoGothic.ttf",
+        "/usr/share/fonts/truetype/vlgothic/VL-Gothic-Regular.ttf",
+        // macOS
+        "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        "/Library/Fonts/Arial Unicode.ttf",
+        // Windows
+        "C:/Windows/Fonts/YuGothM.ttc",
+        "C:/Windows/Fonts/meiryo.ttc",
+        "C:/Windows/Fonts/msgothic.ttc",
+    ];
+
+    let (path, bytes) = match CANDIDATES
+        .iter()
+        .find_map(|p| std::fs::read(p).ok().map(|b| (*p, b)))
+    {
+        Some(v) => v,
+        None => {
+            eprintln!(
+                "[gui] No CJK font found in known locations; falling back to default font."
+            );
+            return;
+        }
+    };
+
+    let mut fonts = egui::FontDefinitions::default();
+    fonts
+        .font_data
+        .insert("cjk_fallback".into(), egui::FontData::from_owned(bytes).into());
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts
+            .families
+            .entry(family)
+            .or_default()
+            .push("cjk_fallback".into());
+    }
+    ctx.set_fonts(fonts);
+    eprintln!("[gui] Loaded CJK font: {}", path);
 }
 
 #[derive(PartialEq, Clone, Copy)]
