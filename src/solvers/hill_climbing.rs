@@ -4,7 +4,6 @@
 //! 局所最適解を探索する。
 
 use crate::optimization::{Problem, Smoothing, Solver, SolverStats};
-use rand_mt::Mt19937GenRand64;
 
 /// 山登り法ソルバー。
 ///
@@ -42,15 +41,17 @@ impl Solver for HillClimbingSolver {
         problem: &dyn Problem<S>,
         smoothing: &dyn Smoothing<S>,
         initial: S,
-        _rng: &mut Mt19937GenRand64,
+        _seed: u64,
     ) -> (S, SolverStats) {
         let mut current = initial.clone();
         let mut current_smoothed = smoothing.score(problem, &current);
         let initial_score = problem.score(&current);
         let mut best = current.clone();
         let mut best_score = initial_score;
+        let mut best_smoothed = current_smoothed;
         let mut iterations = 0;
         let mut score_history = vec![(0, best_score)];
+        let mut smoothed_score_history = vec![(0, best_smoothed)];
 
         loop {
             // すべての近傍を評価
@@ -81,6 +82,7 @@ impl Solver for HillClimbingSolver {
                         if real_score < best_score {
                             best = current.clone();
                             best_score = real_score;
+                            best_smoothed = current_smoothed;
                         }
 
                         // ログ出力
@@ -96,6 +98,7 @@ impl Solver for HillClimbingSolver {
                         // 履歴記録
                         if iterations % 10 == 0 || iterations < 100 {
                             score_history.push((iterations, best_score));
+                            smoothed_score_history.push((iterations, best_smoothed));
                         }
                     } else {
                         // 改善しなかった → 終了
@@ -107,6 +110,7 @@ impl Solver for HillClimbingSolver {
         }
 
         score_history.push((iterations, best_score));
+        smoothed_score_history.push((iterations, best_smoothed));
 
         let stats = SolverStats {
             iterations_completed: iterations,
@@ -116,6 +120,7 @@ impl Solver for HillClimbingSolver {
             accepted_moves: iterations,
             rejected_moves: 0,
             score_history,
+            smoothed_score_history,
         };
 
         (best, stats)
@@ -127,6 +132,7 @@ mod tests {
     use super::*;
     use crate::graph_partition::GraphPartitionProblem;
     use crate::smoothing::NoSmoothing;
+    use rand_mt::Mt19937GenRand64;
 
     #[test]
     fn test_hill_climbing_simple_graph() {
@@ -141,16 +147,17 @@ mod tests {
 
         let solver = HillClimbingSolver::new();
         let smoothing = NoSmoothing;
-        let mut rng = Mt19937GenRand64::new(42);
 
-        let (solution, stats) = solver.solve(&problem, &smoothing, initial.clone(), &mut rng);
+        let (solution, stats) = solver.solve(&problem, &smoothing, initial.clone(), 42);
 
         // Best score should be <= initial score
         assert!(stats.best_score <= stats.initial_score + 1e-10);
         // Solution should be valid
         assert_eq!(solution.len(), 4);
-        // Some iterations should have been made
-        assert!(stats.iterations_completed >= 0);
+        // Some iterations may have been made (not guaranteed for deterministic problems)
+        assert!(stats.iterations_completed <= 1000);
+        // Smoothed score history should be populated
+        assert!(!stats.smoothed_score_history.is_empty());
     }
 
     #[test]
@@ -164,9 +171,8 @@ mod tests {
 
         let solver = HillClimbingSolver::new();
         let smoothing = NoSmoothing;
-        let mut rng = Mt19937GenRand64::new(42);
 
-        let (_solution, stats) = solver.solve(&problem, &smoothing, initial, &mut rng);
+        let (_solution, stats) = solver.solve(&problem, &smoothing, initial, 42);
 
         // Should have made at least one improvement
         assert!(stats.best_score < stats.initial_score + 1e-10);
@@ -183,18 +189,16 @@ mod tests {
         let problem = GraphPartitionProblem::generate(method.clone(), &mut rng1);
 
         let initial1 = problem.random_solution(&mut Mt19937GenRand64::new(100));
-        let mut rng = Mt19937GenRand64::new(200);
         let (sol1, stats1) = HillClimbingSolver::new().solve(
             &problem,
             &NoSmoothing,
             initial1.clone(),
-            &mut rng,
+            200,
         );
 
         let initial2 = initial1.clone();
-        let mut rng = Mt19937GenRand64::new(200);
         let (sol2, stats2) =
-            HillClimbingSolver::new().solve(&problem, &NoSmoothing, initial2, &mut rng);
+            HillClimbingSolver::new().solve(&problem, &NoSmoothing, initial2, 200);
 
         // Same seed should give same result
         assert_eq!(sol1, sol2);

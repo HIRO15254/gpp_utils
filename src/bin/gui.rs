@@ -299,19 +299,19 @@ fn run_entry(e: &SolverEntry, prob: &GraphPartitionProblem, seed: u64, col: Colo
             e.sqa_replicas, e.sqa_temperature,
             e.sqa_gamma_init, e.sqa_gamma_final, e.sqa_steps,
         );
-        sqa.solve(prob, ini, &mut r)
+        sqa.solve(prob, ini, seed)
     } else {
         // RandomKSmoothing 用に solver seed とは別のシードを使用
         let sm_seed = seed.wrapping_add(0xDEAD_BEEF);
         match e.smoothing_kind {
             SmoothingKind::None =>
-                dispatch_solver(e, prob, ini, &mut r, &NoSmoothing),
+                dispatch_solver(e, prob, ini, seed, &NoSmoothing),
             SmoothingKind::KAverage =>
-                dispatch_solver(e, prob, ini, &mut r, &KAveragingSmoothing::new(e.smoothing_k)),
+                dispatch_solver(e, prob, ini, seed, &KAveragingSmoothing::new(e.smoothing_k)),
             SmoothingKind::RandomKAverage =>
-                dispatch_solver(e, prob, ini, &mut r, &RandomKSmoothing::new(e.smoothing_k, sm_seed)),
+                dispatch_solver(e, prob, ini, seed, &RandomKSmoothing::new(e.smoothing_k, sm_seed)),
             SmoothingKind::WeightedAverage =>
-                dispatch_solver(e, prob, ini, &mut r, &WeightedNeighbourSmoothing::new(e.smoothing_k)),
+                dispatch_solver(e, prob, ini, seed, &WeightedNeighbourSmoothing::new(e.smoothing_k)),
         }
     };
 
@@ -331,18 +331,18 @@ fn dispatch_solver<Sm>(
     e: &SolverEntry,
     prob: &GraphPartitionProblem,
     ini: Vec<bool>,
-    r: &mut Mt19937GenRand64,
+    seed: u64,
     smoothing: &Sm,
 ) -> (Vec<bool>, gpp_utils::optimization::SolverStats)
 where
     Sm: gpp_utils::optimization::Smoothing<Vec<bool>>,
 {
     match e.kind {
-        SolverKind::HC => HillClimbingSolver::new().solve(prob, smoothing, ini, r),
+        SolverKind::HC => HillClimbingSolver::new().solve(prob, smoothing, ini, seed),
         SolverKind::SA => SimulatedAnnealingSolver::new(e.sa_temperature, e.sa_iterations)
-            .solve(prob, smoothing, ini, r),
+            .solve(prob, smoothing, ini, seed),
         SolverKind::EO => ExtremalOptimizationSolver::new(Some(e.eo_tau), e.eo_iterations)
-            .solve(prob, smoothing, ini, r),
+            .solve(prob, smoothing, ini, seed),
         SolverKind::SQA => unreachable!("SQA is handled separately"),
     }
 }

@@ -36,8 +36,7 @@ fn main() {
     {
         println!("【戦略 1】スムージングなし");
         let smoothing = NoSmoothing;
-        let mut rng = Mt19937GenRand64::new(42);
-        let (_solution, stats) = solver.solve(&problem, &smoothing, initial.clone(), &mut rng);
+        let (_solution, stats) = solver.solve(&problem, &smoothing, initial.clone(), 42);
 
         println!("  最初のスコア:     {:.2}", stats.initial_score);
         println!("  最終スコア:       {:.2}", stats.final_score);
@@ -53,8 +52,7 @@ fn main() {
     {
         println!("【戦略 2】K=5 近傍平均");
         let smoothing = KAveragingSmoothing::new(5);
-        let mut rng = Mt19937GenRand64::new(42);
-        let (_solution, stats) = solver.solve(&problem, &smoothing, initial.clone(), &mut rng);
+        let (_solution, stats) = solver.solve(&problem, &smoothing, initial.clone(), 42);
 
         println!("  最初のスコア:     {:.2}", stats.initial_score);
         println!("  最終スコア:       {:.2}", stats.final_score);
@@ -70,8 +68,7 @@ fn main() {
     {
         println!("【戦略 3】K=10 近傍平均");
         let smoothing = KAveragingSmoothing::new(10);
-        let mut rng = Mt19937GenRand64::new(42);
-        let (_solution, stats) = solver.solve(&problem, &smoothing, initial.clone(), &mut rng);
+        let (_solution, stats) = solver.solve(&problem, &smoothing, initial.clone(), 42);
 
         println!("  最初のスコア:     {:.2}", stats.initial_score);
         println!("  最終スコア:       {:.2}", stats.final_score);
@@ -87,8 +84,7 @@ fn main() {
     {
         println!("【戦略 4】全近傍平均（決定論的）");
         let smoothing = AllNeighbourAveragingSmoothing;
-        let mut rng = Mt19937GenRand64::new(42);
-        let (_solution, stats) = solver.solve(&problem, &smoothing, initial.clone(), &mut rng);
+        let (_solution, stats) = solver.solve(&problem, &smoothing, initial.clone(), 42);
 
         println!("  最初のスコア:     {:.2}", stats.initial_score);
         println!("  最終スコア:       {:.2}", stats.final_score);

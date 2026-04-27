@@ -56,12 +56,18 @@ impl SimulatedQuantumAnnealingSolver {
     ///
     /// レプリカは `problem.random_solution()` で初期化される。
     /// 横磁場 Γ は `gamma_init` から `gamma_final` へ指数的に減衰する。
+    ///
+    /// # Arguments
+    /// - `problem`: 最適化問題
+    /// - `initial`: 初期解
+    /// - `seed`: 乱数生成用シード
     pub fn solve(
         &self,
         problem: &dyn Problem<Vec<bool>>,
         initial: Vec<bool>,
-        rng: &mut Mt19937GenRand64,
+        seed: u64,
     ) -> (Vec<bool>, SolverStats) {
+        let mut rng = Mt19937GenRand64::new(seed);
         let p = self.num_replicas;
         let n = initial.len();
         let t = self.temperature;
@@ -72,7 +78,7 @@ impl SimulatedQuantumAnnealingSolver {
 
         // レプリカをランダム初期化
         let mut replicas: Vec<Vec<bool>> = (0..p)
-            .map(|_| problem.random_solution(rng))
+            .map(|_| problem.random_solution(&mut rng))
             .collect();
         let mut scores: Vec<f64> = replicas.iter().map(|r| problem.score(r)).collect();
 
@@ -92,6 +98,7 @@ impl SimulatedQuantumAnnealingSolver {
         let mut accepted = 0usize;
         let mut rejected = 0usize;
         let mut score_history = vec![(0, best_score)];
+        let mut smoothed_score_history = vec![(0, best_score)]; // SQA は平滑化なしで実スコア = 平滑化スコア
         let record_interval = (self.max_steps / 100).max(1);
 
         for step in 0..self.max_steps {
@@ -158,6 +165,7 @@ impl SimulatedQuantumAnnealingSolver {
 
             if step % record_interval == 0 {
                 score_history.push((step, best_score));
+                smoothed_score_history.push((step, best_score));
             }
 
             if let Some(log_int) = self.log_interval {
@@ -172,6 +180,7 @@ impl SimulatedQuantumAnnealingSolver {
         }
 
         score_history.push((self.max_steps, best_score));
+        smoothed_score_history.push((self.max_steps, best_score));
 
         let final_score = scores.iter().cloned().fold(f64::INFINITY, f64::min);
 
@@ -183,6 +192,7 @@ impl SimulatedQuantumAnnealingSolver {
             accepted_moves: accepted,
             rejected_moves: rejected,
             score_history,
+            smoothed_score_history,
         };
 
         (best, stats)
@@ -204,13 +214,13 @@ mod tests {
         let problem = GraphPartitionProblem::new(graph);
         let initial = vec![true, true, false, false];
         let solver = SimulatedQuantumAnnealingSolver::new(4, 0.1, 5.0, 0.01, 100);
-        let mut rng = Mt19937GenRand64::new(42);
 
-        let (_sol, stats) = solver.solve(&problem, initial, &mut rng);
+        let (_sol, stats) = solver.solve(&problem, initial, 42);
 
         assert!(stats.best_score.is_finite());
         assert_eq!(stats.iterations_completed, 100);
         assert!(stats.accepted_moves + stats.rejected_moves > 0);
+        assert!(!stats.smoothed_score_history.is_empty());
     }
 
     #[test]
@@ -225,8 +235,8 @@ mod tests {
         let initial = vec![true, false, true, false, true, false];
         let solver = SimulatedQuantumAnnealingSolver::new(4, 0.1, 3.0, 0.01, 50);
 
-        let (sol1, stats1) = solver.solve(&problem, initial.clone(), &mut Mt19937GenRand64::new(77));
-        let (sol2, stats2) = solver.solve(&problem, initial, &mut Mt19937GenRand64::new(77));
+        let (sol1, stats1) = solver.solve(&problem, initial.clone(), 77);
+        let (sol2, stats2) = solver.solve(&problem, initial, 77);
 
         assert_eq!(sol1, sol2);
         assert_eq!(stats1.best_score, stats2.best_score);

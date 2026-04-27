@@ -46,8 +46,11 @@ impl Solver for ExtremalOptimizationSolver {
         problem: &dyn Problem<S>,
         smoothing: &dyn Smoothing<S>,
         initial: S,
-        rng: &mut Mt19937GenRand64,
+        seed: u64,
     ) -> (S, SolverStats) {
+        let mut rng = Mt19937GenRand64::new(seed);
+        let mut _smoothing_rng = Mt19937GenRand64::new(seed ^ 0xAAAAAAAAAAAAAAAA);
+
         let initial_score = problem.score(&initial);
 
         // n = 近傍数（= 構成要素数）を初期解から取得
@@ -65,6 +68,7 @@ impl Solver for ExtremalOptimizationSolver {
                     accepted_moves: 0,
                     rejected_moves: 0,
                     score_history: vec![(0, initial_score)],
+                    smoothed_score_history: vec![(0, initial_score)],
                 },
             );
         }
@@ -76,8 +80,10 @@ impl Solver for ExtremalOptimizationSolver {
         let mut current_smoothed = smoothing.score(problem, &current);
         let mut best = current.clone();
         let mut best_score = initial_score;
+        let mut best_smoothed = current_smoothed;
 
         let mut score_history = vec![(0, best_score)];
+        let mut smoothed_score_history = vec![(0, best_smoothed)];
         let record_interval = (self.max_iterations / 100).max(1);
 
         for iteration in 0..self.max_iterations {
@@ -112,10 +118,12 @@ impl Solver for ExtremalOptimizationSolver {
             if real_score < best_score {
                 best = current.clone();
                 best_score = real_score;
+                best_smoothed = current_smoothed;
             }
 
             if iteration % record_interval == 0 {
                 score_history.push((iteration, best_score));
+                smoothed_score_history.push((iteration, best_smoothed));
             }
 
             if let Some(log_int) = self.log_interval {
@@ -129,6 +137,7 @@ impl Solver for ExtremalOptimizationSolver {
         }
 
         score_history.push((self.max_iterations, best_score));
+        smoothed_score_history.push((self.max_iterations, best_smoothed));
 
         let stats = SolverStats {
             iterations_completed: self.max_iterations,
@@ -138,6 +147,7 @@ impl Solver for ExtremalOptimizationSolver {
             accepted_moves: self.max_iterations, // EO は常に受理
             rejected_moves: 0,
             score_history,
+            smoothed_score_history,
         };
 
         (best, stats)
@@ -186,12 +196,12 @@ mod tests {
         let initial = vec![true, false, true, false];
         let solver = ExtremalOptimizationSolver::new(None, 2_000);
         let smoothing = NoSmoothing;
-        let mut rng = Mt19937GenRand64::new(42);
 
-        let (_sol, stats) = solver.solve(&problem, &smoothing, initial, &mut rng);
+        let (_sol, stats) = solver.solve(&problem, &smoothing, initial, 42);
 
         assert!(stats.best_score <= stats.initial_score + 1e-10);
         assert_eq!(stats.iterations_completed, 2_000);
+        assert!(!stats.smoothed_score_history.is_empty());
     }
 
     #[test]
@@ -209,8 +219,8 @@ mod tests {
         let solver = ExtremalOptimizationSolver::new(Some(1.5), 500);
         let smoothing = NoSmoothing;
 
-        let (sol1, stats1) = solver.solve(&problem, &smoothing, initial.clone(), &mut Mt19937GenRand64::new(123));
-        let (sol2, stats2) = solver.solve(&problem, &smoothing, initial, &mut Mt19937GenRand64::new(123));
+        let (sol1, stats1) = solver.solve(&problem, &smoothing, initial.clone(), 123);
+        let (sol2, stats2) = solver.solve(&problem, &smoothing, initial, 123);
 
         assert_eq!(sol1, sol2);
         assert_eq!(stats1.best_score, stats2.best_score);

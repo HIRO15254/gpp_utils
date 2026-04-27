@@ -46,17 +46,22 @@ impl Solver for SimulatedAnnealingSolver {
         problem: &dyn Problem<S>,
         smoothing: &dyn Smoothing<S>,
         initial: S,
-        rng: &mut Mt19937GenRand64,
+        seed: u64,
     ) -> (S, SolverStats) {
+        let mut rng = Mt19937GenRand64::new(seed);
+        let mut _smoothing_rng = Mt19937GenRand64::new(seed ^ 0xAAAAAAAAAAAAAAAA);
+
         let mut current = initial.clone();
         let mut current_smoothed = smoothing.score(problem, &current);
         let initial_score = problem.score(&current);
         let mut best = current.clone();
         let mut best_score = initial_score;
+        let mut best_smoothed = current_smoothed;
 
         let mut accepted = 0usize;
         let mut rejected = 0usize;
         let mut score_history = vec![(0, best_score)];
+        let mut smoothed_score_history = vec![(0, best_smoothed)];
         let record_interval = (self.max_iterations / 100).max(1);
 
         for iteration in 0..self.max_iterations {
@@ -86,6 +91,7 @@ impl Solver for SimulatedAnnealingSolver {
                 if real_score < best_score {
                     best = current.clone();
                     best_score = real_score;
+                    best_smoothed = current_smoothed;
                 }
             } else {
                 rejected += 1;
@@ -93,6 +99,7 @@ impl Solver for SimulatedAnnealingSolver {
 
             if iteration % record_interval == 0 {
                 score_history.push((iteration, best_score));
+                smoothed_score_history.push((iteration, best_smoothed));
             }
 
             if let Some(log_int) = self.log_interval {
@@ -106,6 +113,7 @@ impl Solver for SimulatedAnnealingSolver {
         }
 
         score_history.push((self.max_iterations, best_score));
+        smoothed_score_history.push((self.max_iterations, best_smoothed));
 
         let stats = SolverStats {
             iterations_completed: self.max_iterations,
@@ -115,6 +123,7 @@ impl Solver for SimulatedAnnealingSolver {
             accepted_moves: accepted,
             rejected_moves: rejected,
             score_history,
+            smoothed_score_history,
         };
 
         (best, stats)
@@ -139,13 +148,13 @@ mod tests {
         let initial = vec![true, true, false, false];
         let solver = SimulatedAnnealingSolver::new(5.0, 1_000);
         let smoothing = NoSmoothing;
-        let mut rng = Mt19937GenRand64::new(42);
 
-        let (_sol, stats) = solver.solve(&problem, &smoothing, initial.clone(), &mut rng);
+        let (_sol, stats) = solver.solve(&problem, &smoothing, initial.clone(), 42);
 
         assert!(stats.best_score <= stats.initial_score + 1e-10);
         assert_eq!(stats.iterations_completed, 1_000);
         assert!(stats.accepted_moves + stats.rejected_moves > 0);
+        assert!(!stats.smoothed_score_history.is_empty());
     }
 
     #[test]
@@ -159,8 +168,8 @@ mod tests {
         let solver = SimulatedAnnealingSolver::new(3.0, 500);
         let smoothing = NoSmoothing;
 
-        let (sol1, stats1) = solver.solve(&problem, &smoothing, initial.clone(), &mut Mt19937GenRand64::new(99));
-        let (sol2, stats2) = solver.solve(&problem, &smoothing, initial.clone(), &mut Mt19937GenRand64::new(99));
+        let (sol1, stats1) = solver.solve(&problem, &smoothing, initial.clone(), 99);
+        let (sol2, stats2) = solver.solve(&problem, &smoothing, initial.clone(), 99);
 
         assert_eq!(sol1, sol2);
         assert_eq!(stats1.best_score, stats2.best_score);

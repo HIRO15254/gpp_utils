@@ -51,8 +51,10 @@ pub struct SolverStats {
     pub accepted_moves: usize,
     /// 拒否された移動回数。
     pub rejected_moves: usize,
-    /// スコア履歴 [(反復, 最良スコア)]。
+    /// スコア履歴 [(反復, 最良実スコア)]。
     pub score_history: Vec<(usize, f64)>,
+    /// 平滑化スコア履歴 [(反復, 最良平滑化スコア)]（平滑化なしの場合は score_history と同じ）。
+    pub smoothed_score_history: Vec<(usize, f64)>,
 }
 
 /// 探索戦略（ソルバー）。
@@ -65,13 +67,13 @@ pub trait Solver: Send + Sync {
     /// - `problem`: 最適化問題
     /// - `smoothing`: スコア計算方法
     /// - `initial`: 初期解
-    /// - `rng`: 乱数生成器
+    /// - `seed`: 乱数生成用シード。ソルバーは別途平滑化用シード（seed ^ 0xAAAAAAAAAAAAAAAA）を使用する。
     fn solve<S: Clone>(
         &self,
         problem: &dyn Problem<S>,
         smoothing: &dyn Smoothing<S>,
         initial: S,
-        rng: &mut Mt19937GenRand64,
+        seed: u64,
     ) -> (S, SolverStats);
 }
 
