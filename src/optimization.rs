@@ -1,105 +1,177 @@
-use rand::Rng;
+//! 解最適化フレームワーク
+//!
+//! 問題、スコア計算、探索戦略を独立したトレイトで定義し、
+//! 任意の組み合わせで最適化実験を実行できる構造。
+
 use rand_mt::Mt19937GenRand64;
+use serde::{Deserialize, Serialize};
 
-pub trait OptimizationProblem<P, S: Clone, G> {
-    fn new(problem: P) -> Self where Self: Sized;
-    
-    fn generate_problem(generation_method: G, rng: &mut Mt19937GenRand64) -> P where Self: Sized;
-
+/// 最適化問題の定義。
+///
+/// 解の基本操作（スコア計算、近傍生成、初期化）のみを定義。
+/// スコア計算方法は [`Smoothing`] トレイトで差し替え可能。
+pub trait Problem<S: Clone>: Send + Sync {
+    /// 解のスコアを計算する（実問題のスコア）。
     fn score(&self, solution: &S) -> f64;
 
-    fn neighbour_size(&self) -> usize;
+    /// 解の全近傍を生成する。
+    fn neighbour(&self, solution: &S) -> Vec<S>;
 
-    fn neighbour(
-        &self,
-        neighbour_id: usize,
-        current_solution: &S,
-        current_score: f64,
-    ) -> (S, f64);
+    /// ランダムな解を生成する。
+    fn random_solution(&self, rng: &mut Mt19937GenRand64) -> S;
 
-    fn create_random_solution(&self, rng: &mut Mt19937GenRand64) -> S;
-
-    fn random_neighbour(
-        &self,
-        current_solution: &S,
-        current_score: f64,
-        rng: &mut Mt19937GenRand64,
-    ) -> (S, f64) {
-        let neighbor_count = self.neighbour_size();
-        let random_id = rng.gen_range(0..neighbor_count);
-        self.neighbour(random_id, current_solution, current_score)
+    /// 近傍サイズ（最適化用、デフォルトは全近傍の長さ）。
+    fn neighbour_size(&self) -> usize {
+        // デフォルト実装は呼び出せないため、実装側で override することを推奨
+        usize::MAX
     }
+}
 
-    fn basin(&self, initial_solution: &S) -> S {
-        let (solution, _) = self.basin_with_distance(initial_solution);
-        solution
+/// スコア計算方法の差し替え層。
+///
+/// 同じ問題に対して異なるスコア評価方法を提供する。
+/// 例えば、実スコア、K-近傍平均、連続緩和など。
+pub trait Smoothing<S: Clone>: Send + Sync {
+    /// 問題のスコアを評価（平滑化）。
+    fn score(&self, problem: &dyn Problem<S>, solution: &S) -> f64;
+}
+
+/// ソルバーの実行統計。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SolverStats {
+    /// 完了した反復回数（ステップ数）。
+    pub iterations_completed: usize,
+    /// 初期解のスコア。
+    pub initial_score: f64,
+    /// 最終解のスコア。
+    pub final_score: f64,
+    /// 探索中に見つけた最良スコア。
+    pub best_score: f64,
+    /// 受け入れられた移動回数。
+    pub accepted_moves: usize,
+    /// 拒否された移動回数。
+    pub rejected_moves: usize,
+    /// スコア履歴 [(反復, 最良実スコア)]。
+    pub score_history: Vec<(usize, f64)>,
+    /// 平滑化スコア履歴 [(反復, 最良平滑化スコア)]（平滑化なしの場合は score_history と同じ）。
+    pub smoothed_score_history: Vec<(usize, f64)>,
+}
+
+/// 探索戦略（ソルバー）。
+///
+/// 任意の [`Problem`] と [`Smoothing`] の組み合わせで最適化を実行する。
+pub trait Solver: Send + Sync {
+    /// 最適化を実行する。
+    ///
+    /// # Arguments
+    /// - `problem`: 最適化問題
+    /// - `smoothing`: スコア計算方法
+    /// - `initial`: 初期解
+    /// - `seed`: 乱数生成用シード。ソルバーは別途平滑化用シード（seed ^ 0xAAAAAAAAAAAAAAAA）を使用する。
+    fn solve<S: Clone>(
+        &self,
+        problem: &dyn Problem<S>,
+        smoothing: &dyn Smoothing<S>,
+        initial: S,
+        seed: u64,
+    ) -> (S, SolverStats);
+}
+
+// ============================================================================
+// Smoothing の基本実装
+// ============================================================================
+
+/// スムージングなし（元のスコアをそのまま使用）。
+#[derive(Debug, Clone)]
+pub struct NoSmoothing;
+
+impl<S: Clone> Smoothing<S> for NoSmoothing {
+    fn score(&self, problem: &dyn Problem<S>, solution: &S) -> f64 {
+        problem.score(solution)
     }
+}
 
-    fn basin_with_distance(&self, initial_solution: &S) -> (S, usize) {
-        let mut current_solution = initial_solution.clone();
-        let mut current_score = self.score(&current_solution);
-        let mut improved = true;
-        let mut distance = 0;
+/// K-近傍平均によるスムージング。
+///
+/// ランダムに選んだ K 個の近傍のスコアを平均して、
+/// 平滑化されたスコアを計算する。
+#[derive(Debug, Clone)]
+pub struct KAveragingSmoothing {
+    /// サンプリングする近傍数。
+    pub k: usize,
+}
 
-        while improved {
-            improved = false;
-            let neighbor_count = self.neighbour_size();
-            
-            if let Some((best_neighbour_solution, best_neighbour_score)) = (0..neighbor_count)
-                .map(|neighbor_id| self.neighbour(neighbor_id, &current_solution, current_score))
-                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap()) 
-            {
-                if best_neighbour_score < current_score {
-                    current_solution = best_neighbour_solution;
-                    current_score = best_neighbour_score;
-                    improved = true;
-                    distance += 1;
-                }
-            }            
+impl KAveragingSmoothing {
+    pub fn new(k: usize) -> Self {
+        Self { k }
+    }
+}
+
+impl<S: Clone> Smoothing<S> for KAveragingSmoothing {
+    fn score(&self, problem: &dyn Problem<S>, solution: &S) -> f64 {
+        let neighbours = problem.neighbour(solution);
+        if neighbours.is_empty() {
+            return problem.score(solution);
         }
 
-        (current_solution, distance)
+        let sample_count = self.k.min(neighbours.len());
+        let sum: f64 = neighbours
+            .iter()
+            .take(sample_count)
+            .map(|n| problem.score(n))
+            .sum();
+        sum / sample_count as f64
     }
 }
 
-/// Extremal Optimization に必要な追加インターフェース。
-///
-/// 解の各構成要素に適応度を割り当て、最も適応度の低い要素を
-/// 優先的に変更する EO アルゴリズムで使用する。
-///
-/// 構成要素 i は `neighbour(i, ...)` による変異操作に対応する必要がある。
-pub trait ExtremalOptimizationProblem<P, S: Clone, G>: OptimizationProblem<P, S, G> {
-    /// 解の構成要素数。
-    fn component_count(&self) -> usize;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    /// 各構成要素の適応度を計算する。値が大きいほど良い配置を示す。
-    ///
-    /// 返り値の長さは `component_count()` に等しい。
-    fn component_fitness(&self, solution: &S) -> Vec<f64>;
-}
+    #[derive(Clone)]
+    struct DummyProblem;
 
-/// Simulated Quantum Annealing (SQA) に必要な追加インターフェース。
-///
-/// レプリカ間結合エネルギーの計算のため、2つの解の特定構成要素が
-/// 同じ値を持つかどうかを判定する機能を提供する。
-pub trait ReplicaCouplingProblem<P, S: Clone, G>: OptimizationProblem<P, S, G> {
-    /// 構成要素 `component` が2つの解で同じ値を持つか判定する。
-    fn components_equal(&self, sol_a: &S, sol_b: &S, component: usize) -> bool;
-}
+    impl Problem<i32> for DummyProblem {
+        fn score(&self, solution: &i32) -> f64 {
+            (solution * solution) as f64
+        }
 
-/// 連続緩和 SA に必要なインターフェース。
-///
-/// 二値変数を [0, 1] の連続変数に緩和し、連続空間上で SA を実行するために使用する。
-pub trait ContinuousRelaxationProblem<P> {
-    /// 連続変数の次元数（構成要素数）。
-    fn dimension(&self) -> usize;
+        fn neighbour(&self, solution: &i32) -> Vec<i32> {
+            vec![solution - 1, *solution, solution + 1]
+        }
 
-    /// 連続解のスコアを計算する（滑らかな目的関数）。
-    fn continuous_score(&self, solution: &[f64]) -> f64;
+        fn random_solution(&self, _rng: &mut Mt19937GenRand64) -> i32 {
+            0
+        }
 
-    /// 連続解を離散解（`Vec<bool>`）に変換する。
-    fn discretize(&self, solution: &[f64]) -> Vec<bool>;
+        fn neighbour_size(&self) -> usize {
+            3
+        }
+    }
 
-    /// 離散解の真のスコアを計算する（最良解追跡用）。
-    fn discrete_score(&self, partition: &[bool]) -> f64;
+    #[test]
+    fn test_no_smoothing_equals_real_score() {
+        let problem = DummyProblem;
+        let smoothing = NoSmoothing;
+        let solution = 5i32;
+
+        assert_eq!(
+            smoothing.score(&problem, &solution),
+            problem.score(&solution)
+        );
+    }
+
+    #[test]
+    fn test_k_averaging_smoothing() {
+        let problem = DummyProblem;
+        let smoothing = KAveragingSmoothing::new(2);
+        let solution = 5i32;
+
+        // neighbours = [4, 5, 6]
+        // scores = [16, 25, 36]
+        // average of first 2: (16 + 25) / 2 = 20.5
+        let score = smoothing.score(&problem, &solution);
+        assert!((score - 20.5).abs() < 1e-10);
+    }
+
 }

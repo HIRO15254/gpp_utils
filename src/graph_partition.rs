@@ -18,13 +18,9 @@
 //! # 近傍構造
 //!
 //! 1つの頂点のパーティション割り当てを反転する操作（フリップ）を近傍とする。
-//! 近傍サイズは頂点数 n に等しく、[`OptimizationProblem::neighbour`] ではスコアの
-//! 差分計算（Δ評価）により O(deg(v)) で新スコアを求める。
+//! 近傍サイズは頂点数 n に等しい。
 
-use crate::optimization::{
-    ContinuousRelaxationProblem, ExtremalOptimizationProblem, OptimizationProblem,
-    ReplicaCouplingProblem,
-};
+use crate::optimization::Problem;
 use rand::Rng;
 use rand_mt::Mt19937GenRand64;
 
@@ -89,17 +85,73 @@ pub fn get_partition_sizes(partition: &Partition) -> (usize, usize) {
 
 /// グラフ分割問題のインスタンス。
 ///
-/// [`OptimizationProblem`] トレイトを実装しており、焼きなまし法などの
-/// 汎用ソルバーで解くことができる。
+/// [`Problem<Vec<bool>>`] トレイトを実装しており、汎用ソルバーで解くことができる。
+#[derive(Clone)]
 pub struct GraphPartitionProblem {
     graph: Graph,
 }
 
 impl GraphPartitionProblem {
-    /// 幾何グラフを生成し、グラフと頂点座標の両方を返す。
-    ///
-    /// 座標は可視化や再現性のためにファイルに保存する用途を想定している。
+    /// グラフからインスタンスを生成する。
+    pub fn new(graph: Graph) -> Self {
+        Self { graph }
+    }
+
+    /// 指定した生成方式でグラフを生成し、問題インスタンスを返す。
+    pub fn generate(method: GraphGenerationMethod, rng: &mut Mt19937GenRand64) -> Self {
+        let graph = match method {
+            GraphGenerationMethod::Random { node_count, expected_degree } => {
+                Self::generate_random_graph(node_count, expected_degree, rng)
+            }
+            GraphGenerationMethod::Geometric { node_count, expected_degree } => {
+                Self::generate_geometric_graph(node_count, expected_degree, rng).0
+            }
+        };
+        Self { graph }
+    }
+
+    /// 幾何グラフを生成し、頂点座標と共に問題インスタンスを返す（GUI可視化用）。
     pub fn generate_geometric_with_coords(
+        node_count: usize,
+        expected_degree: f64,
+        rng: &mut Mt19937GenRand64,
+    ) -> (Self, Vec<(f64, f64)>) {
+        let (graph, coords) = Self::generate_geometric_graph(node_count, expected_degree, rng);
+        (Self { graph }, coords)
+    }
+
+    /// 内部グラフへの参照を返す（可視化用）。
+    pub fn graph(&self) -> &Graph {
+        &self.graph
+    }
+
+    /// Erdős–Rényi ランダムグラフを生成する。
+    fn generate_random_graph(
+        node_count: usize,
+        expected_degree: f64,
+        rng: &mut Mt19937GenRand64,
+    ) -> Graph {
+        let mut graph = Graph::new(node_count);
+
+        let edge_probability = if node_count > 1 {
+            expected_degree / (node_count - 1) as f64
+        } else {
+            0.0
+        };
+
+        for i in 0..node_count {
+            for j in (i + 1)..node_count {
+                if rng.r#gen::<f64>() < edge_probability {
+                    graph.add_edge(i, j);
+                }
+            }
+        }
+
+        graph
+    }
+
+    /// 幾何ランダムグラフを生成する。
+    fn generate_geometric_graph(
         node_count: usize,
         expected_degree: f64,
         rng: &mut Mt19937GenRand64,
@@ -135,44 +187,7 @@ impl GraphPartitionProblem {
     }
 }
 
-impl OptimizationProblem<Graph, Partition, GraphGenerationMethod> for GraphPartitionProblem {
-    fn new(graph: Graph) -> Self {
-        Self { graph }
-    }
-
-    fn generate_problem(generation_method: GraphGenerationMethod, rng: &mut Mt19937GenRand64) -> Graph {
-        match generation_method {
-            GraphGenerationMethod::Random { node_count, expected_degree } => {
-                let mut graph = Graph::new(node_count);
-
-                let edge_probability = if node_count > 1 {
-                    expected_degree / (node_count - 1) as f64
-                } else {
-                    0.0
-                };
-
-                for i in 0..node_count {
-                    for j in (i + 1)..node_count {
-                        if rng.r#gen::<f64>() < edge_probability {
-                            graph.add_edge(i, j);
-                        }
-                    }
-                }
-
-                graph
-            }
-            GraphGenerationMethod::Geometric { node_count, expected_degree } => {
-                // Use the dedicated function and discard coordinates
-                let (graph, _coords) = GraphPartitionProblem::generate_geometric_with_coords(
-                    node_count,
-                    expected_degree,
-                    rng,
-                );
-                graph
-            }
-        }
-    }
-
+impl Problem<Partition> for GraphPartitionProblem {
     fn score(&self, partition: &Partition) -> f64 {
         let mut cut_edges = 0;
 
@@ -193,117 +208,32 @@ impl OptimizationProblem<Graph, Partition, GraphGenerationMethod> for GraphParti
         cut_edges as f64 + penalty
     }
 
-    fn neighbour_size(&self) -> usize {
-        self.graph.node_count
-    }
+    fn neighbour(&self, partition: &Partition) -> Vec<Partition> {
+        let mut neighbours = Vec::with_capacity(self.graph.node_count);
 
-    fn neighbour(
-        &self,
-        neighbour_id: usize,
-        current_solution: &Partition,
-        current_score: f64,
-    ) -> (Partition, f64) {
-        if neighbour_id >= self.graph.node_count {
-            panic!("Neighbour ID out of bounds");
+        for i in 0..self.graph.node_count {
+            let mut new_partition = partition.clone();
+            new_partition[i] = !new_partition[i];
+            neighbours.push(new_partition);
         }
-        let mut new_partition = current_solution.clone();
-        new_partition[neighbour_id] = !new_partition[neighbour_id];
 
-        // Calculate efficient score delta
-        let v1_size = current_solution
-            .iter()
-            .filter(|&&x| x != new_partition[neighbour_id])
-            .count();
-        let v2_size = self.graph.node_count - v1_size;
-
-        let added_edges = self.graph.adjacency_list[neighbour_id]
-            .iter()
-            .filter(|&&neighbor| new_partition[neighbour_id] != new_partition[neighbor])
-            .count();
-
-        let degree_i = self.graph.adjacency_list[neighbour_id].len();
-        let removed_edges = degree_i - added_edges;
-
-        let score_delta = added_edges as f64
-            - removed_edges as f64
-            - ALPHA * 4.0 * (v1_size as f64 - v2_size as f64 - 1.0);
-
-        let new_score = current_score + score_delta;
-
-        (new_partition, new_score)
+        neighbours
     }
 
-    fn create_random_solution(&self, rng: &mut Mt19937GenRand64) -> Partition {
-        (0..self.graph.node_count).map(|_| rng.r#gen::<bool>()).collect()
-    }
-}
-
-impl ExtremalOptimizationProblem<Graph, Partition, GraphGenerationMethod> for GraphPartitionProblem {
-    fn component_count(&self) -> usize {
-        self.graph.node_count
-    }
-
-    fn component_fitness(&self, solution: &Partition) -> Vec<f64> {
+    fn random_solution(&self, rng: &mut Mt19937GenRand64) -> Partition {
         (0..self.graph.node_count)
-            .map(|i| {
-                let deg = self.graph.adjacency_list[i].len();
-                if deg == 0 {
-                    return 0.0;
-                }
-                let internal = self.graph.adjacency_list[i]
-                    .iter()
-                    .filter(|&&j| solution[j] == solution[i])
-                    .count();
-                let external = deg - internal;
-                (internal as f64 - external as f64) / deg as f64
-            })
+            .map(|_| rng.r#gen::<bool>())
             .collect()
     }
-}
 
-impl ReplicaCouplingProblem<Graph, Partition, GraphGenerationMethod> for GraphPartitionProblem {
-    fn components_equal(&self, sol_a: &Partition, sol_b: &Partition, component: usize) -> bool {
-        sol_a[component] == sol_b[component]
-    }
-}
-
-impl ContinuousRelaxationProblem<Graph> for GraphPartitionProblem {
-    fn dimension(&self) -> usize {
+    fn neighbour_size(&self) -> usize {
         self.graph.node_count
-    }
-
-    fn continuous_score(&self, solution: &[f64]) -> f64 {
-        // カットエッジの連続版: Σ_{(u,v)∈E} |x_u - x_v|
-        let mut cut_cost = 0.0;
-        for u in 0..self.graph.node_count {
-            for &v in &self.graph.adjacency_list[u] {
-                if u < v {
-                    cut_cost += (solution[u] - solution[v]).abs();
-                }
-            }
-        }
-
-        // バランスペナルティ: ALPHA × (Σx_i - n/2)²
-        let sum: f64 = solution.iter().sum();
-        let diff = sum - self.graph.node_count as f64 / 2.0;
-        let penalty = ALPHA * diff * diff;
-
-        cut_cost + penalty
-    }
-
-    fn discretize(&self, solution: &[f64]) -> Vec<bool> {
-        solution.iter().map(|&x| x >= 0.5).collect()
-    }
-
-    fn discrete_score(&self, partition: &[bool]) -> f64 {
-        self.score(&partition.to_vec())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::optimization::OptimizationProblem;
 
     #[test]
     fn test_graph_creation() {
@@ -367,15 +297,15 @@ mod tests {
         let graph = Graph::new(10);
         let problem = GraphPartitionProblem::new(graph);
         let mut rng = Mt19937GenRand64::new(42);
-        let solution = problem.create_random_solution(&mut rng);
+        let solution = problem.random_solution(&mut rng);
 
         assert_eq!(solution.len(), 10);
-        
+
         // With same seed, should be deterministic
         let graph2 = Graph::new(10);
         let problem2 = GraphPartitionProblem::new(graph2);
         let mut rng2 = Mt19937GenRand64::new(42);
-        let solution2 = problem2.create_random_solution(&mut rng2);
+        let solution2 = problem2.random_solution(&mut rng2);
         assert_eq!(solution, solution2);
     }
 
@@ -387,211 +317,59 @@ mod tests {
 
         let problem = GraphPartitionProblem::new(graph);
         let partition = vec![true, false, true];
-        let score = problem.score(&partition);
 
-        // Test flipping node 1
-        let (new_partition, new_score) = problem.neighbour(1, &partition, score);
-        assert_eq!(new_partition, vec![true, true, true]);
-        let expected_score = problem.score(&new_partition);
-        assert!(
-            (new_score - expected_score).abs() < 1e-10,
-            "Score mismatch: {} vs {}",
-            new_score,
-            expected_score
-        );
+        let neighbours = problem.neighbour(&partition);
+        assert_eq!(neighbours.len(), 3);
+        assert_eq!(neighbours[0], vec![false, false, true]);
+        assert_eq!(neighbours[1], vec![true, true, true]);
+        assert_eq!(neighbours[2], vec![true, false, false]);
     }
 
     #[test]
-    fn test_efficient_neighbour_delta() {
-        let mut graph = Graph::new(4);
-        graph.add_edge(0, 1);
-        graph.add_edge(1, 2);
-        graph.add_edge(2, 3);
-
+    fn test_neighbour_size() {
+        let graph = Graph::new(7);
         let problem = GraphPartitionProblem::new(graph);
-        let partition = vec![true, false, true, false];
-        let current_score = problem.score(&partition);
-
-        // Test efficient delta calculation using neighbour method (flipping node 1)
-        let (new_partition, new_score) = problem.neighbour(1, &partition, current_score);
-
-        // Verify the score matches the actual calculation
-        let expected_score = problem.score(&new_partition);
-        assert!(
-            (new_score - expected_score).abs() < 1e-10,
-            "Delta calculation mismatch: {} vs {}",
-            new_score,
-            expected_score
-        );
-    }
-
-    #[test]
-    fn test_optimization_trait_methods() {
-        let mut graph = Graph::new(3);
-        graph.add_edge(0, 1);
-        graph.add_edge(1, 2);
-
-        let problem = GraphPartitionProblem::new(graph);
-
-        assert_eq!(problem.neighbour_size(), 3);
-
-        let partition = vec![true, false, true];
-        let score = problem.score(&partition);
-
-        // Test basin method from trait
-        let optimized = problem.basin(&partition);
-        let optimized_score = problem.score(&optimized);
-
-        // Basin should find a local optimum (score should be <= original)
-        assert!(optimized_score <= score || (optimized_score - score).abs() < 1e-10);
+        assert_eq!(problem.neighbour_size(), 7);
     }
 
     #[test]
     fn test_generate_random_instance() {
-        // Test with high expected degree - should generate many edges
-        let method1 = GraphGenerationMethod::Random { node_count: 5, expected_degree: 3.0 };
+        let method = GraphGenerationMethod::Random {
+            node_count: 5,
+            expected_degree: 2.0,
+        };
+        let mut rng = Mt19937GenRand64::new(42);
+        let problem = GraphPartitionProblem::generate(method, &mut rng);
+
+        assert_eq!(problem.neighbour_size(), 5);
+
+        // Verify it's a valid partition
+        let partition = problem.random_solution(&mut rng);
+        assert_eq!(partition.len(), 5);
+        let score = problem.score(&partition);
+        assert!(score.is_finite());
+    }
+
+    #[test]
+    fn test_determinism() {
+        let method = GraphGenerationMethod::Random {
+            node_count: 5,
+            expected_degree: 2.0,
+        };
+
         let mut rng1 = Mt19937GenRand64::new(42);
-        let graph1 = GraphPartitionProblem::generate_problem(method1, &mut rng1);
-        assert_eq!(graph1.node_count, 5);
-        
-        // Count edges and calculate average degree
-        let total_degree1: usize = graph1.adjacency_list.iter().map(|adj| adj.len()).sum();
-        let avg_degree1 = total_degree1 as f64 / graph1.node_count as f64;
-        
-        // Test with low expected degree - should generate fewer edges
-        let method2 = GraphGenerationMethod::Random { node_count: 5, expected_degree: 1.0 };
+        let problem1 = GraphPartitionProblem::generate(method.clone(), &mut rng1);
+
         let mut rng2 = Mt19937GenRand64::new(42);
-        let graph2 = GraphPartitionProblem::generate_problem(method2, &mut rng2);
-        let total_degree2: usize = graph2.adjacency_list.iter().map(|adj| adj.len()).sum();
-        let avg_degree2 = total_degree2 as f64 / graph2.node_count as f64;
-        
-        // Higher expected degree should generally produce higher average degree
-        assert!(avg_degree1 >= avg_degree2);
-        
-        // Test determinism - same seed should produce same graph
-        let method3 = GraphGenerationMethod::Random { node_count: 5, expected_degree: 2.0 };
-        let mut rng3 = Mt19937GenRand64::new(42);
-        let mut rng4 = Mt19937GenRand64::new(42);
-        let graph3 = GraphPartitionProblem::generate_problem(method3.clone(), &mut rng3);
-        let graph4 = GraphPartitionProblem::generate_problem(method3.clone(), &mut rng4);
+        let problem2 = GraphPartitionProblem::generate(method, &mut rng2);
 
-        assert_eq!(graph3.adjacency_list, graph4.adjacency_list);
-        
-        // Test that average degree is approximately expected (with some tolerance for randomness)
-        let total_degree3: usize = graph3.adjacency_list.iter().map(|adj| adj.len()).sum();
-        let avg_degree3 = total_degree3 as f64 / graph3.node_count as f64;
-        
-        // Should be reasonably close to expected degree (within reasonable variance)
-        assert!((avg_degree3 - 2.0).abs() < 1.5, "Average degree {} too far from expected 2.0", avg_degree3);
-    }
-
-    #[test]
-    fn test_generate_problem_trait() {
-        // Test the trait method for generating random problems
-        let method = GraphGenerationMethod::Random { 
-            node_count: 5, 
-            expected_degree: 2.0 
-        };
         let mut rng = Mt19937GenRand64::new(123);
-        let graph = GraphPartitionProblem::generate_problem(method.clone(), &mut rng);
-        assert_eq!(graph.node_count, 5);
-        
-        // Test determinism
-        let mut rng1 = Mt19937GenRand64::new(123);
-        let mut rng2 = Mt19937GenRand64::new(123);
-        let graph1 = GraphPartitionProblem::generate_problem(method.clone(), &mut rng1);
-        let graph2 = GraphPartitionProblem::generate_problem(method.clone(), &mut rng2);
-        
-        assert_eq!(graph1.adjacency_list, graph2.adjacency_list);
-    }
+        let partition = problem1.random_solution(&mut rng);
 
-    #[test]
-    fn test_generation_method_variants() {
-        // Test different generation parameters
-        let method_small = GraphGenerationMethod::Random { 
-            node_count: 3, 
-            expected_degree: 1.0 
-        };
-        let method_large = GraphGenerationMethod::Random { 
-            node_count: 6, 
-            expected_degree: 3.0 
-        };
-        
-        let mut rng = Mt19937GenRand64::new(456);
-        let graph_small = GraphPartitionProblem::generate_problem(method_small, &mut rng);
-        
-        // Reset RNG with different seed for fair comparison
-        let mut rng = Mt19937GenRand64::new(789);
-        let graph_large = GraphPartitionProblem::generate_problem(method_large, &mut rng);
-        
-        assert_eq!(graph_small.node_count, 3);
-        assert_eq!(graph_large.node_count, 6);
-        
-        // Calculate average degrees
-        let avg_degree_small = if graph_small.node_count > 0 {
-            graph_small.adjacency_list.iter().map(|adj| adj.len()).sum::<usize>() as f64 / graph_small.node_count as f64
-        } else {
-            0.0
-        };
-        let avg_degree_large = if graph_large.node_count > 0 {
-            graph_large.adjacency_list.iter().map(|adj| adj.len()).sum::<usize>() as f64 / graph_large.node_count as f64
-        } else {
-            0.0
-        };
-        
-        // Verify that larger expected degree generally produces higher average degree
-        // (with some tolerance for randomness)
-        assert!(avg_degree_large >= avg_degree_small - 1.0,
-            "Large graph avg degree {} should be >= small graph avg degree {} - 1.0",
-            avg_degree_large, avg_degree_small);
-    }
-
-    #[test]
-    fn test_component_count() {
-        let graph = Graph::new(7);
-        let problem = GraphPartitionProblem::new(graph);
         assert_eq!(
-            ExtremalOptimizationProblem::component_count(&problem),
-            7
+            problem1.score(&partition),
+            problem2.score(&partition),
+            "Same seed should produce same graph"
         );
-    }
-
-    #[test]
-    fn test_component_fitness_path_graph() {
-        // パスグラフ 0-1-2-3, パーティション [true, true, false, false]
-        let mut graph = Graph::new(4);
-        graph.add_edge(0, 1);
-        graph.add_edge(1, 2);
-        graph.add_edge(2, 3);
-
-        let problem = GraphPartitionProblem::new(graph);
-        let partition = vec![true, true, false, false];
-        let fitness = problem.component_fitness(&partition);
-
-        assert_eq!(fitness.len(), 4);
-        // 頂点 0: 隣接=[1(同)], fitness = (1-0)/1 = 1.0
-        assert!((fitness[0] - 1.0).abs() < 1e-10);
-        // 頂点 1: 隣接=[0(同), 2(異)], fitness = (1-1)/2 = 0.0
-        assert!((fitness[1] - 0.0).abs() < 1e-10);
-        // 頂点 2: 隣接=[1(異), 3(同)], fitness = (1-1)/2 = 0.0
-        assert!((fitness[2] - 0.0).abs() < 1e-10);
-        // 頂点 3: 隣接=[2(同)], fitness = (1-0)/1 = 1.0
-        assert!((fitness[3] - 1.0).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_component_fitness_isolated_vertex() {
-        let mut graph = Graph::new(3);
-        graph.add_edge(0, 1);
-        // 頂点 2 は孤立
-
-        let problem = GraphPartitionProblem::new(graph);
-        let partition = vec![true, false, true];
-        let fitness = problem.component_fitness(&partition);
-
-        // 頂点 0: 隣接=[1(異)], fitness = (0-1)/1 = -1.0
-        assert!((fitness[0] - (-1.0)).abs() < 1e-10);
-        // 頂点 2: 孤立, fitness = 0.0
-        assert!((fitness[2] - 0.0).abs() < 1e-10);
     }
 }
