@@ -11,10 +11,16 @@
 ```
 src/
 ├── lib.rs                  # クレートルート
-├── optimization.rs         # 汎用最適化トレイト
+├── optimization.rs         # 汎用最適化トレイト (Problem / Smoothing / Solver)
 ├── graph_partition.rs      # グラフ分割問題の定義
-├── simulated_annealing.rs  # 焼きなまし法ソルバー
-└── file_utils.rs           # JSON 入出力ユーティリティ
+├── smoothing.rs            # スムージング戦略 (None / KAvg / RandomKAvg / Weighted)
+├── solvers/                # ソルバー群 (HC / SA / EO / SQA)
+├── experiment.rs           # ベイスン評価などの補助
+├── file_utils.rs           # JSON 入出力ユーティリティ
+├── graph_spec.rs           # グラフ仕様とライブラリ (data/graphs に永続化)
+├── run_config.rs           # SA 実行条件 (Theta / 10^N 反復 / Smoothing)
+├── run_executor.rs         # 対数刻み 6 トレース計測と結果ストア
+└── bin/gui.rs              # 4 タブ構成の実験 GUI
 ```
 
 ### optimization — 最適化問題トレイト
@@ -115,6 +121,86 @@ score = カットエッジ数 + ALPHA * (|V1| - |V2|)^2
 | `load_json(path)` | JSON ファイルを読み込みデシリアライズ |
 | `ensure_dir_exists(path)` | ディレクトリが存在しなければ作成 |
 
+## 実験ワークフロー
+
+`graph_spec` / `run_config` / `run_executor` の 3 モジュールは、**プリセット
+された条件で大量の SA 実行を回し、対数刻みでスナップショットを取り、
+ファイルにキャッシュする** ことを目的とした実験用バックボーン。GUI（`bin/gui.rs`）
+の 4 タブ（Graphs / Configs / Run / Results）はこのバックボーンの上で動く。
+
+### graph_spec — グラフ仕様とライブラリ
+
+プリセット定数:
+
+| 定数 | 値 |
+|---|---|
+| `NODE_COUNTS` | `[62, 124, 250, 500, 1000, 2000]` |
+| `EXPECTED_DEGREES` | `[2.5, 5.0, 10.0, 20.0, 40.0]` |
+| `GraphKind` | `Random` / `Geometric` |
+
+主な型・メソッド:
+
+- `GraphSpec { kind, n, d, seed }` — グラフの一意キー。`id()` 例: `random_n124_d5_s7`, `geom_n62_d2p5_s0`
+- `StoredGraph` — 隣接リストと（`Geometric` の場合）座標を保持し JSON で永続化
+- `GraphLibrary::load_or_generate(spec)` — 既存ファイルがあれば読み込み、無ければ生成して保存（保存先は `data/graphs/<id>.json`）
+- `GraphLibrary::list()` — ディレクトリ内のグラフを列挙
+
+### run_config — SA 実行条件
+
+```rust
+pub struct RunConfig {
+    pub name: String,
+    pub theta: Option<f64>,      // 温度を Theta = log10(T) で指定。None なら T = 0
+    pub log10_iterations: u32,   // 反復回数 = 10^N
+    pub smoothing: SmoothingSpec,
+}
+```
+
+- `temperature()` — `theta = None` のとき `0.0`、それ以外は `10^theta`
+- `iterations()` — `10^log10_iterations`（最大 `10^9`）
+- `id()` — キャッシュキー。例: `th+0_iter4_kavg8`, `T0_iter5_none`
+- `SmoothingSpec` バリアント: `None` / `KAverage(k)` / `RandomKAverage(k)` / `WeightedAverage(k)`
+
+### run_executor — 対数刻み実行と結果ストア
+
+各スナップショットで 1 つの `StepRecord` を記録する:
+
+| フィールド | 内容 |
+|---|---|
+| `step` | SA のステップ番号（0 = 初期解、その後 1, 2, …, 9, 10, 20, …） |
+| `current_smoothed` | 現在解のスムージング空間でのスコア |
+| `current_real` | 現在解の元空間（実）スコア |
+| `basin_smoothed_from_smoothed` | スムージング空間で山登り後のベイスンのスムージング空間スコア |
+| `basin_real_from_smoothed` | 同ベイスンの元空間スコア |
+| `basin_smoothed_from_real` | 元空間で山登り後のベイスンのスムージング空間スコア |
+| `basin_real_from_real` | 同ベイスンの元空間スコア |
+
+主な API:
+
+- `logarithmic_steps(max_iter)` — `1, 2, ..., 9, 10, 20, ...` のサンプリング点列を返す（必要に応じて末尾に `max_iter` を追加）
+- `execute(spec, cfg, prob, seed) -> RunResult` — 単一シードを実行し、初期＋対数刻みでスナップショットを記録
+- `ResultStore::path_for(spec, cfg, seed)` → `data/results/<graph_id>/<config_id>/seed_<seed>.json`
+- `ResultStore::exists / load / save` — 結果のキャッシュ管理（GUI は完了済みの triple をスキップする）
+- `ResultStore::export_tsv(result, path)` — gnuplot 互換の TSV を出力（列: `step, cur_sm, cur_real, basin_sm_from_sm, basin_real_from_sm, basin_sm_from_real, basin_real_from_real`）
+
+### GUI（`cargo run --bin gui`）
+
+4 つのタブで実験を回す:
+
+1. **Graphs** — `kind` / `N` / `D` / `seed` を選んで `Generate / Load`。既に `data/graphs` に同 ID のグラフがあれば再利用、無ければ生成して保存。下部のリストから 1 つ選ぶと可視化される。
+2. **Configs** — `RunConfig` のリストを編集する。`use Theta` チェックボックスで `Theta` を有効化（無効なら `T = 0` の貪欲）、`log10(iter)` スライダで反復数を設定、スムージング種別と K を選択。
+3. **Run** — 選択中のグラフ・チェック済み Config・`start_seed` / `# seeds` で一括実行する。実行は裏スレッドで進み、`ResultStore` にキャッシュされた `(graph, config, seed)` 三つ組はスキップされる。プログレスバーとログで進捗を確認できる。
+4. **Results** — 現在の選択（グラフ・Config・seed 範囲）にマッチする結果を `Load matching` で読み込み、6 トレースを log-step 軸でプロット。各トレースはチェックボックスで個別に表示切替できる。`Export TSV` で選択結果を `data/tsv/<graph_id>/<config_id>/seed_<seed>.tsv` に書き出す。
+
+ディレクトリ構成:
+
+```
+data/
+├── graphs/<graph_id>.json            # 生成済みグラフ
+├── results/<graph_id>/<config_id>/   # 実行結果 JSON
+└── tsv/<graph_id>/<config_id>/       # gnuplot 用 TSV
+```
+
 ## 使い方
 
 ### 依存関係の追加
@@ -180,3 +266,5 @@ let (best_solution, stats) = solver.solve(&problem, initial_solution, &mut rng);
 | `rand_mt` | 4.2 | Mersenne Twister (MT19937) による再現可能な乱数 |
 | `serde` | 1.0 | シリアライズ / デシリアライズ |
 | `serde_json` | 1.0 | JSON 入出力 |
+| `eframe` | 0.31 | ネイティブ GUI フレームワーク（`bin/gui.rs`） |
+| `egui_plot` | 0.31 | プロット描画（`bin/gui.rs`） |
