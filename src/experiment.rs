@@ -3,8 +3,7 @@
 //! 異なるスムージング戦略とソルバーの組み合わせを体系的に実行し、
 //! 結果を集計・分析する。
 
-use crate::optimization::{Problem, Smoothing, Solver, SolverStats};
-use rand_mt::Mt19937GenRand64;
+use crate::optimization::{Problem, Smoothing, SolverStats};
 use serde::{Deserialize, Serialize};
 
 /// 実験の結果。

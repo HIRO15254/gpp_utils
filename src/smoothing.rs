@@ -3,8 +3,6 @@
 //! 同じ問題に対して異なるスコア評価方法（平滑化戦略）を提供する。
 
 use crate::optimization::{Problem, Smoothing};
-use rand::Rng;
-use rand_mt::Mt19937GenRand64;
 
 /// スムージングなし（元のスコアをそのまま使用）。
 ///
@@ -138,6 +136,7 @@ impl MultiLevelSmoothing {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand_mt::Mt19937GenRand64;
 
     #[derive(Clone)]
     struct DummyProblem;

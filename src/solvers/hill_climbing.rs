@@ -174,7 +174,7 @@ mod tests {
 
     #[test]
     fn test_hill_climbing_determinism() {
-        use crate::graph_partition::{Graph, GraphGenerationMethod};
+        use crate::graph_partition::GraphGenerationMethod;
         let method = GraphGenerationMethod::Random {
             node_count: 5,
             expected_degree: 2.0,
