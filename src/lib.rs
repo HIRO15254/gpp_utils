@@ -1,5 +1,6 @@
 // New framework (under development)
 pub mod optimization;
+pub mod smoothing;
 pub mod file_utils;
 pub mod graph_partition;
 
