@@ -161,6 +161,22 @@ pub struct RunConfig {
 - `id()` — キャッシュキー。例: `th+0_iter4_kavg8`, `T0_iter5_none`
 - `SmoothingSpec` バリアント: `None` / `KAverage(k)` / `RandomKAverage(k)` / `WeightedAverage(k)`
 
+掃引（パラメータの全組合せ探索）には `ConfigSweep` を使う:
+
+```rust
+pub struct ConfigSweep {
+    pub name: String,
+    pub thetas: Vec<Option<f64>>,        // None は T = 0
+    pub log10_iterations: Vec<u32>,
+    pub smoothings: Vec<SmoothingSpec>,
+}
+```
+
+- `expand()` — `thetas × log10_iterations × smoothings` のデカルト積を `Vec<RunConfig>` に展開する。
+- `count()` — 展開後の組合せ数。いずれかの軸が空ならゼロ。
+
+GUI の Configs タブはこの `ConfigSweep` を編集する UI を提供し、Run 実行時に `expand()` を呼んで個別の `RunConfig` 列を作る。
+
 ### run_executor — 対数刻み実行と結果ストア
 
 各スナップショットで 1 つの `StepRecord` を記録する:
@@ -187,10 +203,18 @@ pub struct RunConfig {
 
 4 つのタブで実験を回す:
 
-1. **Graphs** — `kind` / `N` / `D` / `seed` を選んで `Generate / Load`。既に `data/graphs` に同 ID のグラフがあれば再利用、無ければ生成して保存。下部のリストから 1 つ選ぶと可視化される。
-2. **Configs** — `RunConfig` のリストを編集する。`use Theta` チェックボックスで `Theta` を有効化（無効なら `T = 0` の貪欲）、`log10(iter)` スライダで反復数を設定、スムージング種別と K を選択。
-3. **Run** — 選択中のグラフ・チェック済み Config・`start_seed` / `# seeds` で一括実行する。実行は裏スレッドで進み、`ResultStore` にキャッシュされた `(graph, config, seed)` 三つ組はスキップされる。プログレスバーとログで進捗を確認できる。
-4. **Results** — 現在の選択（グラフ・Config・seed 範囲）にマッチする結果を `Load matching` で読み込み、6 トレースを log-step 軸でプロット。各トレースはチェックボックスで個別に表示切替できる。`Export TSV` で選択結果を `data/tsv/<graph_id>/<config_id>/seed_<seed>.tsv` に書き出す。
+1. **Graphs** — `kind` / `N` / `D` / `seed` を選んで `Generate / Load`。既に `data/graphs` に同 ID のグラフがあれば再利用、無ければ生成して保存。リストの各行には**チェックボックス**があり、複数のグラフを同時に Run の対象として選べる。ラベルクリックでプレビュー対象を切り替える（右ペインで可視化）。`Check all` / `Uncheck all` で一括操作。
+2. **Configs** — `ConfigSweep` のリストを編集する。1 件の Sweep は **Theta 値集合 × log10(iter) 値集合 × Smoothing 種別 × K 値集合** のデカルト積を `RunConfig` 列に展開する。
+   - `Theta values`: カンマ区切り（例: `-1.0, 0.0, 1.0`）。`T0` / `off` / `none` のトークンは `T = 0`（貪欲）として解釈。
+   - `log10(iter)`: カンマ区切り整数（例: `3, 4, 5`）。
+   - `Smoothing kinds`: `None` / `K-Avg (det)` / `K-Avg (rand)` / `Weighted` のうち複数を選択可。
+   - `K values`: カンマ区切り正整数。`None` 以外のチェック済み種別 × K 値の組合せで `SmoothingSpec` を展開する。
+   - 行右上に `→ M configs` で展開後の本数を表示。パースエラーは赤字で表示し、最後に成功した値を保持する。
+3. **Run** — Graphs タブでチェックした複数グラフ × Configs タブの選択 Sweep（展開後の全 RunConfig）× `start_seed` / `# seeds` の全タスクを **rayon ワークプール**で並列実行する。
+   - `# threads` スライダで使用論理コア数（1..=available_parallelism）を設定。
+   - `ResultStore` にキャッシュされた `(graph, config, seed)` 三つ組はスキップされる。
+   - 進捗バーは `done / total (skipped, active workers)` を表示。ログには各タスクの実時間と最終 real スコアが出力される。
+4. **Results** — 現在の選択（複数グラフ・Sweep 展開後の Config 群・seed 範囲）にマッチする結果を `Load matching` で読み込み、6 トレースを log-step 軸でプロット。プロット凡例には `graph_id | config_name | config_id | seed | trace` が含まれる。表には `graph` 列を追加。`Export TSV` で選択結果を `data/tsv/<graph_id>/<config_id>/seed_<seed>.tsv` に書き出す。
 
 ディレクトリ構成:
 
@@ -268,3 +292,4 @@ let (best_solution, stats) = solver.solve(&problem, initial_solution, &mut rng);
 | `serde_json` | 1.0 | JSON 入出力 |
 | `eframe` | 0.31 | ネイティブ GUI フレームワーク（`bin/gui.rs`） |
 | `egui_plot` | 0.31 | プロット描画（`bin/gui.rs`） |
+| `rayon` | 1 | GUI からのバッチ実行用のスレッドプール並列化 |
