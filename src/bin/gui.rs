@@ -1,23 +1,27 @@
 //! GPP 実験用 GUI（4 タブ構成）。
 //!
-//! - Graphs: プリセット N/D/方式/シードでグラフを生成・永続化し、選択する。
-//! - Configs: SA 実行条件（Θ、10^N 反復、スムージング）の集合を編集する。
-//! - Run: 選択中のグラフと対象 Config 群、シード範囲で一括実行する（裏スレッド）。
+//! - Graphs: プリセット N/D/方式/シードでグラフを生成・永続化し、複数選択する。
+//! - Configs: 解法と平滑化のパラメータを複数値で指定し、全組合せの掃引を編集する。
+//! - Run: 選択中のグラフ群と Sweep 群、シード範囲で一括並列実行する（rayon プール）。
 //! - Results: 完了済み結果を 6 トレースの log-log プロットおよび TSV で確認する。
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 
 use eframe::egui;
 use egui::{Color32, CornerRadius, RichText, Stroke};
 use egui_plot::{Line, Plot, PlotPoints};
+use rayon::prelude::*;
 
+use gpp_utils::graph_partition::GraphPartitionProblem;
 use gpp_utils::graph_spec::{
     EXPECTED_DEGREES, GraphKind, GraphLibrary, GraphSpec, NODE_COUNTS, StoredGraph,
 };
-use gpp_utils::run_config::{RunConfig, SmoothingSpec};
-use gpp_utils::run_executor::{RunResult, ResultStore, execute};
+use gpp_utils::run_config::{ConfigSweep, RunConfig, SmoothingSpec};
+use gpp_utils::run_executor::{ResultStore, RunResult, execute};
 
 const GRAPH_DIR: &str = "data/graphs";
 const RESULT_DIR: &str = "data/results";
@@ -128,6 +132,7 @@ struct RunStatus {
     total: usize,
     done: usize,
     skipped: usize,
+    active_workers: usize,
     cancel: bool,
     log: Vec<String>,
 }
@@ -142,6 +147,185 @@ impl RunStatus {
     }
 }
 
+/// Configs タブ用の編集中バッファ。入力中の文字列はここに保持し、
+/// `apply_to_sweep` で `ConfigSweep` に同期する。
+#[derive(Clone)]
+struct SweepInputs {
+    thetas_text: String,
+    iters_text: String,
+    ks_text: String,
+    /// [None, KAvg, RandomKAvg, Weighted] の順でチェック状態を保持。
+    smoothing_kinds: [bool; 4],
+    last_error: Option<String>,
+}
+
+impl SweepInputs {
+    fn from_sweep(sw: &ConfigSweep) -> Self {
+        let thetas_text = sw
+            .thetas
+            .iter()
+            .map(|t| match t {
+                None => "T0".to_string(),
+                Some(v) => format_float(*v),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let iters_text = sw
+            .log10_iterations
+            .iter()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut kinds = [false; 4];
+        let mut k_set = std::collections::BTreeSet::<usize>::new();
+        for sm in &sw.smoothings {
+            match sm {
+                SmoothingSpec::None => kinds[0] = true,
+                SmoothingSpec::KAverage(k) => {
+                    kinds[1] = true;
+                    k_set.insert(*k);
+                }
+                SmoothingSpec::RandomKAverage(k) => {
+                    kinds[2] = true;
+                    k_set.insert(*k);
+                }
+                SmoothingSpec::WeightedAverage(k) => {
+                    kinds[3] = true;
+                    k_set.insert(*k);
+                }
+            }
+        }
+        if k_set.is_empty() {
+            k_set.insert(8);
+        }
+        let ks_text = k_set
+            .iter()
+            .map(|k| k.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        Self {
+            thetas_text,
+            iters_text,
+            ks_text,
+            smoothing_kinds: kinds,
+            last_error: None,
+        }
+    }
+
+    /// 入力テキストをパースして `ConfigSweep` に同期する。
+    /// 何らかのエラーがあれば `last_error` にセットして false を返す。
+    fn apply_to_sweep(&mut self, sw: &mut ConfigSweep) -> bool {
+        let thetas = match parse_theta_list(&self.thetas_text) {
+            Ok(v) => v,
+            Err(e) => {
+                self.last_error = Some(format!("Theta: {}", e));
+                return false;
+            }
+        };
+        let iters = match parse_u32_list(&self.iters_text) {
+            Ok(v) => v,
+            Err(e) => {
+                self.last_error = Some(format!("log10(iter): {}", e));
+                return false;
+            }
+        };
+        let ks = match parse_usize_list(&self.ks_text) {
+            Ok(v) => v,
+            Err(e) => {
+                self.last_error = Some(format!("K: {}", e));
+                return false;
+            }
+        };
+
+        let mut smoothings: Vec<SmoothingSpec> = Vec::new();
+        if self.smoothing_kinds[0] {
+            smoothings.push(SmoothingSpec::None);
+        }
+        let need_k = self.smoothing_kinds[1] || self.smoothing_kinds[2] || self.smoothing_kinds[3];
+        if need_k && ks.is_empty() {
+            self.last_error =
+                Some("K values must be non-empty when a K-based smoothing is selected.".into());
+            return false;
+        }
+        if self.smoothing_kinds[1] {
+            for &k in &ks {
+                smoothings.push(SmoothingSpec::KAverage(k));
+            }
+        }
+        if self.smoothing_kinds[2] {
+            for &k in &ks {
+                smoothings.push(SmoothingSpec::RandomKAverage(k));
+            }
+        }
+        if self.smoothing_kinds[3] {
+            for &k in &ks {
+                smoothings.push(SmoothingSpec::WeightedAverage(k));
+            }
+        }
+
+        sw.thetas = thetas;
+        sw.log10_iterations = iters;
+        sw.smoothings = smoothings;
+        self.last_error = None;
+        true
+    }
+}
+
+fn format_float(v: f64) -> String {
+    if (v.fract()).abs() < 1e-9 {
+        format!("{:.1}", v)
+    } else {
+        format!("{}", v)
+    }
+}
+
+fn parse_theta_list(s: &str) -> Result<Vec<Option<f64>>, String> {
+    let mut out = Vec::new();
+    for tok in s.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        let lc = tok.to_ascii_lowercase();
+        if matches!(lc.as_str(), "t0" | "off" | "none" | "-") {
+            out.push(None);
+        } else {
+            let v = lc
+                .parse::<f64>()
+                .map_err(|_| format!("invalid number: {:?}", tok))?;
+            out.push(Some(v));
+        }
+    }
+    if out.is_empty() {
+        return Err("at least one value required".into());
+    }
+    Ok(out)
+}
+
+fn parse_u32_list(s: &str) -> Result<Vec<u32>, String> {
+    let mut out = Vec::new();
+    for tok in s.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        let v = tok
+            .parse::<u32>()
+            .map_err(|_| format!("invalid integer: {:?}", tok))?;
+        out.push(v);
+    }
+    if out.is_empty() {
+        return Err("at least one value required".into());
+    }
+    Ok(out)
+}
+
+fn parse_usize_list(s: &str) -> Result<Vec<usize>, String> {
+    let mut out = Vec::new();
+    for tok in s.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        let v = tok
+            .parse::<usize>()
+            .map_err(|_| format!("invalid integer: {:?}", tok))?;
+        if v == 0 {
+            return Err(format!("must be >= 1: {:?}", tok));
+        }
+        out.push(v);
+    }
+    Ok(out)
+}
+
 struct App {
     library: GraphLibrary,
     store: ResultStore,
@@ -149,22 +333,27 @@ struct App {
     // Graphs
     graphs: Vec<StoredGraph>,
     selected_graph: Option<usize>,
+    graph_selected_for_run: Vec<bool>,
     new_kind: GraphKind,
     new_n_idx: usize,
     new_d_idx: usize,
     new_seed: u64,
 
-    // Configs
-    configs: Vec<RunConfig>,
-    config_selected_for_run: Vec<bool>,
-    next_config_id: usize,
+    // Configs (sweeps)
+    sweeps: Vec<ConfigSweep>,
+    sweep_inputs: Vec<SweepInputs>,
+    sweep_selected_for_run: Vec<bool>,
+    next_sweep_id: usize,
 
     // Run params
     start_seed: u64,
     num_seeds: usize,
+    num_threads: usize,
+    max_threads: usize,
 
     // Run status (shared with thread)
     run_status: Arc<Mutex<RunStatus>>,
+    cancel_flag: Arc<AtomicBool>,
 
     // Results
     loaded_results: Vec<RunResult>,
@@ -185,36 +374,48 @@ impl App {
         let store = ResultStore::new(RESULT_DIR);
         let _ = std::fs::create_dir_all(&store.base_dir);
 
-        let mut configs = Vec::new();
-        configs.push(RunConfig {
-            name: "T=1, 10^4".into(),
-            theta: Some(0.0),
-            log10_iterations: 4,
-            smoothing: SmoothingSpec::None,
+        let mut sweeps = Vec::new();
+        sweeps.push(ConfigSweep {
+            name: "default".into(),
+            thetas: vec![Some(0.0)],
+            log10_iterations: vec![4],
+            smoothings: vec![SmoothingSpec::None],
         });
-        configs.push(RunConfig {
-            name: "T=0, 10^4 (greedy)".into(),
-            theta: None,
-            log10_iterations: 4,
-            smoothing: SmoothingSpec::None,
+        sweeps.push(ConfigSweep {
+            name: "greedy".into(),
+            thetas: vec![None],
+            log10_iterations: vec![4],
+            smoothings: vec![SmoothingSpec::None],
         });
-        let config_selected_for_run = vec![true; configs.len()];
+        let sweep_inputs = sweeps.iter().map(SweepInputs::from_sweep).collect();
+        let sweep_selected_for_run = vec![true; sweeps.len()];
+
+        let max_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .max(1);
+        let num_threads = max_threads.min(4).max(1);
 
         let mut s = Self {
             library,
             store,
             selected_graph: if graphs.is_empty() { None } else { Some(0) },
+            graph_selected_for_run: vec![true; graphs.len()],
             graphs,
             new_kind: GraphKind::Random,
             new_n_idx: 1,
             new_d_idx: 1,
             new_seed: 0,
-            configs,
-            config_selected_for_run,
-            next_config_id: 3,
+            sweeps,
+            sweep_inputs,
+            sweep_selected_for_run,
+            next_sweep_id: 3,
             start_seed: 0,
             num_seeds: 1,
+            num_threads,
+            max_threads,
             run_status: Arc::new(Mutex::new(RunStatus::default())),
+            cancel_flag: Arc::new(AtomicBool::new(false)),
             loaded_results: Vec::new(),
             selected_result: None,
             show_trace: [true, true, false, true, false, true],
@@ -226,7 +427,25 @@ impl App {
     }
 
     fn refresh_graphs(&mut self) {
+        let prev: Vec<(String, bool)> = self
+            .graphs
+            .iter()
+            .zip(self.graph_selected_for_run.iter().copied())
+            .map(|(g, sel)| (g.spec.id(), sel))
+            .collect();
         self.graphs = self.library.list();
+        // 既存の選択状態を id で引き継ぐ。新規はデフォルトで OFF。
+        self.graph_selected_for_run = self
+            .graphs
+            .iter()
+            .map(|g| {
+                let id = g.spec.id();
+                prev.iter()
+                    .find(|(pid, _)| pid == &id)
+                    .map(|(_, sel)| *sel)
+                    .unwrap_or(false)
+            })
+            .collect();
         if let Some(i) = self.selected_graph {
             if i >= self.graphs.len() {
                 self.selected_graph = if self.graphs.is_empty() { None } else { Some(0) };
@@ -236,12 +455,40 @@ impl App {
         }
     }
 
-    fn ensure_config_selection_len(&mut self) {
-        self.config_selected_for_run.resize(self.configs.len(), true);
+    fn ensure_sweep_selection_len(&mut self) {
+        self.sweep_selected_for_run.resize(self.sweeps.len(), true);
+        while self.sweep_inputs.len() < self.sweeps.len() {
+            let i = self.sweep_inputs.len();
+            self.sweep_inputs.push(SweepInputs::from_sweep(&self.sweeps[i]));
+        }
+        self.sweep_inputs.truncate(self.sweeps.len());
     }
 
     fn current_graph(&self) -> Option<&StoredGraph> {
         self.selected_graph.and_then(|i| self.graphs.get(i))
+    }
+
+    fn selected_graphs_for_run(&self) -> Vec<StoredGraph> {
+        self.graphs
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| self.graph_selected_for_run.get(*i).copied().unwrap_or(false))
+            .map(|(_, g)| g.clone())
+            .collect()
+    }
+
+    fn expanded_selected_configs(&self) -> Vec<RunConfig> {
+        let mut out = Vec::new();
+        for (i, sw) in self.sweeps.iter().enumerate() {
+            if !self.sweep_selected_for_run.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            out.extend(sw.expand());
+        }
+        // 同じ id を持つ重複を排除。
+        let mut seen = std::collections::HashSet::new();
+        out.retain(|c| seen.insert(c.id()));
+        out
     }
 
     fn generate_graph_clicked(&mut self) {
@@ -258,6 +505,9 @@ impl App {
                 self.refresh_graphs();
                 if let Some(idx) = self.graphs.iter().position(|g| g.spec == spec) {
                     self.selected_graph = Some(idx);
+                    if let Some(flag) = self.graph_selected_for_run.get_mut(idx) {
+                        *flag = true;
+                    }
                 }
                 self.status = format!("Graph ready: {}", spec.id());
             }
@@ -266,30 +516,33 @@ impl App {
     }
 
     fn start_run(&mut self) {
-        let graph = match self.current_graph() {
-            Some(g) => g.clone(),
-            None => {
-                self.status = "Select a graph first.".into();
-                return;
-            }
-        };
-        let cfgs: Vec<RunConfig> = self
-            .configs
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| self.config_selected_for_run.get(*i).copied().unwrap_or(false))
-            .map(|(_, c)| c.clone())
-            .collect();
+        let graphs = self.selected_graphs_for_run();
+        if graphs.is_empty() {
+            self.status = "Check at least one graph in the Graphs tab.".into();
+            return;
+        }
+        let cfgs = self.expanded_selected_configs();
         if cfgs.is_empty() {
-            self.status = "No configs selected.".into();
+            self.status = "No configs selected (or all sweeps are empty).".into();
             return;
         }
         if self.num_seeds == 0 {
             self.status = "num_seeds must be >= 1.".into();
             return;
         }
+        let threads = self.num_threads.clamp(1, self.max_threads);
 
-        let total = cfgs.len() * self.num_seeds;
+        // ワークアイテム: (graph_idx, cfg_idx, seed)
+        let mut items: Vec<(usize, usize, u64)> = Vec::new();
+        for gi in 0..graphs.len() {
+            for ci in 0..cfgs.len() {
+                for s_off in 0..self.num_seeds {
+                    items.push((gi, ci, self.start_seed.wrapping_add(s_off as u64)));
+                }
+            }
+        }
+        let total = items.len();
+
         {
             let mut s = self.run_status.lock().unwrap();
             if s.in_progress {
@@ -301,28 +554,57 @@ impl App {
                 total,
                 done: 0,
                 skipped: 0,
+                active_workers: 0,
                 cancel: false,
-                log: vec![format!("Starting {} runs on {}", total, graph.spec.id())],
+                log: vec![format!(
+                    "Starting {} runs on {} graphs × {} configs × {} seeds with {} threads",
+                    total,
+                    graphs.len(),
+                    cfgs.len(),
+                    self.num_seeds,
+                    threads,
+                )],
             };
         }
+        self.cancel_flag.store(false, Ordering::SeqCst);
 
+        // 共有データを Arc 化。
+        let graphs_arc: Arc<Vec<StoredGraph>> = Arc::new(graphs);
+        let problems_arc: Arc<Vec<GraphPartitionProblem>> =
+            Arc::new(graphs_arc.iter().map(|g| g.problem()).collect());
+        let cfgs_arc: Arc<Vec<RunConfig>> = Arc::new(cfgs);
+        let items_arc: Arc<Vec<(usize, usize, u64)>> = Arc::new(items);
         let store_dir = self.store.base_dir.clone();
         let status_arc = Arc::clone(&self.run_status);
-        let start_seed = self.start_seed;
-        let num_seeds = self.num_seeds;
+        let cancel_flag = Arc::clone(&self.cancel_flag);
+        let active_counter = Arc::new(AtomicUsize::new(0));
 
         thread::spawn(move || {
-            let store = ResultStore::new(store_dir);
-            let problem = graph.problem();
-            'outer: for cfg in &cfgs {
-                for s_off in 0..num_seeds {
-                    {
-                        let st = status_arc.lock().unwrap();
-                        if st.cancel {
-                            break 'outer;
-                        }
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build();
+            let pool = match pool {
+                Ok(p) => p,
+                Err(e) => {
+                    let mut st = status_arc.lock().unwrap();
+                    st.in_progress = false;
+                    st.push_log(format!("thread pool error: {}", e));
+                    return;
+                }
+            };
+
+            pool.install(|| {
+                let store = ResultStore::new(&store_dir);
+                items_arc.par_iter().for_each(|&(gi, ci, seed)| {
+                    if cancel_flag.load(Ordering::SeqCst) {
+                        let mut st = status_arc.lock().unwrap();
+                        st.done += 1;
+                        return;
                     }
-                    let seed = start_seed.wrapping_add(s_off as u64);
+                    let graph = &graphs_arc[gi];
+                    let cfg = &cfgs_arc[ci];
+                    let problem = &problems_arc[gi];
+
                     if store.exists(&graph.spec, cfg, seed) {
                         let mut st = status_arc.lock().unwrap();
                         st.skipped += 1;
@@ -333,19 +615,30 @@ impl App {
                             cfg.id(),
                             seed
                         ));
-                        continue;
+                        return;
                     }
-                    let t0 = std::time::Instant::now();
-                    let result = execute(graph.spec, cfg, &problem, seed);
-                    let elapsed = t0.elapsed().as_secs_f64();
-                    if let Err(e) = store.save(&result) {
+
+                    active_counter.fetch_add(1, Ordering::SeqCst);
+                    {
                         let mut st = status_arc.lock().unwrap();
+                        st.active_workers = active_counter.load(Ordering::SeqCst);
+                    }
+
+                    let t0 = std::time::Instant::now();
+                    let result = execute(graph.spec, cfg, problem, seed);
+                    let elapsed = t0.elapsed().as_secs_f64();
+                    let save_err = store.save(&result).err();
+
+                    active_counter.fetch_sub(1, Ordering::SeqCst);
+                    let mut st = status_arc.lock().unwrap();
+                    st.active_workers = active_counter.load(Ordering::SeqCst);
+                    st.done += 1;
+                    if let Some(e) = save_err {
                         st.push_log(format!("save error: {}", e));
                     }
-                    let mut st = status_arc.lock().unwrap();
-                    st.done += 1;
                     st.push_log(format!(
-                        "done {} / seed={} ({:.1}s, final real={:.2})",
+                        "done {} / {} / seed={} ({:.1}s, final real={:.2})",
+                        graph.spec.id(),
                         cfg.id(),
                         seed,
                         elapsed,
@@ -355,19 +648,27 @@ impl App {
                             .map(|r| r.current_real)
                             .unwrap_or(f64::NAN)
                     ));
-                }
-            }
+                });
+            });
+
             let mut st = status_arc.lock().unwrap();
             st.in_progress = false;
-            st.push_log("--- finished ---");
+            st.active_workers = 0;
+            if cancel_flag.load(Ordering::SeqCst) {
+                st.push_log("--- cancelled ---");
+            } else {
+                st.push_log("--- finished ---");
+            }
         });
 
-        self.status = "Run started.".into();
+        self.status = format!("Run started ({} tasks, {} threads).", total, threads);
     }
 
     fn cancel_run(&mut self) {
-        let mut st = self.run_status.lock().unwrap();
-        if st.in_progress {
+        let in_progress = self.run_status.lock().unwrap().in_progress;
+        if in_progress {
+            self.cancel_flag.store(true, Ordering::SeqCst);
+            let mut st = self.run_status.lock().unwrap();
             st.cancel = true;
             st.push_log("cancel requested");
         }
@@ -376,23 +677,25 @@ impl App {
     fn load_results_for_current(&mut self) {
         self.loaded_results.clear();
         self.selected_result = None;
-        let graph = match self.current_graph() {
-            Some(g) => g.clone(),
-            None => {
-                self.status = "Select a graph first.".into();
-                return;
-            }
-        };
+        let graphs = self.selected_graphs_for_run();
+        if graphs.is_empty() {
+            self.status = "Check at least one graph in the Graphs tab.".into();
+            return;
+        }
+        let cfgs = self.expanded_selected_configs();
+        if cfgs.is_empty() {
+            self.status = "No configs selected.".into();
+            return;
+        }
         let mut loaded = 0usize;
-        for (i, cfg) in self.configs.iter().enumerate() {
-            if !self.config_selected_for_run.get(i).copied().unwrap_or(false) {
-                continue;
-            }
-            for s_off in 0..self.num_seeds {
-                let seed = self.start_seed.wrapping_add(s_off as u64);
-                if let Some(r) = self.store.load(&graph.spec, cfg, seed) {
-                    self.loaded_results.push(r);
-                    loaded += 1;
+        for graph in &graphs {
+            for cfg in &cfgs {
+                for s_off in 0..self.num_seeds {
+                    let seed = self.start_seed.wrapping_add(s_off as u64);
+                    if let Some(r) = self.store.load(&graph.spec, cfg, seed) {
+                        self.loaded_results.push(r);
+                        loaded += 1;
+                    }
                 }
             }
         }
@@ -445,7 +748,10 @@ impl eframe::App for App {
                     if st.in_progress {
                         ui.colored_label(
                             Color32::from_rgb(220, 180, 60),
-                            format!("running {}/{}", st.done, st.total),
+                            format!(
+                                "running {}/{} ({} workers)",
+                                st.done, st.total, st.active_workers
+                            ),
                         );
                     }
                 });
@@ -525,34 +831,58 @@ impl App {
             {
                 self.generate_graph_clicked();
             }
-            if left.button("Refresh list").clicked() {
-                self.refresh_graphs();
-            }
+            left.horizontal(|ui| {
+                if ui.button("Refresh list").clicked() {
+                    self.refresh_graphs();
+                }
+                if ui.button("Check all").clicked() {
+                    for v in self.graph_selected_for_run.iter_mut() {
+                        *v = true;
+                    }
+                }
+                if ui.button("Uncheck all").clicked() {
+                    for v in self.graph_selected_for_run.iter_mut() {
+                        *v = false;
+                    }
+                }
+            });
 
             left.add_space(8.0);
             left.separator();
             left.heading("Library");
+            let selected_count = self.graph_selected_for_run.iter().filter(|&&b| b).count();
             left.label(
-                RichText::new(format!("{} graphs in {}", self.graphs.len(), GRAPH_DIR))
-                    .small()
-                    .weak(),
+                RichText::new(format!(
+                    "{} graphs in {} ({} checked for run)",
+                    self.graphs.len(),
+                    GRAPH_DIR,
+                    selected_count
+                ))
+                .small()
+                .weak(),
             );
             egui::ScrollArea::vertical().id_salt("graphs_scroll").show(left, |ui| {
                 for i in 0..self.graphs.len() {
                     let id = self.graphs[i].spec.id();
                     let edges = self.graphs[i].edge_count;
                     let n = self.graphs[i].spec.n;
-                    let selected = self.selected_graph == Some(i);
-                    let label = format!("{} ({} edges, n={})", id, edges, n);
-                    if ui.selectable_label(selected, label).clicked() {
-                        self.selected_graph = Some(i);
-                    }
+                    let is_preview = self.selected_graph == Some(i);
+                    ui.horizontal(|ui| {
+                        let mut sel = self.graph_selected_for_run[i];
+                        if ui.checkbox(&mut sel, "").changed() {
+                            self.graph_selected_for_run[i] = sel;
+                        }
+                        let label = format!("{} ({} edges, n={})", id, edges, n);
+                        if ui.selectable_label(is_preview, label).clicked() {
+                            self.selected_graph = Some(i);
+                        }
+                    });
                 }
             });
 
             // Right: visualization
             let right = &mut cols[1];
-            right.heading("Selected Graph");
+            right.heading("Selected Graph (preview)");
             if let Some(g) = self.current_graph() {
                 let info = format!(
                     "{}\n{} nodes, {} edges",
@@ -571,36 +901,39 @@ impl App {
 
     fn tab_configs(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.heading("Run Configurations");
+            ui.heading("Run Configurations (Sweeps)");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("+ Add").clicked() {
-                    let id = self.next_config_id;
-                    self.next_config_id += 1;
-                    self.configs.push(RunConfig {
-                        name: format!("config #{}", id),
-                        theta: Some(0.0),
-                        log10_iterations: 4,
-                        smoothing: SmoothingSpec::None,
-                    });
-                    self.ensure_config_selection_len();
+                    let id = self.next_sweep_id;
+                    self.next_sweep_id += 1;
+                    let sw = ConfigSweep {
+                        name: format!("sweep #{}", id),
+                        thetas: vec![Some(0.0)],
+                        log10_iterations: vec![4],
+                        smoothings: vec![SmoothingSpec::None],
+                    };
+                    self.sweep_inputs.push(SweepInputs::from_sweep(&sw));
+                    self.sweeps.push(sw);
+                    self.sweep_selected_for_run.push(true);
                 }
             });
         });
         ui.label(
             RichText::new(
-                "Theta = log10(T). Iterations = 10^N. T = 0 (greedy) when Theta is disabled.",
+                "Each sweep expands to (Theta values × log10(iter) values × smoothing kinds × K values). \
+                 Use comma-separated lists. \"T0\"/\"off\" in Theta means T=0 (greedy).",
             )
             .small()
             .weak(),
         );
         ui.add_space(4.0);
 
-        self.ensure_config_selection_len();
+        self.ensure_sweep_selection_len();
         let mut remove: Option<usize> = None;
-        let mut config_changed = false;
 
         egui::ScrollArea::vertical().id_salt("cfg_scroll").show(ui, |ui| {
-            for (idx, cfg) in self.configs.iter_mut().enumerate() {
+            for idx in 0..self.sweeps.len() {
+                let mut dirty = false;
                 egui::Frame::NONE
                     .fill(Color32::from_rgb(34, 38, 48))
                     .corner_radius(CornerRadius::same(6))
@@ -608,159 +941,155 @@ impl App {
                     .inner_margin(8.0)
                     .outer_margin(egui::Margin::symmetric(0, 3))
                     .show(ui, |ui| {
+                        let sw = &mut self.sweeps[idx];
+                        let inp = &mut self.sweep_inputs[idx];
+
                         ui.horizontal(|ui| {
                             ui.label("Name:");
-                            ui.add(egui::TextEdit::singleline(&mut cfg.name).desired_width(180.0));
+                            if ui
+                                .add(egui::TextEdit::singleline(&mut sw.name).desired_width(180.0))
+                                .changed()
+                            {
+                                dirty = true;
+                            }
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 if ui.small_button("\u{2715}").on_hover_text("Remove").clicked() {
                                     remove = Some(idx);
                                 }
-                                ui.label(RichText::new(cfg.id()).small().weak());
+                                ui.label(
+                                    RichText::new(format!("\u{2192} {} configs", sw.count()))
+                                        .small()
+                                        .weak(),
+                                );
                             });
                         });
 
                         ui.horizontal(|ui| {
-                            let mut has_theta = cfg.theta.is_some();
+                            ui.label("Theta values:")
+                                .on_hover_text("Comma-separated, e.g. \"-1.0, 0.0, 1.0\". \"T0\" / \"off\" = T = 0 (greedy).");
                             if ui
-                                .checkbox(&mut has_theta, "use Theta")
-                                .on_hover_text("If unchecked, T = 0 (no acceptance of worse moves)")
+                                .add(
+                                    egui::TextEdit::singleline(&mut inp.thetas_text)
+                                        .desired_width(ui.available_width() - 10.0)
+                                        .hint_text("-1.0, 0.0, 1.0, T0"),
+                                )
                                 .changed()
                             {
-                                cfg.theta = if has_theta { Some(0.0) } else { None };
-                                config_changed = true;
-                            }
-                            if let Some(t) = &mut cfg.theta {
-                                let resp = ui.add(
-                                    egui::Slider::new(t, -3.0..=3.0)
-                                        .text("Theta = log10(T)")
-                                        .step_by(0.1),
-                                );
-                                if resp.changed() {
-                                    config_changed = true;
-                                }
-                            } else {
-                                ui.colored_label(Color32::GRAY, "T = 0");
+                                dirty = true;
                             }
                         });
-
                         ui.horizontal(|ui| {
-                            let mut n = cfg.log10_iterations as i32;
+                            ui.label("log10(iter):")
+                                .on_hover_text("Comma-separated integers. iterations = 10^N.");
                             if ui
-                                .add(egui::Slider::new(&mut n, 1..=8).text("log10(iter)"))
+                                .add(
+                                    egui::TextEdit::singleline(&mut inp.iters_text)
+                                        .desired_width(ui.available_width() - 10.0)
+                                        .hint_text("3, 4, 5"),
+                                )
                                 .changed()
                             {
-                                cfg.log10_iterations = n.max(0) as u32;
-                                config_changed = true;
+                                dirty = true;
                             }
-                            ui.label(format!("= {} iterations", cfg.iterations()));
                         });
-
                         ui.horizontal(|ui| {
-                            ui.label("Smoothing:");
-                            let label = match cfg.smoothing {
-                                SmoothingSpec::None => "None".to_string(),
-                                SmoothingSpec::KAverage(k) => format!("K-Avg (det) K={}", k),
-                                SmoothingSpec::RandomKAverage(k) => format!("K-Avg (rand) K={}", k),
-                                SmoothingSpec::WeightedAverage(k) => format!("Weighted K={}", k),
-                            };
-                            egui::ComboBox::from_id_salt(format!("sm_{}", idx))
-                                .selected_text(label)
-                                .show_ui(ui, |ui| {
-                                    let cur_k = match cfg.smoothing {
-                                        SmoothingSpec::None => 8,
-                                        SmoothingSpec::KAverage(k)
-                                        | SmoothingSpec::RandomKAverage(k)
-                                        | SmoothingSpec::WeightedAverage(k) => k,
-                                    };
-                                    if ui
-                                        .selectable_label(
-                                            matches!(cfg.smoothing, SmoothingSpec::None),
-                                            "None",
-                                        )
-                                        .clicked()
-                                    {
-                                        cfg.smoothing = SmoothingSpec::None;
-                                        config_changed = true;
-                                    }
-                                    if ui
-                                        .selectable_label(
-                                            matches!(cfg.smoothing, SmoothingSpec::KAverage(_)),
-                                            "K-Avg (det)",
-                                        )
-                                        .clicked()
-                                    {
-                                        cfg.smoothing = SmoothingSpec::KAverage(cur_k);
-                                        config_changed = true;
-                                    }
-                                    if ui
-                                        .selectable_label(
-                                            matches!(cfg.smoothing, SmoothingSpec::RandomKAverage(_)),
-                                            "K-Avg (rand)",
-                                        )
-                                        .clicked()
-                                    {
-                                        cfg.smoothing = SmoothingSpec::RandomKAverage(cur_k);
-                                        config_changed = true;
-                                    }
-                                    if ui
-                                        .selectable_label(
-                                            matches!(cfg.smoothing, SmoothingSpec::WeightedAverage(_)),
-                                            "Weighted",
-                                        )
-                                        .clicked()
-                                    {
-                                        cfg.smoothing = SmoothingSpec::WeightedAverage(cur_k);
-                                        config_changed = true;
-                                    }
-                                });
-                            match &mut cfg.smoothing {
-                                SmoothingSpec::None => {}
-                                SmoothingSpec::KAverage(k)
-                                | SmoothingSpec::RandomKAverage(k)
-                                | SmoothingSpec::WeightedAverage(k) => {
-                                    if ui
-                                        .add(egui::Slider::new(k, 1..=64).text("K"))
-                                        .changed()
-                                    {
-                                        config_changed = true;
-                                    }
+                            ui.label("Smoothing kinds:");
+                            let labels = ["None", "K-Avg (det)", "K-Avg (rand)", "Weighted"];
+                            for (i, lbl) in labels.iter().enumerate() {
+                                if ui.checkbox(&mut inp.smoothing_kinds[i], *lbl).changed() {
+                                    dirty = true;
                                 }
                             }
                         });
+                        ui.horizontal(|ui| {
+                            ui.label("K values:")
+                                .on_hover_text("Comma-separated positive integers. Ignored if only \"None\" smoothing is selected.");
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut inp.ks_text)
+                                        .desired_width(ui.available_width() - 10.0)
+                                        .hint_text("5, 10, 20"),
+                                )
+                                .changed()
+                            {
+                                dirty = true;
+                            }
+                        });
+
+                        if let Some(err) = &inp.last_error {
+                            ui.colored_label(
+                                Color32::from_rgb(220, 100, 100),
+                                RichText::new(format!("parse error: {}", err)).small(),
+                            );
+                        }
                     });
+
+                if dirty {
+                    let inp = &mut self.sweep_inputs[idx];
+                    let sw = &mut self.sweeps[idx];
+                    let _ = inp.apply_to_sweep(sw);
+                }
             }
         });
 
         if let Some(i) = remove {
-            self.configs.remove(i);
-            self.config_selected_for_run.remove(i);
-        }
-        if config_changed {
-            // no-op marker for future use
+            self.sweeps.remove(i);
+            self.sweep_inputs.remove(i);
+            self.sweep_selected_for_run.remove(i);
         }
     }
 
     fn tab_run(&mut self, ui: &mut egui::Ui) {
-        self.ensure_config_selection_len();
+        self.ensure_sweep_selection_len();
         ui.columns(2, |cols| {
             let left = &mut cols[0];
-            left.heading("Target");
-            if let Some(g) = self.current_graph() {
-                left.label(format!("Graph: {}", g.spec.id()));
-                left.label(format!("  ({} nodes, {} edges)", g.spec.n, g.edge_count));
+            left.heading("Target graphs");
+            let selected_graphs = self.selected_graphs_for_run();
+            if selected_graphs.is_empty() {
+                left.colored_label(
+                    Color32::GRAY,
+                    "No graph checked (use the Graphs tab to check rows).",
+                );
             } else {
-                left.colored_label(Color32::GRAY, "No graph selected (Graphs tab).");
-            }
-            left.add_space(8.0);
-            left.label("Configs to run:");
-            for i in 0..self.configs.len() {
-                let cfg_label = format!("{}  ({})", self.configs[i].name, self.configs[i].id());
-                left.checkbox(&mut self.config_selected_for_run[i], cfg_label);
+                left.label(format!("{} graph(s) selected:", selected_graphs.len()));
+                egui::ScrollArea::vertical()
+                    .id_salt("run_graphs_scroll")
+                    .max_height(120.0)
+                    .show(left, |ui| {
+                        for g in &selected_graphs {
+                            ui.label(
+                                RichText::new(format!(
+                                    "  - {} ({} edges, n={})",
+                                    g.spec.id(),
+                                    g.edge_count,
+                                    g.spec.n
+                                ))
+                                .small(),
+                            );
+                        }
+                    });
             }
 
             left.add_space(8.0);
+            left.heading("Sweeps to run");
+            for i in 0..self.sweeps.len() {
+                let cnt = self.sweeps[i].count();
+                let label = format!(
+                    "{}  (\u{2192} {} configs)",
+                    self.sweeps[i].name, cnt
+                );
+                left.checkbox(&mut self.sweep_selected_for_run[i], label);
+            }
+            let expanded = self.expanded_selected_configs();
+            left.label(
+                RichText::new(format!("\u{2192} {} unique configs after expansion", expanded.len()))
+                    .small()
+                    .weak(),
+            );
+
+            left.add_space(8.0);
             left.separator();
-            left.heading("Seeds");
+            left.heading("Seeds & Threads");
             egui::Grid::new("seeds_grid").num_columns(2).spacing([8.0, 6.0]).show(left, |ui| {
                 ui.label("Start seed:");
                 ui.add(egui::DragValue::new(&mut self.start_seed).speed(1));
@@ -768,15 +1097,25 @@ impl App {
                 ui.label("# seeds:");
                 ui.add(egui::Slider::new(&mut self.num_seeds, 1..=64));
                 ui.end_row();
+                ui.label("# threads:");
+                ui.add(egui::Slider::new(&mut self.num_threads, 1..=self.max_threads.max(1)));
+                ui.end_row();
             });
             left.label(
                 RichText::new(format!(
-                    "Seeds: {}..{}",
+                    "Seeds: {}..{}  | Logical cores: {}",
                     self.start_seed,
-                    self.start_seed.wrapping_add(self.num_seeds as u64)
+                    self.start_seed.wrapping_add(self.num_seeds as u64),
+                    self.max_threads
                 ))
                 .small()
                 .weak(),
+            );
+            let total_tasks = selected_graphs.len() * expanded.len() * self.num_seeds;
+            left.label(
+                RichText::new(format!("Total tasks: {}", total_tasks))
+                    .small()
+                    .weak(),
             );
 
             left.add_space(8.0);
@@ -784,7 +1123,7 @@ impl App {
             left.horizontal(|ui| {
                 if ui
                     .add_enabled(
-                        !in_progress && self.current_graph().is_some(),
+                        !in_progress && !selected_graphs.is_empty() && !expanded.is_empty(),
                         egui::Button::new(RichText::new("Run").strong())
                             .min_size(egui::vec2(100.0, 28.0)),
                     )
@@ -803,14 +1142,21 @@ impl App {
             // Right: progress + log
             let right = &mut cols[1];
             right.heading("Progress");
-            let (in_progress, total, done, skipped, log) = {
+            let (in_progress, total, done, skipped, active, log) = {
                 let st = self.run_status.lock().unwrap();
-                (st.in_progress, st.total, st.done, st.skipped, st.log.clone())
+                (
+                    st.in_progress,
+                    st.total,
+                    st.done,
+                    st.skipped,
+                    st.active_workers,
+                    st.log.clone(),
+                )
             };
             let pct = if total > 0 { done as f32 / total as f32 } else { 0.0 };
             right.add(egui::ProgressBar::new(pct).text(format!(
-                "{}/{} (skipped {})",
-                done, total, skipped
+                "{}/{} (skipped {}, active {})",
+                done, total, skipped, active
             )));
             right.add_space(4.0);
             right.label(
@@ -846,7 +1192,7 @@ impl App {
         });
         ui.label(
             RichText::new(
-                "Loads runs in data/results matching the currently selected graph, configs, and seed range (Run tab).",
+                "Loads runs in data/results matching the currently selected graphs, sweeps, and seed range (Run tab).",
             )
             .small()
             .weak(),
@@ -906,7 +1252,8 @@ impl App {
                         pui.line(
                             Line::new(PlotPoints::new(pts))
                                 .name(format!(
-                                    "{} | {} | s={} | {}",
+                                    "{} | {} | {} | s={} | {}",
+                                    r.graph_spec.id(),
                                     r.config.name,
                                     r.config.id(),
                                     r.seed,
@@ -931,6 +1278,7 @@ impl App {
                 .min_col_width(60.0)
                 .show(ui, |ui| {
                     ui.label(RichText::new("sel").strong());
+                    ui.label(RichText::new("graph").strong());
                     ui.label(RichText::new("config").strong());
                     ui.label(RichText::new("seed").strong());
                     ui.label(RichText::new("steps").strong());
@@ -945,6 +1293,7 @@ impl App {
                         {
                             self.selected_result = if is_sel { None } else { Some(i) };
                         }
+                        ui.label(r.graph_spec.id());
                         ui.label(format!("{} ({})", r.config.name, r.config.id()));
                         ui.label(format!("{}", r.seed));
                         ui.label(format!("{}", r.records.len()));

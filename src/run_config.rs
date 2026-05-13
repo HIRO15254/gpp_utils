@@ -86,6 +86,62 @@ impl RunConfig {
     }
 }
 
+/// 解法・スムージングパラメータの掃引集合。
+///
+/// `thetas` × `log10_iterations` × `smoothings` の全組合せを
+/// [`ConfigSweep::expand`] で [`RunConfig`] 列に展開する。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigSweep {
+    /// 表示用ラベル（展開後の各 RunConfig のプレフィックスにも使う）。
+    pub name: String,
+    /// 温度パラメータ集合。`None` は T=0（受理しない）。
+    pub thetas: Vec<Option<f64>>,
+    /// イテレーション数の指数集合（`max_iter = 10^N`）。
+    pub log10_iterations: Vec<u32>,
+    /// スムージング戦略集合。
+    pub smoothings: Vec<SmoothingSpec>,
+}
+
+impl ConfigSweep {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            thetas: vec![Some(0.0)],
+            log10_iterations: vec![4],
+            smoothings: vec![SmoothingSpec::None],
+        }
+    }
+
+    /// 全組合せを展開した RunConfig 列。
+    pub fn expand(&self) -> Vec<RunConfig> {
+        let mut out = Vec::with_capacity(self.count());
+        let base = self.name.trim();
+        for &theta in &self.thetas {
+            for &log_n in &self.log10_iterations {
+                for sm in &self.smoothings {
+                    out.push(RunConfig {
+                        name: base.to_string(),
+                        theta,
+                        log10_iterations: log_n,
+                        smoothing: *sm,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// 展開後の組合せ数（いずれか 1 つでも空ならゼロ）。
+    pub fn count(&self) -> usize {
+        if self.thetas.is_empty() || self.log10_iterations.is_empty() || self.smoothings.is_empty()
+        {
+            0
+        } else {
+            self.thetas.len() * self.log10_iterations.len() * self.smoothings.len()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,5 +182,35 @@ mod tests {
             smoothing: SmoothingSpec::None,
         };
         assert_eq!(c0.id(), "T0_iter5_none");
+    }
+
+    #[test]
+    fn test_sweep_expand_cartesian() {
+        let sweep = ConfigSweep {
+            name: "s".into(),
+            thetas: vec![Some(0.0), None],
+            log10_iterations: vec![3, 4],
+            smoothings: vec![SmoothingSpec::None, SmoothingSpec::KAverage(5)],
+        };
+        assert_eq!(sweep.count(), 8);
+        let cfgs = sweep.expand();
+        assert_eq!(cfgs.len(), 8);
+        // 全ての展開された ID が一意であること。
+        let mut ids: Vec<_> = cfgs.iter().map(|c| c.id()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 8);
+    }
+
+    #[test]
+    fn test_sweep_empty_axis() {
+        let sweep = ConfigSweep {
+            name: "s".into(),
+            thetas: vec![],
+            log10_iterations: vec![3],
+            smoothings: vec![SmoothingSpec::None],
+        };
+        assert_eq!(sweep.count(), 0);
+        assert!(sweep.expand().is_empty());
     }
 }
