@@ -10,12 +10,12 @@ use rand_mt::Mt19937GenRand64;
 use serde::{Deserialize, Serialize};
 
 use crate::file_utils::{ensure_dir_exists, load_json, save_json};
-use crate::graph_partition::{GraphPartitionProblem, Partition};
+use crate::graph_partition::{GraphPartitionProblem, Partition, get_partition_sizes};
 use crate::graph_spec::GraphSpec;
 use crate::optimization::{Problem, Smoothing};
 use crate::run_config::{RunConfig, SmoothingSpec};
 use crate::smoothing::{
-    KAveragingSmoothing, NoSmoothing, RandomKSmoothing, WeightedNeighbourSmoothing,
+    KAveragingSmoothing, RandomKSmoothing, WeightedNeighbourSmoothing,
 };
 
 /// 1 ステップ分の計測値。
@@ -75,25 +75,31 @@ pub fn logarithmic_steps(max_iter: usize) -> Vec<usize> {
     v
 }
 
-/// 元空間での山登り（NoSmoothing で評価して下降）。
+/// 元空間での山登り（差分計算で全近傍を評価し、最良を選ぶ）。
 fn hill_climb_real(prob: &GraphPartitionProblem, start: &Partition) -> Partition {
     let mut current = start.clone();
-    let mut current_score = prob.score(&current);
+    let n = prob.graph().node_count;
+    let (mut t, mut f) = get_partition_sizes(&current);
     loop {
-        let neighbours = prob.neighbour(&current);
-        let mut best_idx = None;
-        let mut best_score = current_score;
-        for (i, n) in neighbours.iter().enumerate() {
-            let s = prob.score(n);
-            if s < best_score {
-                best_score = s;
-                best_idx = Some(i);
+        let mut best_delta = 0.0;
+        let mut best_i: Option<usize> = None;
+        for i in 0..n {
+            let d = prob.flip_delta_with_sizes(&current, i, (t, f));
+            if d < best_delta - 1e-12 {
+                best_delta = d;
+                best_i = Some(i);
             }
         }
-        match best_idx {
+        match best_i {
             Some(i) => {
-                current = neighbours[i].clone();
-                current_score = best_score;
+                if current[i] {
+                    t -= 1;
+                    f += 1;
+                } else {
+                    t += 1;
+                    f -= 1;
+                }
+                current[i] = !current[i];
             }
             None => break,
         }
@@ -101,7 +107,7 @@ fn hill_climb_real(prob: &GraphPartitionProblem, start: &Partition) -> Partition
     current
 }
 
-/// 任意のスムージング空間での山登り。
+/// 任意のスムージング空間での山登り（フリップ・イン・プレースで近傍配列確保を回避）。
 fn hill_climb_smoothed<Sm>(
     prob: &GraphPartitionProblem,
     sm: &Sm,
@@ -111,21 +117,23 @@ where
     Sm: Smoothing<Partition> + ?Sized,
 {
     let mut current = start.clone();
+    let n = current.len();
     let mut current_smoothed = sm.score(prob, &current);
     loop {
-        let neighbours = prob.neighbour(&current);
-        let mut best_idx = None;
         let mut best_score = current_smoothed;
-        for (i, n) in neighbours.iter().enumerate() {
-            let s = sm.score(prob, n);
+        let mut best_i: Option<usize> = None;
+        for i in 0..n {
+            current[i] = !current[i];
+            let s = sm.score(prob, &current);
+            current[i] = !current[i];
             if s < best_score {
                 best_score = s;
-                best_idx = Some(i);
+                best_i = Some(i);
             }
         }
-        match best_idx {
+        match best_i {
             Some(i) => {
-                current = neighbours[i].clone();
+                current[i] = !current[i];
                 current_smoothed = best_score;
             }
             None => break,
@@ -134,7 +142,7 @@ where
     current
 }
 
-/// SA を実行する（スムージング戦略は型として渡す）。
+/// SA を実行する（一般スムージング版。`flip_in_place` で近傍配列確保を回避）。
 fn run_sa_with_smoothing<Sm>(
     prob: &GraphPartitionProblem,
     sm: &Sm,
@@ -146,27 +154,27 @@ where
 {
     let mut rng = Mt19937GenRand64::new(seed);
     let mut current: Partition = prob.random_solution(&mut rng);
+    let n = current.len();
     let mut current_smoothed = sm.score(prob, &current);
 
     let max_iter = cfg.iterations();
     let temperature = cfg.temperature();
 
-    // スナップショットを取るステップ番号を昇順で。
     let snap_steps = logarithmic_steps(max_iter);
     let mut snap_iter = snap_steps.iter().copied().peekable();
     let mut records = Vec::with_capacity(snap_steps.len() + 1);
 
-    // 初期スナップショット (step = 0)
     records.push(make_snapshot(prob, sm, &current, current_smoothed, 0));
 
+    if n == 0 {
+        return (current, records);
+    }
+
     for it in 1..=max_iter {
-        let neighbours = prob.neighbour(&current);
-        if neighbours.is_empty() {
-            break;
-        }
-        let idx = rng.gen_range(0..neighbours.len());
-        let neighbour_smoothed = sm.score(prob, &neighbours[idx]);
-        let delta = neighbour_smoothed - current_smoothed;
+        let i = rng.gen_range(0..n);
+        current[i] = !current[i];
+        let candidate_smoothed = sm.score(prob, &current);
+        let delta = candidate_smoothed - current_smoothed;
         let accept = if delta < 0.0 {
             true
         } else if temperature > 0.0 {
@@ -175,8 +183,9 @@ where
             false
         };
         if accept {
-            current = neighbours[idx].clone();
-            current_smoothed = neighbour_smoothed;
+            current_smoothed = candidate_smoothed;
+        } else {
+            current[i] = !current[i];
         }
 
         if let Some(&want) = snap_iter.peek() {
@@ -188,6 +197,86 @@ where
     }
 
     (current, records)
+}
+
+/// SA の高速パス（NoSmoothing 専用）。
+/// 差分計算でスコアを増分管理し、毎ステップ O(deg(i)) で動く。
+fn run_sa_no_smoothing(
+    prob: &GraphPartitionProblem,
+    cfg: &RunConfig,
+    seed: u64,
+) -> (Partition, Vec<StepRecord>) {
+    let mut rng = Mt19937GenRand64::new(seed);
+    let mut current: Partition = prob.random_solution(&mut rng);
+    let n = current.len();
+    let (mut t, mut f) = get_partition_sizes(&current);
+    let mut current_score = prob.score(&current);
+
+    let max_iter = cfg.iterations();
+    let temperature = cfg.temperature();
+
+    let snap_steps = logarithmic_steps(max_iter);
+    let mut snap_iter = snap_steps.iter().copied().peekable();
+    let mut records = Vec::with_capacity(snap_steps.len() + 1);
+
+    records.push(make_snapshot_no_smoothing(prob, &current, current_score, 0));
+
+    if n == 0 {
+        return (current, records);
+    }
+
+    for it in 1..=max_iter {
+        let i = rng.gen_range(0..n);
+        let delta = prob.flip_delta_with_sizes(&current, i, (t, f));
+        let accept = if delta < 0.0 {
+            true
+        } else if temperature > 0.0 {
+            rng.r#gen::<f64>() < (-delta / temperature).exp()
+        } else {
+            false
+        };
+        if accept {
+            if current[i] {
+                t -= 1;
+                f += 1;
+            } else {
+                t += 1;
+                f -= 1;
+            }
+            current[i] = !current[i];
+            current_score += delta;
+        }
+
+        if let Some(&want) = snap_iter.peek() {
+            if it == want {
+                records.push(make_snapshot_no_smoothing(prob, &current, current_score, it));
+                snap_iter.next();
+            }
+        }
+    }
+
+    (current, records)
+}
+
+/// NoSmoothing 用スナップショット。スムージング空間 = 元空間なので、
+/// 6 トレース全てが同じ値になり、山登りも 1 回で済む。
+fn make_snapshot_no_smoothing(
+    prob: &GraphPartitionProblem,
+    current: &Partition,
+    current_score: f64,
+    step: usize,
+) -> StepRecord {
+    let basin = hill_climb_real(prob, current);
+    let basin_score = prob.score(&basin);
+    StepRecord {
+        step,
+        current_smoothed: current_score,
+        current_real: current_score,
+        basin_smoothed_from_smoothed: basin_score,
+        basin_real_from_smoothed: basin_score,
+        basin_smoothed_from_real: basin_score,
+        basin_real_from_real: basin_score,
+    }
 }
 
 fn make_snapshot<Sm>(
@@ -233,7 +322,9 @@ pub fn execute(
     let t0 = std::time::Instant::now();
     let sm_seed = seed.wrapping_add(0xDEAD_BEEF);
     let (final_p, records) = match cfg.smoothing {
-        SmoothingSpec::None => run_sa_with_smoothing(prob, &NoSmoothing, cfg, seed),
+        // 差分計算を使う高速パス。スムージング空間 = 元空間なので
+        // 6 トレースは全て同値、山登りも 1 回で済む。
+        SmoothingSpec::None => run_sa_no_smoothing(prob, cfg, seed),
         SmoothingSpec::KAverage(k) => {
             run_sa_with_smoothing(prob, &KAveragingSmoothing::new(k), cfg, seed)
         }
