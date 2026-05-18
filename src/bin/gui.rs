@@ -1254,9 +1254,10 @@ impl App {
                             }
                             if let Some(t) = &mut cfg.theta {
                                 ui.add(
+                                    // step_by は付けない（sweep 生成の細かい
+                                    // theta 値が丸められて壊れるのを防ぐ）。
                                     egui::Slider::new(t, -3.0..=3.0)
-                                        .text("Theta = log10(T)")
-                                        .step_by(0.1),
+                                        .text("Theta = log10(T)"),
                                 );
                             } else {
                                 ui.colored_label(Color32::GRAY, "T = 0");
@@ -1338,11 +1339,10 @@ impl App {
                                     ui.add(egui::Slider::new(k, 1..=64).text("K"));
                                 }
                                 SmoothingSpec::WeightedAverage(w) => {
-                                    ui.add(
-                                        egui::Slider::new(w, 0.0..=1.0)
-                                            .text("weight")
-                                            .step_by(0.05),
-                                    );
+                                    // step_by は付けない: 設定すると egui が値を
+                                    // その倍数へ丸めて書き戻し、sweep で生成した
+                                    // 細かい重み（0.125 等）が壊れるため。
+                                    ui.add(egui::Slider::new(w, 0.0..=1.0).text("weight"));
                                 }
                             }
                         });
