@@ -237,6 +237,7 @@ struct App {
     sweep_iters: String,
     sweep_kind: SmoothingKind,
     sweep_ks: String,
+    sweep_weights: String,
 
     // Run params
     start_seed: u64,
@@ -327,6 +328,7 @@ impl App {
             sweep_iters: "4".into(),
             sweep_kind: SmoothingKind::None,
             sweep_ks: "4, 8".into(),
+            sweep_weights: "0.25, 0.5, 1".into(),
             start_seed: 0,
             num_seeds: 1,
             num_threads: detected_cpus,
@@ -578,6 +580,7 @@ impl App {
         }
         let log10_iterations = parse_num_list::<u32>(&self.sweep_iters);
         let ks = parse_num_list::<usize>(&self.sweep_ks);
+        let weights = parse_num_list::<f64>(&self.sweep_weights);
 
         if thetas.is_empty() {
             self.status = "Sweep: specify at least one Theta (or enable greedy).".into();
@@ -587,8 +590,13 @@ impl App {
             self.status = "Sweep: specify at least one log10(iter) value.".into();
             return;
         }
-        if self.sweep_kind.needs_k() && ks.is_empty() {
+        if self.sweep_kind.uses_k() && ks.is_empty() {
             self.status = "Sweep: specify at least one K value for this smoothing.".into();
+            return;
+        }
+        if self.sweep_kind.uses_weight() && weights.is_empty() {
+            self.status =
+                "Sweep: specify at least one weight (0..1) for weighted smoothing.".into();
             return;
         }
 
@@ -597,6 +605,7 @@ impl App {
             log10_iterations,
             smoothing_kind: self.sweep_kind,
             ks,
+            weights,
         };
         let generated = sweep.expand();
         let n = generated.len();
@@ -1158,13 +1167,22 @@ impl App {
                             });
                         ui.end_row();
 
-                        ui.label("K values:");
-                        ui.add_enabled(
-                            self.sweep_kind.needs_k(),
-                            egui::TextEdit::singleline(&mut self.sweep_ks)
-                                .desired_width(240.0)
-                                .hint_text("e.g. 4, 8, 16"),
-                        );
+                        if self.sweep_kind.uses_weight() {
+                            ui.label("Weight values (0..1):");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.sweep_weights)
+                                    .desired_width(240.0)
+                                    .hint_text("e.g. 0.25, 0.5, 1"),
+                            );
+                        } else {
+                            ui.label("K values:");
+                            ui.add_enabled(
+                                self.sweep_kind.uses_k(),
+                                egui::TextEdit::singleline(&mut self.sweep_ks)
+                                    .desired_width(240.0)
+                                    .hint_text("e.g. 4, 8, 16"),
+                            );
+                        }
                         ui.end_row();
                     });
                 if ui
@@ -1262,16 +1280,19 @@ impl App {
                                 SmoothingSpec::None => "None".to_string(),
                                 SmoothingSpec::KAverage(k) => format!("K-Avg (det) K={}", k),
                                 SmoothingSpec::RandomKAverage(k) => format!("K-Avg (rand) K={}", k),
-                                SmoothingSpec::WeightedAverage(k) => format!("Weighted K={}", k),
+                                SmoothingSpec::WeightedAverage(w) => format!("Weighted w={:.2}", w),
                             };
                             egui::ComboBox::from_id_salt(format!("sm_{}", idx))
                                 .selected_text(label)
                                 .show_ui(ui, |ui| {
                                     let cur_k = match cfg.smoothing {
-                                        SmoothingSpec::None => 8,
                                         SmoothingSpec::KAverage(k)
-                                        | SmoothingSpec::RandomKAverage(k)
-                                        | SmoothingSpec::WeightedAverage(k) => k,
+                                        | SmoothingSpec::RandomKAverage(k) => k,
+                                        _ => 8,
+                                    };
+                                    let cur_w = match cfg.smoothing {
+                                        SmoothingSpec::WeightedAverage(w) => w,
+                                        _ => 0.5,
                                     };
                                     if ui
                                         .selectable_label(
@@ -1307,15 +1328,21 @@ impl App {
                                         )
                                         .clicked()
                                     {
-                                        cfg.smoothing = SmoothingSpec::WeightedAverage(cur_k);
+                                        cfg.smoothing = SmoothingSpec::WeightedAverage(cur_w);
                                     }
                                 });
                             match &mut cfg.smoothing {
                                 SmoothingSpec::None => {}
                                 SmoothingSpec::KAverage(k)
-                                | SmoothingSpec::RandomKAverage(k)
-                                | SmoothingSpec::WeightedAverage(k) => {
+                                | SmoothingSpec::RandomKAverage(k) => {
                                     ui.add(egui::Slider::new(k, 1..=64).text("K"));
+                                }
+                                SmoothingSpec::WeightedAverage(w) => {
+                                    ui.add(
+                                        egui::Slider::new(w, 0.0..=1.0)
+                                            .text("weight")
+                                            .step_by(0.05),
+                                    );
                                 }
                             }
                         });

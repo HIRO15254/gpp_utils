@@ -31,7 +31,7 @@ fn main() {
         ("None", SmoothingSpec::None),
         ("KAvg(8)", SmoothingSpec::KAverage(8)),
         ("RandomK(8)", SmoothingSpec::RandomKAverage(8)),
-        ("Weighted(8)", SmoothingSpec::WeightedAverage(8)),
+        ("Weighted(0.5)", SmoothingSpec::WeightedAverage(0.5)),
     ];
 
     println!("{}", "=".repeat(72));

@@ -298,6 +298,10 @@ $$
 - $K = n$: $w = 1$ → 全近傍平均と等価
 - $0 < K < n$: 両者の連続的な内挿。$K$ を連続パラメータとして扱える。
 
+> **実験ワークフローでの指定**: `smoothing.rs` の汎用版は $K$ から $w = K'/n$ を導くが、
+> 実験ワークフロー（`SmoothingSpec::WeightedAverage`）は重み $w \in [0,1]$ を**直接指定**する
+> （グラフサイズ $n$ に依存しないため）。数式は同一で、パラメータの与え方のみが異なる。
+
 ### 4.5 補足: AllNeighbourAveragingSmoothing
 
 全近傍スコアの単純平均。`WeightedNeighbourSmoothing` の $K = n$ と一致する。

@@ -14,8 +14,17 @@ pub enum SmoothingSpec {
     KAverage(usize),
     /// 確率的 K-近傍平均（距離 2 フォールバックあり）。
     RandomKAverage(usize),
-    /// 重み付き平均（K/n × avg + (1-K/n) × current）。
-    WeightedAverage(usize),
+    /// 重み付き平均（w × 全近傍平均 + (1-w) × current）。`w` は重み（0〜1）。
+    WeightedAverage(f64),
+}
+
+/// 重み値を id 文字列用に整形する（小数点 `.` は `p` に置換）。
+fn fmt_weight(w: f64) -> String {
+    if w.fract().abs() < 1e-9 {
+        format!("{}", w as i64)
+    } else {
+        format!("{}", w).replace('.', "p")
+    }
 }
 
 impl SmoothingSpec {
@@ -24,7 +33,7 @@ impl SmoothingSpec {
             Self::None => "none".into(),
             Self::KAverage(k) => format!("kavg{}", k),
             Self::RandomKAverage(k) => format!("rkavg{}", k),
-            Self::WeightedAverage(k) => format!("wavg{}", k),
+            Self::WeightedAverage(w) => format!("wavg{}", fmt_weight(*w)),
         }
     }
 
@@ -105,19 +114,14 @@ impl SmoothingKind {
         }
     }
 
-    /// K 値を必要とするか（`None` 以外は必要）。
-    pub fn needs_k(self) -> bool {
-        !matches!(self, Self::None)
+    /// 整数 K 値を必要とするか（KAverage / RandomKAverage）。
+    pub fn uses_k(self) -> bool {
+        matches!(self, Self::KAverage | Self::RandomKAverage)
     }
 
-    /// 種別と K から `SmoothingSpec` を作る。`None` 種別では K を無視する。
-    pub fn with_k(self, k: usize) -> SmoothingSpec {
-        match self {
-            Self::None => SmoothingSpec::None,
-            Self::KAverage => SmoothingSpec::KAverage(k),
-            Self::RandomKAverage => SmoothingSpec::RandomKAverage(k),
-            Self::WeightedAverage => SmoothingSpec::WeightedAverage(k),
-        }
+    /// 重み値（0〜1）を必要とするか（WeightedAverage）。
+    pub fn uses_weight(self) -> bool {
+        matches!(self, Self::WeightedAverage)
     }
 }
 
@@ -133,19 +137,29 @@ pub struct ConfigSweep {
     pub log10_iterations: Vec<u32>,
     /// 平滑化の種別（生成される全 `RunConfig` で共通）。
     pub smoothing_kind: SmoothingKind,
-    /// 平滑化の K 値候補。`smoothing_kind` が `None` のときは無視される。
+    /// 平滑化の K 値候補（`smoothing_kind` が KAverage / RandomKAverage のとき使用）。
     #[serde(default)]
     pub ks: Vec<usize>,
+    /// 平滑化の重み候補 0〜1（`smoothing_kind` が WeightedAverage のとき使用）。
+    #[serde(default)]
+    pub weights: Vec<f64>,
 }
 
 impl ConfigSweep {
     /// `thetas × log10_iterations × smoothings` の直積を取り `RunConfig` 群を生成する。
     /// 各 `RunConfig` の `name` には一意な `id()` 文字列が入る。
     pub fn expand(&self) -> Vec<RunConfig> {
-        let smoothings: Vec<SmoothingSpec> = if self.smoothing_kind.needs_k() {
-            self.ks.iter().map(|&k| self.smoothing_kind.with_k(k)).collect()
-        } else {
-            vec![SmoothingSpec::None]
+        let smoothings: Vec<SmoothingSpec> = match self.smoothing_kind {
+            SmoothingKind::None => vec![SmoothingSpec::None],
+            SmoothingKind::KAverage => {
+                self.ks.iter().map(|&k| SmoothingSpec::KAverage(k)).collect()
+            }
+            SmoothingKind::RandomKAverage => {
+                self.ks.iter().map(|&k| SmoothingSpec::RandomKAverage(k)).collect()
+            }
+            SmoothingKind::WeightedAverage => {
+                self.weights.iter().map(|&w| SmoothingSpec::WeightedAverage(w)).collect()
+            }
         };
         let mut out = Vec::new();
         for &theta in &self.thetas {
@@ -215,6 +229,7 @@ mod tests {
             log10_iterations: vec![4, 5],
             smoothing_kind: SmoothingKind::KAverage,
             ks: vec![4, 8],
+            weights: vec![],
         };
         // 2 thetas x 2 iters x 2 Ks = 8
         let cfgs = sweep.expand();
@@ -224,15 +239,28 @@ mod tests {
             assert_eq!(c.name, c.id());
         }
 
-        // None 種別は ks を無視し、平滑化なしの 1 通りに展開される。
+        // None 種別は ks / weights を無視し、平滑化なしの 1 通りに展開される。
         let none_sweep = ConfigSweep {
             thetas: vec![Some(1.0)],
             log10_iterations: vec![3],
             smoothing_kind: SmoothingKind::None,
             ks: vec![4, 8, 16],
+            weights: vec![0.5],
         };
         let none_cfgs = none_sweep.expand();
         assert_eq!(none_cfgs.len(), 1);
         assert_eq!(none_cfgs[0].smoothing, SmoothingSpec::None);
+
+        // WeightedAverage 種別は weights を直積軸に使う（ks は無視）。
+        let w_sweep = ConfigSweep {
+            thetas: vec![Some(0.0)],
+            log10_iterations: vec![4],
+            smoothing_kind: SmoothingKind::WeightedAverage,
+            ks: vec![4, 8],
+            weights: vec![0.25, 0.5, 1.0],
+        };
+        let w_cfgs = w_sweep.expand();
+        assert_eq!(w_cfgs.len(), 3);
+        assert_eq!(w_cfgs[0].smoothing, SmoothingSpec::WeightedAverage(0.25));
     }
 }

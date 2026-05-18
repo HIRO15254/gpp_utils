@@ -42,7 +42,7 @@ fn main() {
         ("none", SmoothingSpec::None),
         ("kavg8", SmoothingSpec::KAverage(8)),
         ("rkavg8", SmoothingSpec::RandomKAverage(8)),
-        ("wavg8", SmoothingSpec::WeightedAverage(8)),
+        ("wavg0.5", SmoothingSpec::WeightedAverage(0.5)),
     ];
 
     // smoothing × seed をシード並列で実行する。`collect()` は順序を保つため、

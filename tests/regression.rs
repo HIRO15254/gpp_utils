@@ -46,7 +46,7 @@ fn parse_smoothing(label: &str) -> SmoothingSpec {
         "none" => SmoothingSpec::None,
         "kavg8" => SmoothingSpec::KAverage(8),
         "rkavg8" => SmoothingSpec::RandomKAverage(8),
-        "wavg8" => SmoothingSpec::WeightedAverage(8),
+        "wavg0.5" => SmoothingSpec::WeightedAverage(0.5),
         other => panic!("unknown smoothing label: {}", other),
     }
 }

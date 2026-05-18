@@ -257,9 +257,12 @@ cargo run --release --bin cli -- --batch <定義>.json [オプション]
 | 戦略 | 表記 |
 |---|---|
 | 平滑化なし | `"None"` |
-| 決定論的 K 近傍平均 | `{ "KAverage": 8 }` |
-| 確率的 K 近傍平均 | `{ "RandomKAverage": 8 }` |
-| 重み付き平均 | `{ "WeightedAverage": 8 }` |
+| 決定論的 K 近傍平均 | `{ "KAverage": 8 }`（K = 近傍の個数） |
+| 確率的 K 近傍平均 | `{ "RandomKAverage": 8 }`（K = 近傍の個数） |
+| 重み付き平均 | `{ "WeightedAverage": 0.5 }`（重み w = 0〜1） |
+
+`WeightedAverage` の値は重み `w` で、`w × 全近傍平均 + (1 − w) × 実スコア` のブレンド比。
+`w = 0` は平滑化なし相当、`w = 1` は全近傍平均。グラフサイズに依存しない（範囲外は 0〜1 にクランプ）。
 
 #### `config_sweep` — パラメータ総当たり
 
@@ -287,9 +290,11 @@ cargo run --release --bin cli -- --batch <定義>.json [オプション]
 | `thetas` | 配列 | 温度 Θ の候補。`null` は T = 0（貪欲） |
 | `log10_iterations` | 整数配列 | 反復回数指数 N（= 10^N）の候補 |
 | `smoothing_kind` | 下表参照 | 平滑化の種別（生成される全設定で共通） |
-| `ks` | 整数配列 | 平滑化の K 候補。`smoothing_kind` が `"None"` のときは無視される |
+| `ks` | 整数配列 | K 近傍個数の候補。`smoothing_kind` が `"KAverage"` / `"RandomKAverage"` のとき使用 |
+| `weights` | 実数配列 | 重み（0〜1）の候補。`smoothing_kind` が `"WeightedAverage"` のとき使用 |
 
 `smoothing_kind`（`SmoothingKind`）の表記: `"None"` / `"KAverage"` / `"RandomKAverage"` / `"WeightedAverage"`。
+`KAverage` / `RandomKAverage` は `ks` を、`WeightedAverage` は `weights` を直積軸に使う（`None` はどちらも無視）。
 
 上記の例は `4 thetas × 2 iterations × 3 Ks = 24` 設定に展開され、`1 graph × 24 configs × 3 seeds = 72` ジョブが実行される。GUI では Configs タブの「Generate from sweep」から同じ展開を行える。
 

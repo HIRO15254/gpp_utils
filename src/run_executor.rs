@@ -518,17 +518,17 @@ fn run_sa_random_k(
 
 fn run_sa_weighted(
     prob: &GraphPartitionProblem,
-    k: usize,
+    weight: f64,
     cfg: &RunConfig,
     seed: u64,
 ) -> (Partition, Vec<StepRecord>) {
     let n = prob.neighbour_size();
+    // 重みは 0〜1 にクランプ（w=0: 平滑化なし相当、w=1: 全近傍平均）。
+    let weight = weight.clamp(0.0, 1.0);
     run_sa_generic(prob, cfg, seed, false, move |p, cuts_at, c, t, f| {
         if n == 0 {
             return GraphPartitionProblem::score_from_state(c, t, f);
         }
-        let k_clamped = k.min(n) as f64;
-        let weight = k_clamped / n as f64;
         // 元実装と同じ加算順序: 0..n を逐次加算 → / n
         let neighbour_avg = (0..n)
             .map(|i| prob.delta_apply_cached(p, cuts_at, i, c, t, f).3)
@@ -556,7 +556,7 @@ pub fn execute(
         SmoothingSpec::None => run_sa_none(prob, cfg, seed),
         SmoothingSpec::KAverage(k) => run_sa_kavg(prob, k, cfg, seed),
         SmoothingSpec::RandomKAverage(k) => run_sa_random_k(prob, k, sm_seed, cfg, seed),
-        SmoothingSpec::WeightedAverage(k) => run_sa_weighted(prob, k, cfg, seed),
+        SmoothingSpec::WeightedAverage(w) => run_sa_weighted(prob, w, cfg, seed),
     };
     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
     RunResult {
