@@ -1,23 +1,9 @@
-//! 複数平滑化 × 複数ソルバーの実験フレームワーク。
+//! 実験用の補助ユーティリティ。
 //!
-//! 異なるスムージング戦略とソルバーの組み合わせを体系的に実行し、
-//! 結果を集計・分析する。
+//! 与えられた解から山登りでベイスン（局所最適解）へ到達し、
+//! その評価値を返す [`BasinEvaluator`] を提供する。
 
-use crate::optimization::{Problem, Smoothing, SolverStats};
-use serde::{Deserialize, Serialize};
-
-/// 実験の結果。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExperimentRunResult {
-    /// 問題の名前。
-    pub problem_name: String,
-    /// スムージング戦略の名前。
-    pub smoothing_name: String,
-    /// ソルバーの名前。
-    pub solver_name: String,
-    /// ソルバーの統計情報。
-    pub stats: SolverStats,
-}
+use crate::optimization::{Problem, Smoothing};
 
 /// ベイスン評価器。
 ///

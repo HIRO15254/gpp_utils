@@ -49,7 +49,6 @@ impl Solver for SimulatedAnnealingSolver {
         seed: u64,
     ) -> (S, SolverStats) {
         let mut rng = Mt19937GenRand64::new(seed);
-        let mut _smoothing_rng = Mt19937GenRand64::new(seed ^ 0xAAAAAAAAAAAAAAAA);
 
         let mut current = initial.clone();
         let mut current_smoothed = smoothing.score(problem, &current);

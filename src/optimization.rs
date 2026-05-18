@@ -85,7 +85,7 @@ pub trait Solver: Send + Sync {
     /// - `problem`: 最適化問題
     /// - `smoothing`: スコア計算方法
     /// - `initial`: 初期解
-    /// - `seed`: 乱数生成用シード。ソルバーは別途平滑化用シード（seed ^ 0xAAAAAAAAAAAAAAAA）を使用する。
+    /// - `seed`: 乱数生成用シード。
     fn solve<S: Clone>(
         &self,
         problem: &dyn Problem<S>,
@@ -93,103 +93,4 @@ pub trait Solver: Send + Sync {
         initial: S,
         seed: u64,
     ) -> (S, SolverStats);
-}
-
-// ============================================================================
-// Smoothing の基本実装
-// ============================================================================
-
-/// スムージングなし（元のスコアをそのまま使用）。
-#[derive(Debug, Clone)]
-pub struct NoSmoothing;
-
-impl<S: Clone> Smoothing<S> for NoSmoothing {
-    fn score(&self, problem: &dyn Problem<S>, solution: &S) -> f64 {
-        problem.score(solution)
-    }
-}
-
-/// K-近傍平均によるスムージング。
-///
-/// ランダムに選んだ K 個の近傍のスコアを平均して、
-/// 平滑化されたスコアを計算する。
-#[derive(Debug, Clone)]
-pub struct KAveragingSmoothing {
-    /// サンプリングする近傍数。
-    pub k: usize,
-}
-
-impl KAveragingSmoothing {
-    pub fn new(k: usize) -> Self {
-        Self { k }
-    }
-}
-
-impl<S: Clone> Smoothing<S> for KAveragingSmoothing {
-    fn score(&self, problem: &dyn Problem<S>, solution: &S) -> f64 {
-        let neighbours = problem.neighbour(solution);
-        if neighbours.is_empty() {
-            return problem.score(solution);
-        }
-
-        let sample_count = self.k.min(neighbours.len());
-        let sum: f64 = neighbours
-            .iter()
-            .take(sample_count)
-            .map(|n| problem.score(n))
-            .sum();
-        sum / sample_count as f64
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[derive(Clone)]
-    struct DummyProblem;
-
-    impl Problem<i32> for DummyProblem {
-        fn score(&self, solution: &i32) -> f64 {
-            (solution * solution) as f64
-        }
-
-        fn neighbour(&self, solution: &i32) -> Vec<i32> {
-            vec![solution - 1, *solution, solution + 1]
-        }
-
-        fn random_solution(&self, _rng: &mut Mt19937GenRand64) -> i32 {
-            0
-        }
-
-        fn neighbour_size(&self) -> usize {
-            3
-        }
-    }
-
-    #[test]
-    fn test_no_smoothing_equals_real_score() {
-        let problem = DummyProblem;
-        let smoothing = NoSmoothing;
-        let solution = 5i32;
-
-        assert_eq!(
-            smoothing.score(&problem, &solution),
-            problem.score(&solution)
-        );
-    }
-
-    #[test]
-    fn test_k_averaging_smoothing() {
-        let problem = DummyProblem;
-        let smoothing = KAveragingSmoothing::new(2);
-        let solution = 5i32;
-
-        // neighbours = [4, 5, 6]
-        // scores = [16, 25, 36]
-        // average of first 2: (16 + 25) / 2 = 20.5
-        let score = smoothing.score(&problem, &solution);
-        assert!((score - 20.5).abs() < 1e-10);
-    }
-
 }

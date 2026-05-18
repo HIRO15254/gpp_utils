@@ -628,31 +628,7 @@ impl App {
         }
 
         let png_path = dir.join("plot.png");
-        let invoke = std::process::Command::new("gnuplot")
-            .arg("plot.gp")
-            .current_dir(&dir)
-            .output();
-        match invoke {
-            Ok(out) if out.status.success() => {
-                self.status = format!("PNG: {}", png_path.display());
-            }
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                self.status = format!(
-                    "gnuplot failed (exit {}): {}. Script saved at {}/plot.gp",
-                    out.status,
-                    stderr.trim(),
-                    dir.display()
-                );
-            }
-            Err(e) => {
-                self.status = format!(
-                    "Could not invoke gnuplot ({}). Script saved at {}/plot.gp; run `gnuplot plot.gp` from that directory.",
-                    e,
-                    dir.display()
-                );
-            }
-        }
+        self.status = invoke_gnuplot(&dir, &png_path);
     }
 
     /// GUI のプロットと同じロジックで系列を構築する。Configs タブの並び順を
@@ -779,31 +755,33 @@ impl App {
         let png_path = dir.join(&png_name);
 
         // gnuplot を起動して PNG を生成する。
-        let invoke = std::process::Command::new("gnuplot")
-            .arg("plot.gp")
-            .current_dir(&dir)
-            .output();
-        match invoke {
-            Ok(out) if out.status.success() => {
-                self.status = format!("PNG: {}", png_path.display());
-            }
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                self.status = format!(
-                    "gnuplot failed (exit {}): {}. Script saved at {}/plot.gp",
-                    out.status,
-                    stderr.trim(),
-                    dir.display()
-                );
-            }
-            Err(e) => {
-                self.status = format!(
-                    "Could not invoke gnuplot ({}). Script saved at {}/plot.gp; run `gnuplot plot.gp` from that directory.",
-                    e,
-                    dir.display()
-                );
-            }
+        self.status = invoke_gnuplot(&dir, &png_path);
+    }
+}
+
+/// `<dir>/plot.gp` を gnuplot で実行し、結果に応じた状態メッセージを返す。
+/// 成功時は生成された `png_path` を案内し、失敗時は手動実行の手順を含める。
+fn invoke_gnuplot(dir: &Path, png_path: &Path) -> String {
+    let invoke = std::process::Command::new("gnuplot")
+        .arg("plot.gp")
+        .current_dir(dir)
+        .output();
+    match invoke {
+        Ok(out) if out.status.success() => format!("PNG: {}", png_path.display()),
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            format!(
+                "gnuplot failed (exit {}): {}. Script saved at {}/plot.gp",
+                out.status,
+                stderr.trim(),
+                dir.display()
+            )
         }
+        Err(e) => format!(
+            "Could not invoke gnuplot ({}). Script saved at {}/plot.gp; run `gnuplot plot.gp` from that directory.",
+            e,
+            dir.display()
+        ),
     }
 }
 
@@ -1023,7 +1001,6 @@ impl App {
         let mut remove: Option<usize> = None;
         let mut move_up: Option<usize> = None;
         let mut move_down: Option<usize> = None;
-        let mut config_changed = false;
         let cfg_count = self.configs.len();
 
         egui::ScrollArea::vertical().id_salt("cfg_scroll").show(ui, |ui| {
@@ -1074,17 +1051,13 @@ impl App {
                                 .changed()
                             {
                                 cfg.theta = if has_theta { Some(0.0) } else { None };
-                                config_changed = true;
                             }
                             if let Some(t) = &mut cfg.theta {
-                                let resp = ui.add(
+                                ui.add(
                                     egui::Slider::new(t, -3.0..=3.0)
                                         .text("Theta = log10(T)")
                                         .step_by(0.1),
                                 );
-                                if resp.changed() {
-                                    config_changed = true;
-                                }
                             } else {
                                 ui.colored_label(Color32::GRAY, "T = 0");
                             }
@@ -1097,7 +1070,6 @@ impl App {
                                 .changed()
                             {
                                 cfg.log10_iterations = n.max(0) as u32;
-                                config_changed = true;
                             }
                             ui.label(format!("= {} iterations", cfg.iterations()));
                         });
@@ -1127,7 +1099,6 @@ impl App {
                                         .clicked()
                                     {
                                         cfg.smoothing = SmoothingSpec::None;
-                                        config_changed = true;
                                     }
                                     if ui
                                         .selectable_label(
@@ -1137,7 +1108,6 @@ impl App {
                                         .clicked()
                                     {
                                         cfg.smoothing = SmoothingSpec::KAverage(cur_k);
-                                        config_changed = true;
                                     }
                                     if ui
                                         .selectable_label(
@@ -1147,7 +1117,6 @@ impl App {
                                         .clicked()
                                     {
                                         cfg.smoothing = SmoothingSpec::RandomKAverage(cur_k);
-                                        config_changed = true;
                                     }
                                     if ui
                                         .selectable_label(
@@ -1157,7 +1126,6 @@ impl App {
                                         .clicked()
                                     {
                                         cfg.smoothing = SmoothingSpec::WeightedAverage(cur_k);
-                                        config_changed = true;
                                     }
                                 });
                             match &mut cfg.smoothing {
@@ -1165,12 +1133,7 @@ impl App {
                                 SmoothingSpec::KAverage(k)
                                 | SmoothingSpec::RandomKAverage(k)
                                 | SmoothingSpec::WeightedAverage(k) => {
-                                    if ui
-                                        .add(egui::Slider::new(k, 1..=64).text("K"))
-                                        .changed()
-                                    {
-                                        config_changed = true;
-                                    }
+                                    ui.add(egui::Slider::new(k, 1..=64).text("K"));
                                 }
                             }
                         });
@@ -1194,9 +1157,6 @@ impl App {
                 self.configs.swap(i, i + 1);
                 self.config_selected_for_run.swap(i, i + 1);
             }
-        }
-        if config_changed {
-            // no-op marker for future use
         }
     }
 

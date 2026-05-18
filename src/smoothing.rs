@@ -10,9 +10,6 @@ use rand_mt::Mt19937GenRand64;
 use crate::optimization::{Problem, Smoothing};
 
 /// スムージングなし（元のスコアをそのまま使用）。
-///
-/// これは optimization.rs の NoSmoothing と同じ実装ですが、
-/// 別モジュールで再度定義することで、独立した使用が可能です。
 #[derive(Debug, Clone)]
 pub struct NoSmoothing;
 
@@ -213,67 +210,6 @@ impl<S: Clone> Smoothing<S> for WeightedNeighbourSmoothing {
     }
 }
 
-/// 複数のスムージングレベルを順序付きで提供する。
-///
-/// space_id に応じて異なる K 値を使用した K-近傍平均を提供し、
-/// 滑らかな空間から元の空間への段階的な移行を実現する。
-#[derive(Debug, Clone)]
-pub struct MultiLevelSmoothing {
-    /// スムージング空間の数。
-    space_count: usize,
-    /// 最も平滑化された空間での最大 K 値。
-    max_k: usize,
-}
-
-impl MultiLevelSmoothing {
-    /// 新しい multi-level smoothing を作成する。
-    ///
-    /// # Arguments
-    /// - `space_count`: スムージング空間の数（2 以上推奨）
-    /// - `max_k`: 空間 0 でのサンプリング数（大きいほど平滑）
-    pub fn new(space_count: usize, max_k: usize) -> Self {
-        Self { space_count, max_k }
-    }
-
-    /// 空間インデックスに対応する K 値を計算する。
-    fn k_for_space(&self, space_id: usize) -> usize {
-        if self.space_count <= 1 || space_id >= self.space_count - 1 {
-            return 1;
-        }
-        let t = space_id as f64 / (self.space_count - 1) as f64;
-        let k = self.max_k as f64 * (1.0 - t) + 1.0 * t;
-        k.round().max(1.0) as usize
-    }
-
-    /// 指定した空間でのスムージングを実行する。
-    pub fn score_in_space<S: Clone>(
-        &self,
-        space_id: usize,
-        problem: &dyn Problem<S>,
-        solution: &S,
-    ) -> f64 {
-        let k = self.k_for_space(space_id);
-        if k <= 1 {
-            return problem.score(solution);
-        }
-
-        let n = problem.neighbour_size();
-        if n == 0 {
-            return problem.score(solution);
-        }
-        let sample_count = k.min(n);
-        let sum: f64 = (0..sample_count)
-            .map(|i| problem.score_at_move(solution, i))
-            .sum();
-        sum / sample_count as f64
-    }
-
-    /// スムージング空間の数を返す。
-    pub fn space_count(&self) -> usize {
-        self.space_count
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,40 +271,6 @@ mod tests {
         // average: (16 + 25 + 36) / 3 = 77 / 3 ≈ 25.667
         let score = smoothing.score(&problem, &solution);
         assert!((score - (77.0 / 3.0)).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_multi_level_smoothing_k_values() {
-        let multi = MultiLevelSmoothing::new(5, 50);
-        // space_id=0: k = 50 * (1 - 0) + 1 * 0 = 50
-        assert_eq!(multi.k_for_space(0), 50);
-        // space_id=1: t = 1/4 = 0.25; k = 50 * 0.75 + 1 * 0.25 = 37.75 → 38
-        assert_eq!(multi.k_for_space(1), 38);
-        // space_id=4: space_id >= space_count - 1, so k = 1
-        assert_eq!(multi.k_for_space(4), 1);
-    }
-
-    #[test]
-    fn test_multi_level_smoothing_space_count() {
-        let multi = MultiLevelSmoothing::new(10, 100);
-        assert_eq!(multi.space_count(), 10);
-    }
-
-    #[test]
-    fn test_multi_level_smoothing_score_in_space() {
-        let problem = DummyProblem;
-        let multi = MultiLevelSmoothing::new(5, 50);
-        let solution = 5i32;
-
-        // space_id=0: K=50, but only 3 neighbours available
-        // score = (16 + 25 + 36) / 3 ≈ 25.667
-        let score0 = multi.score_in_space(0, &problem, &solution);
-        assert!((score0 - (77.0 / 3.0)).abs() < 1e-10);
-
-        // space_id=4: K=1 (original)
-        // score = 25.0
-        let score4 = multi.score_in_space(4, &problem, &solution);
-        assert!((score4 - 25.0).abs() < 1e-10);
     }
 
     // -------------------------------------------------------------------------

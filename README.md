@@ -6,6 +6,10 @@
 
 グラフの頂点集合を2つの部分集合に分割し、**カットエッジ数**と**バランスペナルティ**の合計を最小化する組合せ最適化問題を扱う。汎用的な最適化トレイトを軸に設計されており、グラフ分割以外の問題にも拡張可能。
 
+> **アルゴリズム解説**: 目的関数の定式化、差分評価の導出、各ソルバー
+> （山登り / SA / EO / SQA）とスムージング戦略の数学的背景および実装の
+> 詳細は **[docs/algorithms.md](docs/algorithms.md)** にまとめている。
+
 ## モジュール構成
 
 ```
@@ -23,34 +27,30 @@ src/
 └── bin/gui.rs              # 4 タブ構成の実験 GUI
 ```
 
-### optimization — 最適化問題トレイト
+### optimization — 最適化フレームワークのトレイト
 
-`OptimizationProblem<P, S, G>` トレイトは、問題・解・生成方法の3つの型パラメータを取る汎用インターフェースを定義する。
+問題・スコア計算・探索戦略を独立した3つのトレイトに分離し、任意の組み合わせで
+最適化を実行できる構造。
 
-| 型パラメータ | 意味 | グラフ分割での具体型 |
-|---|---|---|
-| `P` | 問題インスタンス | `Graph` |
-| `S` | 解の表現 | `Partition` (`Vec<bool>`) |
-| `G` | 生成方式 | `GraphGenerationMethod` |
+| トレイト | 役割 |
+|---|---|
+| `Problem<S>` | 解 `S` のスコア計算・近傍生成・初期解生成を定義する問題インスタンス |
+| `Smoothing<S>` | スコア評価方法の差し替え層（実スコア / K-近傍平均など） |
+| `Solver` | `Problem` と `Smoothing` を受け取り最適化を実行する探索戦略 |
 
-#### 必須メソッド
+`Problem<S>` の主なメソッド:
 
 | メソッド | 説明 |
 |---|---|
-| `new(problem: P) -> Self` | 問題インスタンスからソルバーを構築 |
-| `generate_problem(method: G, rng) -> P` | 指定方式で問題を生成 |
-| `score(&self, solution: &S) -> f64` | 解の目的関数値（小さいほど良い） |
-| `neighbour_size(&self) -> usize` | 近傍のサイズ |
-| `neighbour(&self, id, solution, score) -> (S, f64)` | 差分計算による近傍解の生成 |
-| `create_random_solution(&self, rng) -> S` | ランダムな初期解を生成 |
+| `score(&self, solution) -> f64` | 解の目的関数値（小さいほど良い） |
+| `neighbour(&self, solution) -> Vec<S>` | 全近傍を生成 |
+| `neighbour_size(&self) -> usize` | 近傍サイズ |
+| `random_solution(&self, rng) -> S` | ランダムな初期解を生成 |
+| `score_at_move(&self, solution, idx) -> f64` | 移動 `idx` 適用後のスコア（差分計算でオーバーライド可能） |
+| `apply_move(&self, solution, idx)` | 移動 `idx` を in-place 適用 |
 
-#### デフォルト実装メソッド
-
-| メソッド | 説明 |
-|---|---|
-| `random_neighbour(solution, score, rng) -> (S, f64)` | ランダムに近傍を1つ選択 |
-| `basin(solution) -> S` | 最急降下法で局所最適解へ移動 |
-| `basin_with_distance(solution) -> (S, usize)` | 局所最適解と移動距離を返す |
+ソルバーは実行統計 `SolverStats`（反復数・初期/最終/最良スコア・受理/棄却数・
+スコア履歴）を返す。
 
 ### graph_partition — グラフ分割問題
 
@@ -80,38 +80,29 @@ score = カットエッジ数 + ALPHA * (|V1| - |V2|)^2
 - `Partition` — `Vec<bool>` の型エイリアス
 - `GraphPartitionProblem` — `OptimizationProblem` の実装
 
-### simulated_annealing — 焼きなまし法
+### solvers — ソルバー群
 
-2種類のソルバーを提供する。
+`Solver` トレイトを実装する4種類の探索戦略。いずれも `Problem` と `Smoothing` の
+任意の組み合わせで動作する。
 
-#### SimulatedAnnealingSolver（標準 SA）
+| ソルバー | 説明 |
+|---|---|
+| `HillClimbingSolver` | 貪欲な局所探索。改善がなくなるまで最良近傍へ移動 |
+| `SimulatedAnnealingSolver` | 固定温度のメトロポリス法による焼きなまし |
+| `ExtremalOptimizationSolver` | τ-EO。べき乗則確率で低適応度の構成要素を変更 |
+| `SimulatedQuantumAnnealingSolver` | 鈴木–トロッター分解による SQA（P レプリカ） |
 
-定数温度での焼きなまし法。設定項目:
+### smoothing — スムージング戦略
 
-| パラメータ | 型 | 説明 |
-|---|---|---|
-| `cooling_schedule` | `CoolingSchedule` | 冷却スケジュール（現在は `Constant` のみ） |
-| `max_iterations` | `usize` | 最大反復回数 |
-| `log_interval` | `Option<usize>` | ログ出力間隔 |
+`Smoothing` トレイトの実装。スコアランドスケープを平滑化する。
 
-#### AdaptiveSimulatedAnnealingSolver（適応的 SA）
-
-複数プロセスの並列探索と準平衡判定による適応的温度制御を行う。
-
-| パラメータ | 型 | 説明 |
-|---|---|---|
-| `initial_acceptance_probability` | `f64` | 初期受理確率 p_s（初期温度の自動決定に使用） |
-| `epsilon` | `f64` | 準平衡判定の閾値 |
-| `gamma` | `f64` | 冷却比（温度に毎ステップ掛ける係数） |
-| `num_processes` | `usize` | 並列プロセス数 |
-| `max_steps` | `usize` | 最大総探索ステップ数 |
-
-主な特徴:
-
-- **初期温度の自動決定**: 目標受理確率 p_s に最も近い温度を、100回の試行SA実行から推定する
-- **準平衡判定**: プロセス間のコスト平均の分散（Ω）が初期値の ε 倍未満に収束したら温度を下げる
-- **比熱の計算**: 各温度段階でのコスト分散から比熱 C(T) = Var(f) / T^2 を計算
-- **実験記録**: 指定ステップでの解・比熱データを JSON ファイルに出力可能
+| 戦略 | 説明 |
+|---|---|
+| `NoSmoothing` | 平滑化なし（実スコアをそのまま使用） |
+| `KAveragingSmoothing` | 先頭 K 近傍のスコア平均（決定論的） |
+| `AllNeighbourAveragingSmoothing` | 全近傍のスコア平均 |
+| `RandomKSmoothing` | ランダム K 近傍平均（距離2近傍フォールバックあり） |
+| `WeightedNeighbourSmoothing` | K/n × 全近傍平均 + (1−K/n) × 実スコア の線形ブレンド |
 
 ### file_utils — ファイルユーティリティ
 
@@ -210,52 +201,58 @@ data/
 gpp_utils = { path = "../gpp_utils" }
 ```
 
-### 基本的な使用例
+### 基本的な使用例（ソルバー API）
 
 ```rust
-use gpp_utils::graph_partition::{Graph, GraphPartitionProblem, GraphGenerationMethod};
-use gpp_utils::optimization::OptimizationProblem;
-use gpp_utils::simulated_annealing::{SimulatedAnnealingSolver, SimulatedAnnealingConfig};
+use gpp_utils::graph_partition::{GraphGenerationMethod, GraphPartitionProblem};
+use gpp_utils::optimization::{Problem, Solver};
+use gpp_utils::smoothing::NoSmoothing;
+use gpp_utils::solvers::HillClimbingSolver;
 use rand_mt::Mt19937GenRand64;
 
 fn main() {
     let mut rng = Mt19937GenRand64::new(42);
 
-    // ランダムグラフの生成
+    // ランダムグラフから問題インスタンスを生成
     let method = GraphGenerationMethod::Random {
         node_count: 100,
         expected_degree: 5.0,
     };
-    let graph = GraphPartitionProblem::generate_problem(method, &mut rng);
-    let problem = GraphPartitionProblem::new(graph);
+    let problem = GraphPartitionProblem::generate(method, &mut rng);
 
-    // 初期解の生成
-    let initial_solution = problem.create_random_solution(&mut rng);
+    // 初期解を生成
+    let initial = problem.random_solution(&mut rng);
 
-    // 焼きなまし法で解く
-    let config = SimulatedAnnealingConfig::new_constant(10.0, 100_000);
-    let solver = SimulatedAnnealingSolver::new(config);
-    let (best_solution, stats) = solver.solve(&problem, initial_solution, &mut rng);
+    // 山登り法で解く（スムージングなし、seed = 42）
+    let solver = HillClimbingSolver::new();
+    let (_best, stats) = solver.solve(&problem, &NoSmoothing, initial, 42);
 
     println!("初期スコア: {}", stats.initial_score);
     println!("最良スコア: {}", stats.best_score);
 }
 ```
 
-### 適応的 SA の使用例
+### 実験ワークフローの使用例（run_executor）
 
 ```rust
-use gpp_utils::simulated_annealing::{AdaptiveSimulatedAnnealingSolver, AdaptiveSAConfig};
+use gpp_utils::graph_spec::{GraphKind, GraphSpec, StoredGraph};
+use gpp_utils::run_config::{RunConfig, SmoothingSpec};
+use gpp_utils::run_executor::execute;
 
-let config = AdaptiveSAConfig::new(
-    0.5,   // 初期受理確率
-    0.3,   // 準平衡閾値 epsilon
-    0.75,  // 冷却比 gamma
-    8,     // 並列プロセス数
-    1_000_000, // 最大ステップ数
-);
-let solver = AdaptiveSimulatedAnnealingSolver::new(config);
-let (best_solution, stats) = solver.solve(&problem, initial_solution, &mut rng);
+// グラフ仕様を決め、生成（既存なら data/graphs からロード）
+let spec = GraphSpec { kind: GraphKind::Random, n: 500, d: 5.0, seed: 0 };
+let stored = StoredGraph::generate(spec);
+let problem = stored.problem();
+
+// SA 実行条件: Θ = 0 (T = 1)、10^4 反復、K = 8 の決定論的スムージング
+let mut cfg = RunConfig::new("example");
+cfg.theta = Some(0.0);
+cfg.log10_iterations = 4;
+cfg.smoothing = SmoothingSpec::KAverage(8);
+
+// 対数刻みでスナップショットを取りながら実行（seed = 42）
+let result = execute(spec, &cfg, &problem, 42);
+println!("記録されたスナップショット数: {}", result.records.len());
 ```
 
 ## 依存クレート

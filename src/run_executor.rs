@@ -9,8 +9,15 @@
 //! ループ全体で保持し、スコア計算を delta_apply の連鎖で O(degree) に削減する。
 //! Smoothing も同じ整数状態を経由して評価することで、N²クローン爆発を完全に解消する。
 //!
-//! 数値結果は元実装とビット完全一致（new_cut/new_diff を整数で再構成し、
-//! 元と同じ式 `int as f64 + ALPHA * int as f64 * int as f64` に渡すため）。
+//! スコア値は整数状態から `score_from_state`（= `score()` と同一の式）で
+//! 再構成するため、浮動小数点演算レベルで決定論的に一致する。
+//!
+//! # ベイスン山登りのタイブレーク
+//!
+//! ベイスン評価の山登りで同スコアの近傍が複数あるときは、1 つを一様ランダムに
+//! 選ぶ。タイブレーク用の乱数列は SA 本体・スムージングとは独立した専用 RNG
+//! （`seed ^ TIEBREAK_SALT`）から取るため、SA の軌跡と `final_partition` には
+//! 影響しない（`records` のベイスン値のみがタイブレークの影響を受ける）。
 
 use std::path::{Path, PathBuf};
 
@@ -23,6 +30,10 @@ use crate::graph_partition::{get_partition_sizes, GraphPartitionProblem, Partiti
 use crate::graph_spec::GraphSpec;
 use crate::optimization::Problem;
 use crate::run_config::{RunConfig, SmoothingSpec};
+
+/// ベイスン山登りのタイブレーク用 RNG シードを、SA 本体のシードから派生させる際の塩。
+/// SA・スムージングの乱数列と独立にすることで `final_partition` への影響を避ける。
+const TIEBREAK_SALT: u64 = 0x7113_B4EA_C0DE_5EED;
 
 /// 1 ステップ分の計測値。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,6 +101,9 @@ pub fn logarithmic_steps(max_iter: usize) -> Vec<usize> {
 /// `cuts_at` を保持し `delta_apply_cached` で各候補を O(1) 評価するため、
 /// 1 ステップあたり O(N)（従来は O(N · degree)）。
 /// 戻り値にベイスンの `cuts_at` を含める。
+///
+/// 同スコアの近傍が複数あるときは `tie_rng` から reservoir sampling で
+/// 1 つを一様選択する。
 fn hill_climb_real_fast(
     prob: &GraphPartitionProblem,
     start: &Partition,
@@ -97,6 +111,7 @@ fn hill_climb_real_fast(
     start_cut: i32,
     start_t: usize,
     start_f: usize,
+    tie_rng: &mut Mt19937GenRand64,
 ) -> (Partition, Vec<i32>, i32, usize, usize) {
     let mut current = start.clone();
     let mut cuts_at = start_cuts.to_vec();
@@ -107,6 +122,7 @@ fn hill_climb_real_fast(
         let n = current.len();
         let mut best_idx: Option<usize> = None;
         let mut best_score = cur_score;
+        let mut tie_count: u64 = 0;
         for i in 0..n {
             let s = prob
                 .delta_apply_cached(&current, &cuts_at, i, cur_cut, cur_t, cur_f)
@@ -114,6 +130,12 @@ fn hill_climb_real_fast(
             if s < best_score {
                 best_score = s;
                 best_idx = Some(i);
+                tie_count = 1;
+            } else if best_idx.is_some() && s == best_score {
+                tie_count += 1;
+                if tie_rng.gen_range(0..tie_count) == 0 {
+                    best_idx = Some(i);
+                }
             }
         }
         match best_idx {
@@ -140,6 +162,9 @@ fn hill_climb_real_fast(
 ///   - ループ前: sm.score(prob, &current) を 1 回（初回 current_smoothed 取得）
 ///   - 各ステップ: 全 N 候補について sm.score(prob, n) を 1 回ずつ（合計 N 回）
 ///   ※ accept 後は best_score を current_smoothed に代入のみ（再評価しない）
+///
+/// 同スコアの近傍が複数あるときは `tie_rng` から reservoir sampling で
+/// 1 つを一様選択する（`tie_rng` は `sm` の内部 RNG とは独立）。
 fn hill_climb_smoothed_fast<F>(
     prob: &GraphPartitionProblem,
     start: &Partition,
@@ -148,6 +173,7 @@ fn hill_climb_smoothed_fast<F>(
     start_t: usize,
     start_f: usize,
     sm: &mut F,
+    tie_rng: &mut Mt19937GenRand64,
 ) -> (Partition, Vec<i32>, i32, usize, usize)
 where
     F: FnMut(&Partition, &[i32], i32, usize, usize) -> f64,
@@ -161,6 +187,7 @@ where
         let n = current.len();
         let mut best_idx: Option<usize> = None;
         let mut best_smoothed = cur_smoothed;
+        let mut tie_count: u64 = 0;
         for i in 0..n {
             // 候補 = current^flip(i)。整数状態を算出後、(current, cuts_at) を
             // 一時的に flip して sm を呼び、unflip で戻す。
@@ -172,6 +199,12 @@ where
             if s < best_smoothed {
                 best_smoothed = s;
                 best_idx = Some(i);
+                tie_count = 1;
+            } else if best_idx.is_some() && s == best_smoothed {
+                tie_count += 1;
+                if tie_rng.gen_range(0..tie_count) == 0 {
+                    best_idx = Some(i);
+                }
             }
         }
         match best_idx {
@@ -205,6 +238,7 @@ fn make_snapshot_fast<F>(
     step: usize,
     sm: &mut F,
     no_smoothing: bool,
+    tie_rng: &mut Mt19937GenRand64,
 ) -> StepRecord
 where
     F: FnMut(&Partition, &[i32], i32, usize, usize) -> f64,
@@ -214,7 +248,7 @@ where
     if no_smoothing {
         // smoothed-basin == real-basin → 1 回の HC で 4 フィールド埋め尽くし
         let (_, _, bc, bt, bf) =
-            hill_climb_real_fast(prob, current, cuts_at, cur_cut, cur_t, cur_f);
+            hill_climb_real_fast(prob, current, cuts_at, cur_cut, cur_t, cur_f, tie_rng);
         let basin_real = GraphPartitionProblem::score_from_state(bc, bt, bf);
         StepRecord {
             step,
@@ -228,13 +262,13 @@ where
     } else {
         // スムージング空間での山登り
         let (basin_sm_pt, basin_sm_cuts, bsmc, bsmt, bsmf) =
-            hill_climb_smoothed_fast(prob, current, cuts_at, cur_cut, cur_t, cur_f, sm);
+            hill_climb_smoothed_fast(prob, current, cuts_at, cur_cut, cur_t, cur_f, sm, tie_rng);
         let basin_smoothed_from_smoothed = sm(&basin_sm_pt, &basin_sm_cuts, bsmc, bsmt, bsmf);
         let basin_real_from_smoothed = GraphPartitionProblem::score_from_state(bsmc, bsmt, bsmf);
 
         // 元空間での山登り
         let (basin_re_pt, basin_re_cuts, brc, brt, brf) =
-            hill_climb_real_fast(prob, current, cuts_at, cur_cut, cur_t, cur_f);
+            hill_climb_real_fast(prob, current, cuts_at, cur_cut, cur_t, cur_f, tie_rng);
         let basin_smoothed_from_real = sm(&basin_re_pt, &basin_re_cuts, brc, brt, brf);
         let basin_real_from_real = GraphPartitionProblem::score_from_state(brc, brt, brf);
 
@@ -272,6 +306,9 @@ where
     F: FnMut(&Partition, &[i32], i32, usize, usize) -> f64,
 {
     let mut rng = Mt19937GenRand64::new(seed);
+    // ベイスン山登りのタイブレーク専用 RNG。SA 本体・スムージングの乱数列とは
+    // 独立なので、final_partition には影響しない。
+    let mut tie_rng = Mt19937GenRand64::new(seed ^ TIEBREAK_SALT);
     let mut current: Partition = prob.random_solution(&mut rng);
     let mut cur_cut = prob.count_cut_edges(&current);
     let (mut cur_t, mut cur_f) = get_partition_sizes(&current);
@@ -298,6 +335,7 @@ where
         0,
         &mut sm,
         no_smoothing,
+        &mut tie_rng,
     ));
 
     let n = prob.neighbour_size();
@@ -364,6 +402,7 @@ where
                     it,
                     &mut sm,
                     no_smoothing,
+                    &mut tie_rng,
                 ));
                 snap_iter.next();
             }
