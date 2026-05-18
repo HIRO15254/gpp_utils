@@ -16,6 +16,7 @@ use egui::{Color32, CornerRadius, RichText, Stroke};
 use egui_plot::{Line, LineStyle, Plot, PlotPoints};
 
 use gpp_utils::batch::{BatchEvent, BatchSpec, run_batch};
+use gpp_utils::file_utils::save_json;
 use gpp_utils::graph_spec::{
     EXPECTED_DEGREES, GraphKind, GraphLibrary, GraphSpec, NODE_COUNTS, StoredGraph,
 };
@@ -27,6 +28,9 @@ const GNUPLOT_DIR: &str = "data/gnuplot";
 const GRAPH_DIR: &str = "data/graphs";
 const RESULT_DIR: &str = "data/results";
 const TSV_DIR: &str = "data/tsv";
+
+/// GUI で組んだ実行内容を CLI 用バッチ定義として書き出す既定パス。
+const BATCH_FILE: &str = "data/batch.json";
 
 const TRACE_NAMES: &[&str] = &[
     "current (smoothed)",
@@ -493,6 +497,48 @@ impl App {
         if st.in_progress {
             self.cancel.store(true, Ordering::Relaxed);
             st.push_log("cancel requested");
+        }
+    }
+
+    /// 選択中のグラフ・設定・シード範囲を CLI 用バッチ定義 JSON として書き出す。
+    /// 出力ファイルは `cli --batch <path>` でそのまま実行できる。
+    fn export_batch_json(&mut self) {
+        let graphs: Vec<GraphSpec> = self
+            .graphs
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| self.graph_selected_for_run.get(*i).copied().unwrap_or(false))
+            .map(|(_, g)| g.spec)
+            .collect();
+        if graphs.is_empty() {
+            self.status = "No graphs selected for run.".into();
+            return;
+        }
+        let configs: Vec<RunConfig> = self
+            .configs
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| self.config_selected_for_run.get(*i).copied().unwrap_or(false))
+            .map(|(_, c)| c.clone())
+            .collect();
+        if configs.is_empty() {
+            self.status = "No configs selected.".into();
+            return;
+        }
+
+        let spec = BatchSpec {
+            graphs,
+            configs,
+            seed_start: self.start_seed,
+            seed_count: self.num_seeds,
+        };
+        let path = Path::new(BATCH_FILE);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match save_json(&spec, path) {
+            Ok(()) => self.status = format!("Batch spec exported: {}", BATCH_FILE),
+            Err(e) => self.status = format!("export error: {}", e),
         }
     }
 
@@ -1264,6 +1310,18 @@ impl App {
                     .clicked()
                 {
                     self.cancel_run();
+                }
+                let can_export =
+                    selected_graph_count > 0 && selected_config_count > 0 && self.num_seeds > 0;
+                if ui
+                    .add_enabled(can_export, egui::Button::new("Export batch JSON"))
+                    .on_hover_text(format!(
+                        "Write the selected graphs/configs/seeds as a CLI batch file ({}).",
+                        BATCH_FILE
+                    ))
+                    .clicked()
+                {
+                    self.export_batch_json();
                 }
             });
 

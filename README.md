@@ -182,7 +182,7 @@ pub struct RunConfig {
 
 1. **Graphs** — `kind` / `N` / `D` / `seed` を選んで `Generate / Load`。既に `data/graphs` に同 ID のグラフがあれば再利用、無ければ生成して保存。下部のリストから 1 つ選ぶと可視化される。
 2. **Configs** — `RunConfig` のリストを編集する。`use Theta` チェックボックスで `Theta` を有効化（無効なら `T = 0` の貪欲）、`log10(iter)` スライダで反復数を設定、スムージング種別と K を選択。
-3. **Run** — 選択中のグラフ・チェック済み Config・`start_seed` / `# seeds` で一括実行する。実行は裏スレッドで進み、`ResultStore` にキャッシュされた `(graph, config, seed)` 三つ組はスキップされる。プログレスバーとログで進捗を確認できる。
+3. **Run** — 選択中のグラフ・チェック済み Config・`start_seed` / `# seeds` で一括実行する。実行は裏スレッドで進み、`ResultStore` にキャッシュされた `(graph, config, seed)` 三つ組はスキップされる。プログレスバーとログで進捗を確認できる。`Export batch JSON` ボタンで、同じ選択内容を CLI 用バッチ定義 (`data/batch.json`) として書き出せる（`cli --batch data/batch.json` でそのまま再実行可能）。
 4. **Results** — 現在の選択（グラフ・Config・seed 範囲）にマッチする結果を `Load matching` で読み込み、6 トレースを log-step 軸でプロット。各トレースはチェックボックスで個別に表示切替できる。`Export TSV` で選択結果を `data/tsv/<graph_id>/<config_id>/seed_<seed>.tsv` に書き出す。
 
 ディレクトリ構成:
