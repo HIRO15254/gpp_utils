@@ -54,26 +54,31 @@ impl Solver for HillClimbingSolver {
         let mut smoothed_score_history = vec![(0, best_smoothed)];
 
         loop {
-            // すべての近傍を評価
-            let neighbours = problem.neighbour(&current);
-            if neighbours.is_empty() {
-                break; // 近傍がない（これはまずない）
+            let n = problem.neighbour_size();
+            if n == 0 {
+                break;
             }
 
-            // スムージングされたスコアで最良の近傍を探す
-            let best_neighbour_opt = neighbours
-                .iter()
-                .map(|n| {
-                    let smoothed = smoothing.score(problem, n);
-                    (n.clone(), smoothed)
-                })
-                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+            // インデックス反復で smoothed スコア最良の近傍を探す。
+            // クローンは選ばれた 1 個に対してのみ apply_move で行う。
+            let mut best_idx: Option<usize> = None;
+            let mut iter_best_smoothed = current_smoothed;
+            for i in 0..n {
+                let mut candidate = current.clone();
+                problem.apply_move(&mut candidate, i);
+                let smoothed = smoothing.score(problem, &candidate);
+                if smoothed < iter_best_smoothed {
+                    iter_best_smoothed = smoothed;
+                    best_idx = Some(i);
+                }
+            }
 
-            match best_neighbour_opt {
-                Some((best_neighbour, best_neighbour_smoothed)) => {
+            match best_idx {
+                Some(i) => {
+                    let best_neighbour_smoothed = iter_best_smoothed;
                     if best_neighbour_smoothed < current_smoothed {
                         // 改善した → 移動
-                        current = best_neighbour;
+                        problem.apply_move(&mut current, i);
                         current_smoothed = best_neighbour_smoothed;
                         iterations += 1;
 

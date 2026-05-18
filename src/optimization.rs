@@ -25,6 +25,24 @@ pub trait Problem<S: Clone>: Send + Sync {
         // デフォルト実装は呼び出せないため、実装側で override することを推奨
         usize::MAX
     }
+
+    /// 移動 `move_idx` を適用した近傍のスコアを返す。
+    ///
+    /// デフォルト実装は `neighbour(s)[move_idx]` を score して返すため、
+    /// 全近傍を作成するコストがかかる。具象型でオーバーライドすることで
+    /// クローン爆発を解消できる。
+    fn score_at_move(&self, solution: &S, move_idx: usize) -> f64 {
+        let n = self.neighbour(solution);
+        self.score(&n[move_idx])
+    }
+
+    /// 移動 `move_idx` を `solution` に in-place 適用する。
+    ///
+    /// デフォルト実装は `neighbour(s)[move_idx]` で置き換える。
+    fn apply_move(&self, solution: &mut S, move_idx: usize) {
+        let n = self.neighbour(solution);
+        *solution = n.into_iter().nth(move_idx).expect("invalid move_idx");
+    }
 }
 
 /// スコア計算方法の差し替え層。
