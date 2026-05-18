@@ -181,7 +181,7 @@ pub struct RunConfig {
 4 つのタブで実験を回す:
 
 1. **Graphs** — `kind` / `N` / `D` / `seed` を選んで `Generate / Load`。既に `data/graphs` に同 ID のグラフがあれば再利用、無ければ生成して保存。下部のリストから 1 つ選ぶと可視化される。
-2. **Configs** — `RunConfig` のリストを編集する。`use Theta` チェックボックスで `Theta` を有効化（無効なら `T = 0` の貪欲）、`log10(iter)` スライダで反復数を設定、スムージング種別と K を選択。
+2. **Configs** — `RunConfig` のリストを編集する。`use Theta` チェックボックスで `Theta` を有効化（無効なら `T = 0` の貪欲）、`log10(iter)` スライダで反復数を設定、スムージング種別と K を選択。`Generate from sweep` を開くと、温度・反復回数・K をカンマ区切りで複数指定し、その総当たり組み合わせを設定リストへ一括追加できる。
 3. **Run** — 選択中のグラフ・チェック済み Config・`start_seed` / `# seeds` で一括実行する。実行は裏スレッドで進み、`ResultStore` にキャッシュされた `(graph, config, seed)` 三つ組はスキップされる。プログレスバーとログで進捗を確認できる。`Export batch JSON` ボタンで、同じ選択内容を CLI 用バッチ定義 (`data/batch.json`) として書き出せる（`cli --batch data/batch.json` でそのまま再実行可能）。
 4. **Results** — 現在の選択（グラフ・Config・seed 範囲）にマッチする結果を `Load matching` で読み込み、6 トレースを log-step 軸でプロット。各トレースはチェックボックスで個別に表示切替できる。`Export TSV` で選択結果を `data/tsv/<graph_id>/<config_id>/seed_<seed>.tsv` に書き出す。
 
@@ -216,8 +216,11 @@ cargo run --release --bin cli -- --batch <定義>.json [オプション]
 
 #### バッチ定義 JSON の書式
 
-`graphs × configs × seeds` の直積がジョブとして実行される。サンプルは
-[`examples/batch.example.json`](examples/batch.example.json) を参照。
+`graphs × configs × seeds` の直積がジョブとして実行される。実行する設定は
+`configs`（明示列挙）と `config_sweep`（総当たり展開）の連結で、どちらか一方だけでも
+両方でもよい。サンプルは [`examples/batch.example.json`](examples/batch.example.json)
+（明示列挙）と [`examples/batch.sweep.example.json`](examples/batch.sweep.example.json)
+（sweep）を参照。
 
 ```json
 {
@@ -240,11 +243,12 @@ cargo run --release --bin cli -- --batch <定義>.json [オプション]
 | `graphs[].n` | 整数 | 頂点数 |
 | `graphs[].d` | 実数 | 期待次数 |
 | `graphs[].seed` | 整数 | グラフ生成シード |
-| `configs` | 配列 | SA 実行条件 `RunConfig` |
+| `configs` | 配列（任意） | 明示列挙する SA 実行条件 `RunConfig`。省略可 |
 | `configs[].name` | 文字列 | 表示用ラベル（キャッシュキー `id()` には影響しない） |
 | `configs[].theta` | 実数 / `null` | 温度 Θ = log10(T)。`null` で T = 0（貪欲） |
 | `configs[].log10_iterations` | 整数 | 反復回数 = 10^N |
 | `configs[].smoothing` | 下表参照 | スムージング戦略 |
+| `config_sweep` | オブジェクト（任意） | 温度×反復回数×平滑化を総当たり展開する指定（下記） |
 | `seed_start` | 整数 | 実行シードの開始値 |
 | `seed_count` | 整数 | シード本数（`seed_start, seed_start+1, …` を `seed_count` 個） |
 
@@ -256,6 +260,38 @@ cargo run --release --bin cli -- --batch <定義>.json [オプション]
 | 決定論的 K 近傍平均 | `{ "KAverage": 8 }` |
 | 確率的 K 近傍平均 | `{ "RandomKAverage": 8 }` |
 | 重み付き平均 | `{ "WeightedAverage": 8 }` |
+
+#### `config_sweep` — パラメータ総当たり
+
+`thetas × log10_iterations × (smoothing_kind × ks)` の直積を取り、自動的に
+`RunConfig` 群を生成する。多数の温度・平滑化パラメータを一括で網羅実験したいときに使う。
+
+```json
+{
+  "graphs": [
+    { "kind": "Random", "n": 124, "d": 5.0, "seed": 0 }
+  ],
+  "config_sweep": {
+    "thetas": [-1.0, 0.0, 1.0, null],
+    "log10_iterations": [4, 5],
+    "smoothing_kind": "KAverage",
+    "ks": [4, 8, 16]
+  },
+  "seed_start": 0,
+  "seed_count": 3
+}
+```
+
+| フィールド | 型 | 説明 |
+|---|---|---|
+| `thetas` | 配列 | 温度 Θ の候補。`null` は T = 0（貪欲） |
+| `log10_iterations` | 整数配列 | 反復回数指数 N（= 10^N）の候補 |
+| `smoothing_kind` | 下表参照 | 平滑化の種別（生成される全設定で共通） |
+| `ks` | 整数配列 | 平滑化の K 候補。`smoothing_kind` が `"None"` のときは無視される |
+
+`smoothing_kind`（`SmoothingKind`）の表記: `"None"` / `"KAverage"` / `"RandomKAverage"` / `"WeightedAverage"`。
+
+上記の例は `4 thetas × 2 iterations × 3 Ks = 24` 設定に展開され、`1 graph × 24 configs × 3 seeds = 72` ジョブが実行される。GUI では Configs タブの「Generate from sweep」から同じ展開を行える。
 
 既に結果が存在する `(graph, config, seed)` 三つ組は既定でスキップされる
 （`--overwrite` で再計算）。グラフのロード／生成や保存に失敗した場合は

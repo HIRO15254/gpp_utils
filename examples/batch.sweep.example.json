@@ -1,0 +1,13 @@
+{
+  "graphs": [
+    { "kind": "Random", "n": 124, "d": 5.0, "seed": 0 }
+  ],
+  "config_sweep": {
+    "thetas": [-1.0, 0.0, 1.0, null],
+    "log10_iterations": [4, 5],
+    "smoothing_kind": "KAverage",
+    "ks": [4, 8, 16]
+  },
+  "seed_start": 0,
+  "seed_count": 3
+}

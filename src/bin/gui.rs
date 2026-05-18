@@ -20,7 +20,7 @@ use gpp_utils::file_utils::save_json;
 use gpp_utils::graph_spec::{
     EXPECTED_DEGREES, GraphKind, GraphLibrary, GraphSpec, NODE_COUNTS, StoredGraph,
 };
-use gpp_utils::run_config::{RunConfig, SmoothingSpec};
+use gpp_utils::run_config::{ConfigSweep, RunConfig, SmoothingKind, SmoothingSpec};
 use gpp_utils::run_executor::{RunResult, ResultStore, StepRecord};
 
 const GNUPLOT_DIR: &str = "data/gnuplot";
@@ -231,6 +231,13 @@ struct App {
     config_selected_for_run: Vec<bool>,
     next_config_id: usize,
 
+    // Config sweep generator inputs (Configs タブ)
+    sweep_thetas: String,
+    sweep_include_greedy: bool,
+    sweep_iters: String,
+    sweep_kind: SmoothingKind,
+    sweep_ks: String,
+
     // Run params
     start_seed: u64,
     num_seeds: usize,
@@ -256,6 +263,16 @@ struct App {
     // UI
     active_tab: Tab,
     status: String,
+}
+
+/// カンマ／空白区切りの文字列を数値リストへパースする（パース不能な要素は無視）。
+fn parse_num_list<T: std::str::FromStr>(s: &str) -> Vec<T> {
+    s.split([',', ' ', '\t', '\n'])
+        .filter_map(|tok| {
+            let t = tok.trim();
+            if t.is_empty() { None } else { t.parse::<T>().ok() }
+        })
+        .collect()
 }
 
 impl App {
@@ -305,6 +322,11 @@ impl App {
             configs,
             config_selected_for_run,
             next_config_id: 3,
+            sweep_thetas: "-1, 0, 1".into(),
+            sweep_include_greedy: false,
+            sweep_iters: "4".into(),
+            sweep_kind: SmoothingKind::None,
+            sweep_ks: "4, 8".into(),
             start_seed: 0,
             num_seeds: 1,
             num_threads: detected_cpus,
@@ -432,6 +454,7 @@ impl App {
         let spec = BatchSpec {
             graphs: graphs.iter().map(|g| g.spec).collect(),
             configs: cfgs,
+            config_sweep: None,
             seed_start: self.start_seed,
             seed_count: self.num_seeds,
         };
@@ -529,6 +552,7 @@ impl App {
         let spec = BatchSpec {
             graphs,
             configs,
+            config_sweep: None,
             seed_start: self.start_seed,
             seed_count: self.num_seeds,
         };
@@ -540,6 +564,45 @@ impl App {
             Ok(()) => self.status = format!("Batch spec exported: {}", BATCH_FILE),
             Err(e) => self.status = format!("export error: {}", e),
         }
+    }
+
+    /// Configs タブの sweep 入力をパースし、温度×反復回数×平滑化の直積で
+    /// 生成した `RunConfig` 群を設定リストへ追記する。
+    fn generate_sweep_configs(&mut self) {
+        let mut thetas: Vec<Option<f64>> = parse_num_list::<f64>(&self.sweep_thetas)
+            .into_iter()
+            .map(Some)
+            .collect();
+        if self.sweep_include_greedy {
+            thetas.push(None);
+        }
+        let log10_iterations = parse_num_list::<u32>(&self.sweep_iters);
+        let ks = parse_num_list::<usize>(&self.sweep_ks);
+
+        if thetas.is_empty() {
+            self.status = "Sweep: specify at least one Theta (or enable greedy).".into();
+            return;
+        }
+        if log10_iterations.is_empty() {
+            self.status = "Sweep: specify at least one log10(iter) value.".into();
+            return;
+        }
+        if self.sweep_kind.needs_k() && ks.is_empty() {
+            self.status = "Sweep: specify at least one K value for this smoothing.".into();
+            return;
+        }
+
+        let sweep = ConfigSweep {
+            thetas,
+            log10_iterations,
+            smoothing_kind: self.sweep_kind,
+            ks,
+        };
+        let generated = sweep.expand();
+        let n = generated.len();
+        self.configs.extend(generated);
+        self.ensure_config_selection_len();
+        self.status = format!("Generated {} configs from sweep.", n);
     }
 
     fn load_results_for_current(&mut self) {
@@ -1030,6 +1093,91 @@ impl App {
             .weak(),
         );
         ui.add_space(4.0);
+
+        egui::CollapsingHeader::new("Generate from sweep (Theta x iterations x smoothing)")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(
+                        "Enter comma-separated values per axis; every combination is appended below.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                egui::Grid::new("sweep_grid")
+                    .num_columns(2)
+                    .spacing([8.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("Theta values:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.sweep_thetas)
+                                .desired_width(240.0)
+                                .hint_text("e.g. -1, 0, 1"),
+                        );
+                        ui.end_row();
+
+                        ui.label("");
+                        ui.checkbox(
+                            &mut self.sweep_include_greedy,
+                            "also include T = 0 (greedy)",
+                        );
+                        ui.end_row();
+
+                        ui.label("log10(iter) values:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.sweep_iters)
+                                .desired_width(240.0)
+                                .hint_text("e.g. 4, 5"),
+                        );
+                        ui.end_row();
+
+                        ui.label("Smoothing kind:");
+                        egui::ComboBox::from_id_salt("sweep_kind")
+                            .selected_text(self.sweep_kind.label())
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.sweep_kind,
+                                    SmoothingKind::None,
+                                    "none",
+                                );
+                                ui.selectable_value(
+                                    &mut self.sweep_kind,
+                                    SmoothingKind::KAverage,
+                                    "kavg (det)",
+                                );
+                                ui.selectable_value(
+                                    &mut self.sweep_kind,
+                                    SmoothingKind::RandomKAverage,
+                                    "rkavg (rand)",
+                                );
+                                ui.selectable_value(
+                                    &mut self.sweep_kind,
+                                    SmoothingKind::WeightedAverage,
+                                    "wavg (weighted)",
+                                );
+                            });
+                        ui.end_row();
+
+                        ui.label("K values:");
+                        ui.add_enabled(
+                            self.sweep_kind.needs_k(),
+                            egui::TextEdit::singleline(&mut self.sweep_ks)
+                                .desired_width(240.0)
+                                .hint_text("e.g. 4, 8, 16"),
+                        );
+                        ui.end_row();
+                    });
+                if ui
+                    .button(RichText::new("Generate configs").strong())
+                    .on_hover_text(
+                        "Append every Theta x iteration x smoothing combination to the list below.",
+                    )
+                    .clicked()
+                {
+                    self.generate_sweep_configs();
+                }
+            });
+        ui.add_space(6.0);
 
         self.ensure_config_selection_len();
         let mut remove: Option<usize> = None;

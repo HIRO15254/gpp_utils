@@ -14,16 +14,23 @@ use serde::{Deserialize, Serialize};
 
 use crate::graph_partition::GraphPartitionProblem;
 use crate::graph_spec::{GraphLibrary, GraphSpec};
-use crate::run_config::RunConfig;
+use crate::run_config::{ConfigSweep, RunConfig};
 use crate::run_executor::{ResultStore, execute};
 
 /// バッチ実行の指定。CLI ではこれを JSON ファイルとして受け取る。
+///
+/// 実行される設定は「明示列挙した `configs`」と「`config_sweep` を直積展開したもの」
+/// を連結したもの（[`BatchSpec::effective_configs`]）。どちらか一方だけでもよい。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchSpec {
     /// 実行対象グラフの仕様（未生成なら自動生成・キャッシュされる）。
     pub graphs: Vec<GraphSpec>,
-    /// 実行する SA 設定。
+    /// 明示的に列挙した SA 設定。
+    #[serde(default)]
     pub configs: Vec<RunConfig>,
+    /// 温度×反復回数×平滑化を総当たり展開する指定（任意）。
+    #[serde(default)]
+    pub config_sweep: Option<ConfigSweep>,
     /// シードの開始値。
     pub seed_start: u64,
     /// シード本数（`seed_start, seed_start+1, ...` を `seed_count` 個実行）。
@@ -31,9 +38,18 @@ pub struct BatchSpec {
 }
 
 impl BatchSpec {
-    /// 総ジョブ数（graphs × configs × seeds）。
+    /// 実際に実行する設定一覧（明示列挙 + sweep 展開）。
+    pub fn effective_configs(&self) -> Vec<RunConfig> {
+        let mut cfgs = self.configs.clone();
+        if let Some(sweep) = &self.config_sweep {
+            cfgs.extend(sweep.expand());
+        }
+        cfgs
+    }
+
+    /// 総ジョブ数（graphs × effective_configs × seeds）。
     pub fn total_jobs(&self) -> usize {
-        self.graphs.len() * self.configs.len() * self.seed_count
+        self.graphs.len() * self.effective_configs().len() * self.seed_count
     }
 }
 
@@ -101,17 +117,20 @@ pub fn run_batch<F>(
     F: Fn(BatchEvent) + Sync,
 {
     let num_threads = num_threads.max(1);
+    // 明示設定 + sweep 展開を 1 度だけ確定させる。
+    let configs = spec.effective_configs();
+    let total = spec.graphs.len() * configs.len() * spec.seed_count;
     on_event(BatchEvent::Started {
-        total: spec.total_jobs(),
+        total,
         graphs: spec.graphs.len(),
-        configs: spec.configs.len(),
+        configs: configs.len(),
         seeds: spec.seed_count,
         threads: num_threads,
     });
 
     // グラフごとに Problem を 1 度だけ構築し Arc 共有する。
     let library = GraphLibrary::new(graph_dir);
-    let mut jobs: Vec<Job> = Vec::with_capacity(spec.total_jobs());
+    let mut jobs: Vec<Job> = Vec::with_capacity(total);
     for &gspec in &spec.graphs {
         let stored = match library.load_or_generate(gspec) {
             Ok(g) => g,
@@ -121,7 +140,7 @@ pub fn run_batch<F>(
             }
         };
         let problem = Arc::new(stored.problem());
-        for cfg in &spec.configs {
+        for cfg in &configs {
             for s_off in 0..spec.seed_count {
                 let seed = spec.seed_start.wrapping_add(s_off as u64);
                 jobs.push(Job {
