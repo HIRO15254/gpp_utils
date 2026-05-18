@@ -1,6 +1,7 @@
 //! Regression baseline generator.
 //!
-//! 旧実装の出力を JSON で吐き出す。新実装後の回帰テストで照合する。
+//! 現行実装の出力を JSON で吐き出し、回帰テスト (`tests/regression.rs`) の
+//! baseline とする。アルゴリズムを意図的に変更したら再実行して更新する。
 //!
 //! 実行: `cargo run --release --example gen_baseline > tests/data/regression_baseline.json`
 

@@ -1,7 +1,10 @@
-//! 回帰テスト: 旧実装で採取した baseline と新実装の出力を照合する。
+//! 回帰テスト: 採取済み baseline と現在の実装の出力を照合し、意図しない
+//! ドリフトを検出する。
 //!
-//! `tests/data/regression_baseline.json` は旧実装ブランチ（master HEAD 直前）で
-//! `cargo run --release --example gen_baseline` を走らせて生成済み。
+//! `tests/data/regression_baseline.json` は現行実装で
+//! `cargo run --release --example gen_baseline > tests/data/regression_baseline.json`
+//! を走らせて生成する。アルゴリズムを意図的に変更したときは baseline も
+//! 再生成すること。
 //!
 //! 検証:
 //! - **`final_partition` がビット完全一致** (Vec<bool> の == 比較)

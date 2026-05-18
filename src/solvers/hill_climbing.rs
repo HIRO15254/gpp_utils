@@ -4,12 +4,17 @@
 //! 局所最適解を探索する。
 
 use crate::optimization::{Problem, Smoothing, Solver, SolverStats};
+use rand::Rng;
+use rand_mt::Mt19937GenRand64;
 
 /// 山登り法ソルバー。
 ///
 /// 隣接解の中から最良のものを選択し、改善がなくなるまで繰り返す。
 /// スムージング戦略と組み合わせることで、異なるランドスケープで
 /// 最適化を実行できる。
+///
+/// 最良スコアの近傍が複数あるときは、`seed` 由来の乱数列を使って
+/// 1 つを一様ランダムに選ぶ（最小インデックス固定によるバイアスを避ける）。
 #[derive(Debug, Clone)]
 pub struct HillClimbingSolver {
     /// ログ出力間隔（None の場合はログなし）。
@@ -41,8 +46,9 @@ impl Solver for HillClimbingSolver {
         problem: &dyn Problem<S>,
         smoothing: &dyn Smoothing<S>,
         initial: S,
-        _seed: u64,
+        seed: u64,
     ) -> (S, SolverStats) {
+        let mut rng = Mt19937GenRand64::new(seed);
         let mut current = initial.clone();
         let mut current_smoothed = smoothing.score(problem, &current);
         let initial_score = problem.score(&current);
@@ -60,9 +66,11 @@ impl Solver for HillClimbingSolver {
             }
 
             // インデックス反復で smoothed スコア最良の近傍を探す。
+            // 同スコアの近傍が複数あるときは reservoir sampling で 1 つを一様選択する。
             // クローンは選ばれた 1 個に対してのみ apply_move で行う。
             let mut best_idx: Option<usize> = None;
             let mut iter_best_smoothed = current_smoothed;
+            let mut tie_count: u64 = 0;
             for i in 0..n {
                 let mut candidate = current.clone();
                 problem.apply_move(&mut candidate, i);
@@ -70,6 +78,13 @@ impl Solver for HillClimbingSolver {
                 if smoothed < iter_best_smoothed {
                     iter_best_smoothed = smoothed;
                     best_idx = Some(i);
+                    tie_count = 1;
+                } else if best_idx.is_some() && smoothed == iter_best_smoothed {
+                    // 既出の最良スコアと同点 → 確率 1/tie_count で置き換える（一様選択）。
+                    tie_count += 1;
+                    if rng.gen_range(0..tie_count) == 0 {
+                        best_idx = Some(i);
+                    }
                 }
             }
 
