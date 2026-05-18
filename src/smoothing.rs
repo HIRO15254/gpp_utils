@@ -40,16 +40,15 @@ impl KAveragingSmoothing {
 
 impl<S: Clone> Smoothing<S> for KAveragingSmoothing {
     fn score(&self, problem: &dyn Problem<S>, solution: &S) -> f64 {
-        let neighbours = problem.neighbour(solution);
-        if neighbours.is_empty() {
+        let n = problem.neighbour_size();
+        if n == 0 {
             return problem.score(solution);
         }
-
-        let sample_count = self.k.min(neighbours.len());
-        let sum: f64 = neighbours
-            .iter()
-            .take(sample_count)
-            .map(|n| problem.score(n))
+        let sample_count = self.k.min(n);
+        // 元実装の `neighbours.iter().take(sample_count).map(|n| problem.score(n)).sum()` と
+        // 等価。インデックス 0..sample_count を順に評価する。
+        let sum: f64 = (0..sample_count)
+            .map(|i| problem.score_at_move(solution, i))
             .sum();
         sum / sample_count as f64
     }
@@ -64,13 +63,12 @@ pub struct AllNeighbourAveragingSmoothing;
 
 impl<S: Clone> Smoothing<S> for AllNeighbourAveragingSmoothing {
     fn score(&self, problem: &dyn Problem<S>, solution: &S) -> f64 {
-        let neighbours = problem.neighbour(solution);
-        if neighbours.is_empty() {
+        let n = problem.neighbour_size();
+        if n == 0 {
             return problem.score(solution);
         }
-
-        let sum: f64 = neighbours.iter().map(|n| problem.score(n)).sum();
-        sum / neighbours.len() as f64
+        let sum: f64 = (0..n).map(|i| problem.score_at_move(solution, i)).sum();
+        sum / n as f64
     }
 }
 
@@ -104,56 +102,66 @@ impl std::fmt::Debug for RandomKSmoothing {
     }
 }
 
-impl<S: Clone + PartialEq> Smoothing<S> for RandomKSmoothing {
+impl<S: Clone + PartialEq + std::hash::Hash + Eq> Smoothing<S> for RandomKSmoothing {
     fn score(&self, problem: &dyn Problem<S>, solution: &S) -> f64 {
-        let d1 = problem.neighbour(solution);
-        if d1.is_empty() {
+        let n = problem.neighbour_size();
+        if n == 0 {
             return problem.score(solution);
         }
 
         let mut rng = self.rng.lock().unwrap();
 
-        let samples: Vec<S> = if self.k <= d1.len() {
+        let scores: Vec<f64> = if self.k <= n {
             // --- 距離1近傍からK個をランダムサンプリング（非復元） ---
-            let mut indices: Vec<usize> = (0..d1.len()).collect();
-            // Partial Fisher-Yates: 先頭 k 要素を確定させる
+            let mut indices: Vec<usize> = (0..n).collect();
             for i in 0..self.k {
-                let j = rng.gen_range(i..d1.len());
+                let j = rng.gen_range(i..n);
                 indices.swap(i, j);
             }
-            indices[..self.k].iter().map(|&i| d1[i].clone()).collect()
+            // 選ばれた K インデックスに対して score_at_move 評価。
+            // 元実装の `d1[i].clone()` を materialize してから score するのと等価。
+            indices[..self.k]
+                .iter()
+                .map(|&i| problem.score_at_move(solution, i))
+                .collect()
         } else {
             // --- d1 全部 + 不足分をd2から補充 ---
-            let needed = self.k - d1.len();
+            // d1 (=N個) はそのまま全部スコアリング。
+            // d2 は元実装の enumerate 順で構築するが、HashSet で重複排除して O(N³) に抑える。
+            let needed = self.k - n;
 
-            // 距離2近傍を収集（元の解・d1と重複するものを除外）
+            // 元実装と同じ enumerate 順で d2 を構築:
+            //   for n1 in &d1 { for n2 in neighbour(n1) { ... } }
+            // 重複判定は HashSet<S> で吸収（挿入順は維持される）。
+            let d1: Vec<S> = problem.neighbour(solution);
+            let mut seen: std::collections::HashSet<S> = d1.iter().cloned().collect();
+            seen.insert(solution.clone());
             let mut d2: Vec<S> = Vec::new();
             for n1 in &d1 {
                 for n2 in problem.neighbour(n1) {
-                    if &n2 != solution
-                        && !d1.iter().any(|x| x == &n2)
-                        && !d2.iter().any(|x| x == &n2)
-                    {
+                    if seen.insert(n2.clone()) {
                         d2.push(n2);
                     }
                 }
             }
 
-            let mut samples = d1.clone();
-            // d2 から needed 個をランダムサンプリング（非復元）
+            // d2 から needed 個を Fisher-Yates でランダムサンプリング。
             let take = needed.min(d2.len());
             for i in 0..take {
                 let j = rng.gen_range(i..d2.len());
                 d2.swap(i, j);
             }
-            samples.extend_from_slice(&d2[..take]);
-            samples
+
+            // d1 全部 + d2 の先頭 take 個を score。
+            let mut scores: Vec<f64> = d1.iter().map(|s| problem.score(s)).collect();
+            scores.extend(d2[..take].iter().map(|s| problem.score(s)));
+            scores
         };
 
-        if samples.is_empty() {
+        if scores.is_empty() {
             return problem.score(solution);
         }
-        samples.iter().map(|s| problem.score(s)).sum::<f64>() / samples.len() as f64
+        scores.iter().sum::<f64>() / scores.len() as f64
     }
 }
 
@@ -186,16 +194,19 @@ impl WeightedNeighbourSmoothing {
 
 impl<S: Clone> Smoothing<S> for WeightedNeighbourSmoothing {
     fn score(&self, problem: &dyn Problem<S>, solution: &S) -> f64 {
-        let neighbours = problem.neighbour(solution);
-        if neighbours.is_empty() {
+        let n = problem.neighbour_size();
+        if n == 0 {
             return problem.score(solution);
         }
 
-        let n = neighbours.len();
         let k = self.k.min(n) as f64;
         let weight = k / n as f64; // K / 全近傍数
 
-        let neighbour_avg = neighbours.iter().map(|nb| problem.score(nb)).sum::<f64>() / n as f64;
+        // 元実装の `neighbours.iter().map(|nb| problem.score(nb)).sum() / n` と等価。
+        let neighbour_avg = (0..n)
+            .map(|i| problem.score_at_move(solution, i))
+            .sum::<f64>()
+            / n as f64;
         let current_score = problem.score(solution);
 
         weight * neighbour_avg + (1.0 - weight) * current_score
@@ -246,16 +257,13 @@ impl MultiLevelSmoothing {
             return problem.score(solution);
         }
 
-        let neighbours = problem.neighbour(solution);
-        if neighbours.is_empty() {
+        let n = problem.neighbour_size();
+        if n == 0 {
             return problem.score(solution);
         }
-
-        let sample_count = k.min(neighbours.len());
-        let sum: f64 = neighbours
-            .iter()
-            .take(sample_count)
-            .map(|n| problem.score(n))
+        let sample_count = k.min(n);
+        let sum: f64 = (0..sample_count)
+            .map(|i| problem.score_at_move(solution, i))
             .sum();
         sum / sample_count as f64
     }

@@ -160,6 +160,130 @@ impl GraphPartitionProblem {
         self.flip_delta_with_sizes(partition, i, sizes)
     }
 
+    /// 指定 partition の cut 数を i32 で計算する（O(E)）。
+    ///
+    /// SA / 山登りループの初期化や、デバッグビルドでの整合性検証に用いる。
+    pub fn count_cut_edges(&self, partition: &Partition) -> i32 {
+        let mut cut_edges: i32 = 0;
+        for node in 0..self.graph.node_count {
+            for &neighbor in &self.graph.adjacency_list[node] {
+                if partition[node] != partition[neighbor] {
+                    cut_edges += 1;
+                }
+            }
+        }
+        cut_edges / 2
+    }
+
+    /// 頂点 `v` をフリップした場合の整数状態とスコアを O(degree(v)) で計算する。
+    ///
+    /// 呼び出し側は現在の整数状態 `(cur_cut, cur_t, cur_f)` を保持しておく。
+    /// 戻り値: `(new_cut, new_t, new_f, new_real_score)`。
+    ///
+    /// `new_real_score` は元の [`GraphPartitionProblem::score`] と
+    /// **完全に同じ演算順序** (`int as f64 + ALPHA * int as f64 * int as f64`)
+    /// で計算され、ビット完全一致を保証する。
+    pub fn delta_apply(
+        &self,
+        partition: &Partition,
+        v: usize,
+        cur_cut: i32,
+        cur_t: usize,
+        cur_f: usize,
+    ) -> (i32, usize, usize, f64) {
+        let mut cuts_at_v: i32 = 0;
+        for &u in &self.graph.adjacency_list[v] {
+            if partition[v] != partition[u] {
+                cuts_at_v += 1;
+            }
+        }
+        let degree = self.graph.adjacency_list[v].len() as i32;
+        let new_cut = cur_cut + degree - 2 * cuts_at_v;
+        let (new_t, new_f) = if partition[v] {
+            (cur_t - 1, cur_f + 1)
+        } else {
+            (cur_t + 1, cur_f - 1)
+        };
+        let diff = (new_t as i64 - new_f as i64).abs() as f64;
+        let new_score = new_cut as f64 + ALPHA * diff * diff;
+        (new_cut, new_t, new_f, new_score)
+    }
+
+    /// 整数状態とスコアから元の `score()` 形式の f64 を生成する。
+    ///
+    /// SA / 山登りループ内で `current_real` 等を計算する用途。
+    /// `score()` と完全に同じ演算順序で評価する。
+    pub fn score_from_state(cut: i32, t: usize, f: usize) -> f64 {
+        let diff = (t as i64 - f as i64).abs() as f64;
+        cut as f64 + ALPHA * diff * diff
+    }
+
+    /// 各頂点 `v` について「`v` に接続する辺のうちパーティションをまたぐ本数」
+    /// (`cuts_at[v]`) を計算する（O(E)）。
+    ///
+    /// この配列を保持しておけば [`delta_apply_cached`](Self::delta_apply_cached) で
+    /// フリップ差分を O(1) で評価でき、[`flip_vertex`](Self::flip_vertex) で
+    /// O(degree) 増分更新できる。
+    pub fn compute_cuts_at(&self, partition: &Partition) -> Vec<i32> {
+        let mut cuts_at = vec![0i32; self.graph.node_count];
+        for v in 0..self.graph.node_count {
+            let mut c: i32 = 0;
+            for &u in &self.graph.adjacency_list[v] {
+                if partition[v] != partition[u] {
+                    c += 1;
+                }
+            }
+            cuts_at[v] = c;
+        }
+        cuts_at
+    }
+
+    /// 頂点 `idx` をフリップし、`partition` と `cuts_at` を同時に O(degree) で更新する。
+    ///
+    /// `cuts_at` は呼び出し時点で `partition` と整合している前提。
+    /// 同じ `idx` で 2 回呼べば元に戻る（対合）。
+    pub fn flip_vertex(&self, partition: &mut [bool], cuts_at: &mut [i32], idx: usize) {
+        let bi = partition[idx];
+        for &u in &self.graph.adjacency_list[idx] {
+            // 辺 (idx, u) のクロス状態はフリップで反転する。
+            if partition[u] != bi {
+                cuts_at[u] -= 1;
+            } else {
+                cuts_at[u] += 1;
+            }
+        }
+        let degree = self.graph.adjacency_list[idx].len() as i32;
+        // idx の全辺がクロス状態を反転するので cuts_at[idx] = degree - cuts_at[idx]。
+        cuts_at[idx] = degree - cuts_at[idx];
+        partition[idx] = !partition[idx];
+    }
+
+    /// [`delta_apply`](Self::delta_apply) の O(1) 版。
+    ///
+    /// `cuts_at[v]` を走査せずに用いる以外は `delta_apply` と**完全に同じ演算**で、
+    /// `cuts_at` が `partition` と整合していればビット完全一致の結果を返す。
+    pub fn delta_apply_cached(
+        &self,
+        partition: &[bool],
+        cuts_at: &[i32],
+        v: usize,
+        cur_cut: i32,
+        cur_t: usize,
+        cur_f: usize,
+    ) -> (i32, usize, usize, f64) {
+        let cuts_at_v = cuts_at[v];
+        let degree = self.graph.adjacency_list[v].len() as i32;
+        let new_cut = cur_cut + degree - 2 * cuts_at_v;
+        let (new_t, new_f) = if partition[v] {
+            (cur_t - 1, cur_f + 1)
+        } else {
+            (cur_t + 1, cur_f - 1)
+        };
+        let diff = (new_t as i64 - new_f as i64).abs() as f64;
+        let new_score = new_cut as f64 + ALPHA * diff * diff;
+        (new_cut, new_t, new_f, new_score)
+    }
+
     /// Erdős–Rényi ランダムグラフを生成する。
     fn generate_random_graph(
         node_count: usize,
@@ -263,6 +387,19 @@ impl Problem<Partition> for GraphPartitionProblem {
 
     fn neighbour_size(&self) -> usize {
         self.graph.node_count
+    }
+
+    fn apply_move(&self, partition: &mut Partition, move_idx: usize) {
+        partition[move_idx] = !partition[move_idx];
+    }
+
+    fn score_at_move(&self, partition: &Partition, move_idx: usize) -> f64 {
+        // 一時クローン + flip + score（O(N + E)）。
+        // N²クローン爆発（呼び出し元の `neighbour()` 経由）を解消する用途。
+        // 元の `score()` と同じ演算経路を辿るためビット完全一致。
+        let mut p = partition.clone();
+        p[move_idx] = !p[move_idx];
+        self.score(&p)
     }
 }
 
@@ -383,6 +520,199 @@ mod tests {
         assert_eq!(partition.len(), 5);
         let score = problem.score(&partition);
         assert!(score.is_finite());
+    }
+
+    /// 検証 1: `delta_apply` のビット完全一致テスト。
+    /// new_real_score が `score(&flipped_partition)` と f64 ビット単位で一致することを保証。
+    #[test]
+    fn test_delta_apply_bitwise_equality() {
+        for graph_seed in 0..5u64 {
+            let method = GraphGenerationMethod::Random {
+                node_count: 30,
+                expected_degree: 4.0,
+            };
+            let mut rng = Mt19937GenRand64::new(graph_seed);
+            let problem = GraphPartitionProblem::generate(method, &mut rng);
+            let n = problem.graph.node_count;
+
+            for trial in 0..50u64 {
+                let mut prng = Mt19937GenRand64::new(graph_seed * 1000 + trial);
+                let partition: Partition = problem.random_solution(&mut prng);
+                let cur_cut = problem.count_cut_edges(&partition);
+                let (cur_t, cur_f) = get_partition_sizes(&partition);
+
+                for v in 0..n {
+                    let (_nc, _nt, _nf, ns) =
+                        problem.delta_apply(&partition, v, cur_cut, cur_t, cur_f);
+                    let mut flipped = partition.clone();
+                    flipped[v] = !flipped[v];
+                    let direct = problem.score(&flipped);
+                    assert_eq!(
+                        ns.to_bits(),
+                        direct.to_bits(),
+                        "delta_apply mismatch: graph_seed={}, trial={}, v={}, ns={}, direct={}",
+                        graph_seed, trial, v, ns, direct
+                    );
+                }
+            }
+        }
+    }
+
+    /// `compute_cuts_at` + `delta_apply_cached` が `delta_apply` と
+    /// ビット完全一致することを検証する。
+    #[test]
+    fn test_delta_apply_cached_matches_delta_apply() {
+        for graph_seed in 0..5u64 {
+            let method = GraphGenerationMethod::Random {
+                node_count: 30,
+                expected_degree: 4.0,
+            };
+            let mut rng = Mt19937GenRand64::new(graph_seed);
+            let problem = GraphPartitionProblem::generate(method, &mut rng);
+            let n = problem.graph.node_count;
+
+            for trial in 0..50u64 {
+                let mut prng = Mt19937GenRand64::new(graph_seed * 1000 + trial);
+                let partition: Partition = problem.random_solution(&mut prng);
+                let cur_cut = problem.count_cut_edges(&partition);
+                let (cur_t, cur_f) = get_partition_sizes(&partition);
+                let cuts_at = problem.compute_cuts_at(&partition);
+
+                for v in 0..n {
+                    let (nc, nt, nf, ns) =
+                        problem.delta_apply(&partition, v, cur_cut, cur_t, cur_f);
+                    let (cc, ct, cf, cs) = problem
+                        .delta_apply_cached(&partition, &cuts_at, v, cur_cut, cur_t, cur_f);
+                    assert_eq!((nc, nt, nf), (cc, ct, cf));
+                    assert_eq!(
+                        ns.to_bits(),
+                        cs.to_bits(),
+                        "delta_apply_cached mismatch: graph_seed={}, trial={}, v={}",
+                        graph_seed, trial, v
+                    );
+                }
+            }
+        }
+    }
+
+    /// `flip_vertex` が `cuts_at` を正しく増分更新し（full recompute と一致）、
+    /// 同じ頂点で 2 回呼ぶと元に戻る（対合）ことを検証する。
+    #[test]
+    fn test_flip_vertex_maintains_cuts_at() {
+        for graph_seed in 0..5u64 {
+            let method = GraphGenerationMethod::Random {
+                node_count: 30,
+                expected_degree: 4.0,
+            };
+            let mut rng = Mt19937GenRand64::new(graph_seed);
+            let problem = GraphPartitionProblem::generate(method, &mut rng);
+            let n = problem.graph.node_count;
+
+            for trial in 0..50u64 {
+                let mut prng = Mt19937GenRand64::new(graph_seed * 1000 + trial);
+                let partition: Partition = problem.random_solution(&mut prng);
+
+                // 各頂点をフリップ → 整合性確認 → 再フリップで原状復帰（対合）。
+                let mut p = partition.clone();
+                let mut cuts_at = problem.compute_cuts_at(&p);
+                for v in 0..n {
+                    problem.flip_vertex(&mut p, &mut cuts_at, v);
+                    assert_eq!(
+                        cuts_at,
+                        problem.compute_cuts_at(&p),
+                        "cuts_at drift after flip: graph_seed={}, trial={}, v={}",
+                        graph_seed, trial, v
+                    );
+                    problem.flip_vertex(&mut p, &mut cuts_at, v);
+                }
+                assert_eq!(p, partition, "flip_vertex is not involutive");
+
+                // 連鎖フリップ: 0..n を順に適用しても整合する。
+                let mut p2 = partition.clone();
+                let mut c2 = problem.compute_cuts_at(&p2);
+                for v in 0..n {
+                    problem.flip_vertex(&mut p2, &mut c2, v);
+                    assert_eq!(
+                        c2,
+                        problem.compute_cuts_at(&p2),
+                        "cuts_at drift in chained flip: graph_seed={}, trial={}, v={}",
+                        graph_seed, trial, v
+                    );
+                }
+            }
+        }
+    }
+
+    /// 検証 2: `score_at_move` のビット完全一致テスト。
+    /// `score(&neighbour(s)[i])` と f64 ビット単位で一致することを保証。
+    #[test]
+    fn test_score_at_move_bitwise_equality() {
+        let method = GraphGenerationMethod::Random {
+            node_count: 30,
+            expected_degree: 4.0,
+        };
+        let mut rng = Mt19937GenRand64::new(7);
+        let problem = GraphPartitionProblem::generate(method, &mut rng);
+        let n = problem.graph.node_count;
+
+        for trial in 0..20u64 {
+            let mut prng = Mt19937GenRand64::new(trial);
+            let partition: Partition = problem.random_solution(&mut prng);
+            let neighbours = problem.neighbour(&partition);
+            for i in 0..n {
+                let via = problem.score_at_move(&partition, i);
+                let direct = problem.score(&neighbours[i]);
+                assert_eq!(
+                    via.to_bits(),
+                    direct.to_bits(),
+                    "score_at_move mismatch: trial={}, i={}, via={}, direct={}",
+                    trial, i, via, direct
+                );
+            }
+        }
+    }
+
+    /// 検証 3: 二重フリップ (delta_apply の連鎖) のビット完全一致テスト。
+    /// `c = current^flip(idx)` の k 番目近傍について、
+    /// `delta_apply(&current_after_flip_idx, k, candidate_state).3` が
+    /// `score(&current^flip(idx)^flip(k))` と f64 ビット単位で一致することを保証。
+    #[test]
+    fn test_double_flip_bitwise_equality() {
+        let method = GraphGenerationMethod::Random {
+            node_count: 30,
+            expected_degree: 4.0,
+        };
+        let mut rng = Mt19937GenRand64::new(11);
+        let problem = GraphPartitionProblem::generate(method, &mut rng);
+        let n = problem.graph.node_count;
+
+        for trial in 0..20u64 {
+            let mut prng = Mt19937GenRand64::new(trial);
+            let partition: Partition = problem.random_solution(&mut prng);
+            let cur_cut = problem.count_cut_edges(&partition);
+            let (cur_t, cur_f) = get_partition_sizes(&partition);
+
+            for idx in (0..n).step_by(3) {
+                // 候補 c の整数状態
+                let (nc, nt, nf, _) = problem.delta_apply(&partition, idx, cur_cut, cur_t, cur_f);
+                // current を一時 flip (= c に変身)
+                let mut current_flipped = partition.clone();
+                current_flipped[idx] = !current_flipped[idx];
+
+                for k in 0..n {
+                    let via = problem.delta_apply(&current_flipped, k, nc, nt, nf).3;
+                    let mut double_flipped = current_flipped.clone();
+                    double_flipped[k] = !double_flipped[k];
+                    let direct = problem.score(&double_flipped);
+                    assert_eq!(
+                        via.to_bits(),
+                        direct.to_bits(),
+                        "double-flip mismatch: trial={}, idx={}, k={}, via={}, direct={}",
+                        trial, idx, k, via, direct
+                    );
+                }
+            }
+        }
     }
 
     #[test]

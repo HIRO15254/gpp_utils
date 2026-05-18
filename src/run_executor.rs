@@ -2,6 +2,15 @@
 //!
 //! 各スナップショットでは現在解と、スムージング空間および元空間それぞれで
 //! 山登りを行ったベイスンの評価値を記録する。
+//!
+//! # Tier 2 specialized fast path
+//!
+//! `GraphPartitionProblem` の整数状態 `(cut_count, t_count, f_count)` を
+//! ループ全体で保持し、スコア計算を delta_apply の連鎖で O(degree) に削減する。
+//! Smoothing も同じ整数状態を経由して評価することで、N²クローン爆発を完全に解消する。
+//!
+//! 数値結果は元実装とビット完全一致（new_cut/new_diff を整数で再構成し、
+//! 元と同じ式 `int as f64 + ALPHA * int as f64 * int as f64` に渡すため）。
 
 use std::path::{Path, PathBuf};
 
@@ -10,13 +19,10 @@ use rand_mt::Mt19937GenRand64;
 use serde::{Deserialize, Serialize};
 
 use crate::file_utils::{ensure_dir_exists, load_json, save_json};
-use crate::graph_partition::{GraphPartitionProblem, Partition, get_partition_sizes};
+use crate::graph_partition::{get_partition_sizes, GraphPartitionProblem, Partition};
 use crate::graph_spec::GraphSpec;
-use crate::optimization::{Problem, Smoothing};
+use crate::optimization::Problem;
 use crate::run_config::{RunConfig, SmoothingSpec};
-use crate::smoothing::{
-    KAveragingSmoothing, RandomKSmoothing, WeightedNeighbourSmoothing,
-};
 
 /// 1 ステップ分の計測値。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,87 +81,203 @@ pub fn logarithmic_steps(max_iter: usize) -> Vec<usize> {
     v
 }
 
-/// 元空間での山登り（差分計算で全近傍を評価し、最良を選ぶ）。
-fn hill_climb_real(prob: &GraphPartitionProblem, start: &Partition) -> Partition {
-    let mut current = start.clone();
-    let n = prob.graph().node_count;
-    let (mut t, mut f) = get_partition_sizes(&current);
-    loop {
-        let mut best_delta = 0.0;
-        let mut best_i: Option<usize> = None;
-        for i in 0..n {
-            let d = prob.flip_delta_with_sizes(&current, i, (t, f));
-            if d < best_delta - 1e-12 {
-                best_delta = d;
-                best_i = Some(i);
-            }
-        }
-        match best_i {
-            Some(i) => {
-                if current[i] {
-                    t -= 1;
-                    f += 1;
-                } else {
-                    t += 1;
-                    f -= 1;
-                }
-                current[i] = !current[i];
-            }
-            None => break,
-        }
-    }
-    current
-}
+// ============================================================================
+// 整数状態追跡による山登り
+// ============================================================================
 
-/// 任意のスムージング空間での山登り（フリップ・イン・プレースで近傍配列確保を回避）。
-fn hill_climb_smoothed<Sm>(
+/// 元空間での山登り（実スコアで下降）。
+///
+/// `cuts_at` を保持し `delta_apply_cached` で各候補を O(1) 評価するため、
+/// 1 ステップあたり O(N)（従来は O(N · degree)）。
+/// 戻り値にベイスンの `cuts_at` を含める。
+fn hill_climb_real_fast(
     prob: &GraphPartitionProblem,
-    sm: &Sm,
     start: &Partition,
-) -> Partition
-where
-    Sm: Smoothing<Partition> + ?Sized,
-{
+    start_cuts: &[i32],
+    start_cut: i32,
+    start_t: usize,
+    start_f: usize,
+) -> (Partition, Vec<i32>, i32, usize, usize) {
     let mut current = start.clone();
-    let n = current.len();
-    let mut current_smoothed = sm.score(prob, &current);
+    let mut cuts_at = start_cuts.to_vec();
+    let (mut cur_cut, mut cur_t, mut cur_f) = (start_cut, start_t, start_f);
+    let mut cur_score = GraphPartitionProblem::score_from_state(cur_cut, cur_t, cur_f);
+
     loop {
-        let mut best_score = current_smoothed;
-        let mut best_i: Option<usize> = None;
+        let n = current.len();
+        let mut best_idx: Option<usize> = None;
+        let mut best_score = cur_score;
         for i in 0..n {
-            current[i] = !current[i];
-            let s = sm.score(prob, &current);
-            current[i] = !current[i];
+            let s = prob
+                .delta_apply_cached(&current, &cuts_at, i, cur_cut, cur_t, cur_f)
+                .3;
             if s < best_score {
                 best_score = s;
-                best_i = Some(i);
+                best_idx = Some(i);
             }
         }
-        match best_i {
+        match best_idx {
             Some(i) => {
-                current[i] = !current[i];
-                current_smoothed = best_score;
+                let (nc, nt, nf, ns) =
+                    prob.delta_apply_cached(&current, &cuts_at, i, cur_cut, cur_t, cur_f);
+                prob.flip_vertex(&mut current, &mut cuts_at, i);
+                cur_cut = nc;
+                cur_t = nt;
+                cur_f = nf;
+                cur_score = ns;
             }
             None => break,
         }
     }
-    current
+    (current, cuts_at, cur_cut, cur_t, cur_f)
 }
 
-/// SA を実行する（一般スムージング版。`flip_in_place` で近傍配列確保を回避）。
-fn run_sa_with_smoothing<Sm>(
+/// スムージング空間での山登り（smoothing closure を経由）。
+/// 1 ステップあたり O(N · sm_cost)。`sm` は (partition, cut, t, f) → smoothed score。
+///
+/// 注意: `sm` は内部 RNG を進める可能性があるため、呼び出し回数を元実装と一致させること。
+/// 元実装の hill_climb_smoothed は:
+///   - ループ前: sm.score(prob, &current) を 1 回（初回 current_smoothed 取得）
+///   - 各ステップ: 全 N 候補について sm.score(prob, n) を 1 回ずつ（合計 N 回）
+///   ※ accept 後は best_score を current_smoothed に代入のみ（再評価しない）
+fn hill_climb_smoothed_fast<F>(
     prob: &GraphPartitionProblem,
-    sm: &Sm,
+    start: &Partition,
+    start_cuts: &[i32],
+    start_cut: i32,
+    start_t: usize,
+    start_f: usize,
+    sm: &mut F,
+) -> (Partition, Vec<i32>, i32, usize, usize)
+where
+    F: FnMut(&Partition, &[i32], i32, usize, usize) -> f64,
+{
+    let mut current = start.clone();
+    let mut cuts_at = start_cuts.to_vec();
+    let (mut cur_cut, mut cur_t, mut cur_f) = (start_cut, start_t, start_f);
+    let mut cur_smoothed = sm(&current, &cuts_at, cur_cut, cur_t, cur_f);
+
+    loop {
+        let n = current.len();
+        let mut best_idx: Option<usize> = None;
+        let mut best_smoothed = cur_smoothed;
+        for i in 0..n {
+            // 候補 = current^flip(i)。整数状態を算出後、(current, cuts_at) を
+            // 一時的に flip して sm を呼び、unflip で戻す。
+            let (nc, nt, nf, _) =
+                prob.delta_apply_cached(&current, &cuts_at, i, cur_cut, cur_t, cur_f);
+            prob.flip_vertex(&mut current, &mut cuts_at, i);
+            let s = sm(&current, &cuts_at, nc, nt, nf);
+            prob.flip_vertex(&mut current, &mut cuts_at, i); // unflip
+            if s < best_smoothed {
+                best_smoothed = s;
+                best_idx = Some(i);
+            }
+        }
+        match best_idx {
+            Some(i) => {
+                let (nc, nt, nf, _) =
+                    prob.delta_apply_cached(&current, &cuts_at, i, cur_cut, cur_t, cur_f);
+                prob.flip_vertex(&mut current, &mut cuts_at, i);
+                cur_cut = nc;
+                cur_t = nt;
+                cur_f = nf;
+                cur_smoothed = best_smoothed;
+            }
+            None => break,
+        }
+    }
+    (current, cuts_at, cur_cut, cur_t, cur_f)
+}
+
+// ============================================================================
+// スナップショット作成
+// ============================================================================
+
+fn make_snapshot_fast<F>(
+    prob: &GraphPartitionProblem,
+    current: &Partition,
+    cuts_at: &[i32],
+    cur_cut: i32,
+    cur_t: usize,
+    cur_f: usize,
+    current_smoothed: f64,
+    step: usize,
+    sm: &mut F,
+    no_smoothing: bool,
+) -> StepRecord
+where
+    F: FnMut(&Partition, &[i32], i32, usize, usize) -> f64,
+{
+    let current_real = GraphPartitionProblem::score_from_state(cur_cut, cur_t, cur_f);
+
+    if no_smoothing {
+        // smoothed-basin == real-basin → 1 回の HC で 4 フィールド埋め尽くし
+        let (_, _, bc, bt, bf) =
+            hill_climb_real_fast(prob, current, cuts_at, cur_cut, cur_t, cur_f);
+        let basin_real = GraphPartitionProblem::score_from_state(bc, bt, bf);
+        StepRecord {
+            step,
+            current_smoothed,
+            current_real,
+            basin_smoothed_from_smoothed: basin_real,
+            basin_real_from_smoothed: basin_real,
+            basin_smoothed_from_real: basin_real,
+            basin_real_from_real: basin_real,
+        }
+    } else {
+        // スムージング空間での山登り
+        let (basin_sm_pt, basin_sm_cuts, bsmc, bsmt, bsmf) =
+            hill_climb_smoothed_fast(prob, current, cuts_at, cur_cut, cur_t, cur_f, sm);
+        let basin_smoothed_from_smoothed = sm(&basin_sm_pt, &basin_sm_cuts, bsmc, bsmt, bsmf);
+        let basin_real_from_smoothed = GraphPartitionProblem::score_from_state(bsmc, bsmt, bsmf);
+
+        // 元空間での山登り
+        let (basin_re_pt, basin_re_cuts, brc, brt, brf) =
+            hill_climb_real_fast(prob, current, cuts_at, cur_cut, cur_t, cur_f);
+        let basin_smoothed_from_real = sm(&basin_re_pt, &basin_re_cuts, brc, brt, brf);
+        let basin_real_from_real = GraphPartitionProblem::score_from_state(brc, brt, brf);
+
+        StepRecord {
+            step,
+            current_smoothed,
+            current_real,
+            basin_smoothed_from_smoothed,
+            basin_real_from_smoothed,
+            basin_smoothed_from_real,
+            basin_real_from_real,
+        }
+    }
+}
+
+// ============================================================================
+// 共通 SA ループ
+// ============================================================================
+
+/// 共通 SA ループ。`sm` は smoothed score 評価クロージャ。
+///
+/// `sm` は呼ばれるたびに内部 RNG を進める可能性がある（RandomK 用）。
+/// 呼び出しパターンは元実装と完全一致させる：
+///   - ループ前: `sm(&current, ...)` を 1 回（初期 current_smoothed）
+///   - 各 SA イテレーション: `sm(&current_with_flipped_idx, ...)` を 1 回
+///   - スナップショット: `make_snapshot_fast` 内で smoothed HC + 2 回の sm 呼び出し
+fn run_sa_generic<F>(
+    prob: &GraphPartitionProblem,
     cfg: &RunConfig,
     seed: u64,
+    no_smoothing: bool,
+    mut sm: F,
 ) -> (Partition, Vec<StepRecord>)
 where
-    Sm: Smoothing<Partition> + ?Sized,
+    F: FnMut(&Partition, &[i32], i32, usize, usize) -> f64,
 {
     let mut rng = Mt19937GenRand64::new(seed);
     let mut current: Partition = prob.random_solution(&mut rng);
-    let n = current.len();
-    let mut current_smoothed = sm.score(prob, &current);
+    let mut cur_cut = prob.count_cut_edges(&current);
+    let (mut cur_t, mut cur_f) = get_partition_sizes(&current);
+    let mut cuts_at = prob.compute_cuts_at(&current);
+
+    let mut current_smoothed = sm(&current, &cuts_at, cur_cut, cur_t, cur_f);
 
     let max_iter = cfg.iterations();
     let temperature = cfg.temperature();
@@ -164,17 +286,37 @@ where
     let mut snap_iter = snap_steps.iter().copied().peekable();
     let mut records = Vec::with_capacity(snap_steps.len() + 1);
 
-    records.push(make_snapshot(prob, sm, &current, current_smoothed, 0));
+    // 初期スナップショット (step = 0)
+    records.push(make_snapshot_fast(
+        prob,
+        &current,
+        &cuts_at,
+        cur_cut,
+        cur_t,
+        cur_f,
+        current_smoothed,
+        0,
+        &mut sm,
+        no_smoothing,
+    ));
 
+    let n = prob.neighbour_size();
     if n == 0 {
         return (current, records);
     }
 
     for it in 1..=max_iter {
-        let i = rng.gen_range(0..n);
-        current[i] = !current[i];
-        let candidate_smoothed = sm.score(prob, &current);
-        let delta = candidate_smoothed - current_smoothed;
+        let idx = rng.gen_range(0..n);
+
+        // 候補 c = current^flip(idx) の整数状態（フリップ前の cuts_at で算出）
+        let (nc, nt, nf, _) =
+            prob.delta_apply_cached(&current, &cuts_at, idx, cur_cut, cur_t, cur_f);
+
+        // (current, cuts_at) を候補へ flip し、sm を評価する。
+        prob.flip_vertex(&mut current, &mut cuts_at, idx);
+        let neighbour_smoothed = sm(&current, &cuts_at, nc, nt, nf);
+
+        let delta = neighbour_smoothed - current_smoothed;
         let accept = if delta < 0.0 {
             true
         } else if temperature > 0.0 {
@@ -183,14 +325,46 @@ where
             false
         };
         if accept {
-            current_smoothed = candidate_smoothed;
+            // 候補状態をそのまま採用（current, cuts_at は flip 済み）。
+            cur_cut = nc;
+            cur_t = nt;
+            cur_f = nf;
+            current_smoothed = neighbour_smoothed;
         } else {
-            current[i] = !current[i];
+            // 不採用 → flip_vertex は対合なので同じ idx でもう一度呼んで戻す。
+            prob.flip_vertex(&mut current, &mut cuts_at, idx);
+        }
+
+        // デバッグビルドでの整合性アサーション（drift 検出用）
+        #[cfg(debug_assertions)]
+        if it % 1000 == 0 {
+            let recomputed_cut = prob.count_cut_edges(&current);
+            let (recomputed_t, recomputed_f) = get_partition_sizes(&current);
+            debug_assert_eq!(cur_cut, recomputed_cut, "cut drift at it={}", it);
+            debug_assert_eq!(cur_t, recomputed_t, "t drift at it={}", it);
+            debug_assert_eq!(cur_f, recomputed_f, "f drift at it={}", it);
+            debug_assert_eq!(
+                cuts_at,
+                prob.compute_cuts_at(&current),
+                "cuts_at drift at it={}",
+                it
+            );
         }
 
         if let Some(&want) = snap_iter.peek() {
             if it == want {
-                records.push(make_snapshot(prob, sm, &current, current_smoothed, it));
+                records.push(make_snapshot_fast(
+                    prob,
+                    &current,
+                    &cuts_at,
+                    cur_cut,
+                    cur_t,
+                    cur_f,
+                    current_smoothed,
+                    it,
+                    &mut sm,
+                    no_smoothing,
+                ));
                 snap_iter.next();
             }
         }
@@ -199,118 +373,136 @@ where
     (current, records)
 }
 
-/// SA の高速パス（NoSmoothing 専用）。
-/// 差分計算でスコアを増分管理し、毎ステップ O(deg(i)) で動く。
-fn run_sa_no_smoothing(
+// ============================================================================
+// Smoothing 種別ごとの specialized SA
+// ============================================================================
+
+fn run_sa_none(
     prob: &GraphPartitionProblem,
     cfg: &RunConfig,
     seed: u64,
 ) -> (Partition, Vec<StepRecord>) {
-    let mut rng = Mt19937GenRand64::new(seed);
-    let mut current: Partition = prob.random_solution(&mut rng);
-    let n = current.len();
-    let (mut t, mut f) = get_partition_sizes(&current);
-    let mut current_score = prob.score(&current);
+    run_sa_generic(prob, cfg, seed, true, |_p, _cuts, c, t, f| {
+        GraphPartitionProblem::score_from_state(c, t, f)
+    })
+}
 
-    let max_iter = cfg.iterations();
-    let temperature = cfg.temperature();
+fn run_sa_kavg(
+    prob: &GraphPartitionProblem,
+    k: usize,
+    cfg: &RunConfig,
+    seed: u64,
+) -> (Partition, Vec<StepRecord>) {
+    let n = prob.neighbour_size();
+    let sample_count = k.min(n);
+    run_sa_generic(prob, cfg, seed, false, move |p, cuts_at, c, t, f| {
+        if n == 0 || sample_count == 0 {
+            return GraphPartitionProblem::score_from_state(c, t, f);
+        }
+        // 元実装の `neighbours.iter().take(sample_count).map(|n| problem.score(n)).sum() / count`
+        // と等価。インデックス 0..sample_count を順に評価し、左→右に逐次加算。
+        let sum: f64 = (0..sample_count)
+            .map(|j| prob.delta_apply_cached(p, cuts_at, j, c, t, f).3)
+            .sum();
+        sum / sample_count as f64
+    })
+}
 
-    let snap_steps = logarithmic_steps(max_iter);
-    let mut snap_iter = snap_steps.iter().copied().peekable();
-    let mut records = Vec::with_capacity(snap_steps.len() + 1);
+fn run_sa_random_k(
+    prob: &GraphPartitionProblem,
+    k: usize,
+    sm_seed: u64,
+    cfg: &RunConfig,
+    seed: u64,
+) -> (Partition, Vec<StepRecord>) {
+    let n = prob.neighbour_size();
+    let mut sm_rng = Mt19937GenRand64::new(sm_seed);
 
-    records.push(make_snapshot_no_smoothing(prob, &current, current_score, 0));
+    run_sa_generic(prob, cfg, seed, false, move |p, cuts_at, c, t, f| {
+        if n == 0 {
+            return GraphPartitionProblem::score_from_state(c, t, f);
+        }
 
-    if n == 0 {
-        return (current, records);
-    }
-
-    for it in 1..=max_iter {
-        let i = rng.gen_range(0..n);
-        let delta = prob.flip_delta_with_sizes(&current, i, (t, f));
-        let accept = if delta < 0.0 {
-            true
-        } else if temperature > 0.0 {
-            rng.r#gen::<f64>() < (-delta / temperature).exp()
+        if k <= n {
+            // d1 から K 個ランダムサンプリング（Fisher-Yates）
+            let mut indices: Vec<usize> = (0..n).collect();
+            for i in 0..k {
+                let j = sm_rng.gen_range(i..n);
+                indices.swap(i, j);
+            }
+            let scores: Vec<f64> = indices[..k]
+                .iter()
+                .map(|&i| prob.delta_apply_cached(p, cuts_at, i, c, t, f).3)
+                .collect();
+            if scores.is_empty() {
+                return GraphPartitionProblem::score_from_state(c, t, f);
+            }
+            scores.iter().sum::<f64>() / scores.len() as f64
         } else {
-            false
-        };
-        if accept {
-            if current[i] {
-                t -= 1;
-                f += 1;
-            } else {
-                t += 1;
-                f -= 1;
+            // d2 フォールバック: d1 全部 + d2 から (k - n) 個サンプル
+            // 元実装の d2 列挙順は (j, k_idx) で j < k_idx の昇順。
+            let mut d2_pairs: Vec<(usize, usize)> = Vec::with_capacity(n * (n - 1) / 2);
+            for j in 0..n {
+                for k_idx in (j + 1)..n {
+                    d2_pairs.push((j, k_idx));
+                }
             }
-            current[i] = !current[i];
-            current_score += delta;
-        }
 
-        if let Some(&want) = snap_iter.peek() {
-            if it == want {
-                records.push(make_snapshot_no_smoothing(prob, &current, current_score, it));
-                snap_iter.next();
+            let needed = k - n;
+            let take = needed.min(d2_pairs.len());
+            for i in 0..take {
+                let j = sm_rng.gen_range(i..d2_pairs.len());
+                d2_pairs.swap(i, j);
             }
+
+            // d1 の全スコア + 選ばれた d2 のスコア
+            let mut scores: Vec<f64> = (0..n)
+                .map(|i| prob.delta_apply_cached(p, cuts_at, i, c, t, f).3)
+                .collect();
+            for &(j, k_idx) in &d2_pairs[..take] {
+                // p^flip(j)^flip(k_idx) のスコア
+                let (jc, jt, jf, _) = prob.delta_apply_cached(p, cuts_at, j, c, t, f);
+                // p[j] を一時 flip して delta_apply(_, k_idx, jc, jt, jf) を取る
+                let mut p_clone = p.clone();
+                p_clone[j] = !p_clone[j];
+                let s = prob.delta_apply(&p_clone, k_idx, jc, jt, jf).3;
+                scores.push(s);
+            }
+
+            if scores.is_empty() {
+                return GraphPartitionProblem::score_from_state(c, t, f);
+            }
+            scores.iter().sum::<f64>() / scores.len() as f64
         }
-    }
-
-    (current, records)
+    })
 }
 
-/// NoSmoothing 用スナップショット。スムージング空間 = 元空間なので、
-/// 6 トレース全てが同じ値になり、山登りも 1 回で済む。
-fn make_snapshot_no_smoothing(
+fn run_sa_weighted(
     prob: &GraphPartitionProblem,
-    current: &Partition,
-    current_score: f64,
-    step: usize,
-) -> StepRecord {
-    let basin = hill_climb_real(prob, current);
-    let basin_score = prob.score(&basin);
-    StepRecord {
-        step,
-        current_smoothed: current_score,
-        current_real: current_score,
-        basin_smoothed_from_smoothed: basin_score,
-        basin_real_from_smoothed: basin_score,
-        basin_smoothed_from_real: basin_score,
-        basin_real_from_real: basin_score,
-    }
+    k: usize,
+    cfg: &RunConfig,
+    seed: u64,
+) -> (Partition, Vec<StepRecord>) {
+    let n = prob.neighbour_size();
+    run_sa_generic(prob, cfg, seed, false, move |p, cuts_at, c, t, f| {
+        if n == 0 {
+            return GraphPartitionProblem::score_from_state(c, t, f);
+        }
+        let k_clamped = k.min(n) as f64;
+        let weight = k_clamped / n as f64;
+        // 元実装と同じ加算順序: 0..n を逐次加算 → / n
+        let neighbour_avg = (0..n)
+            .map(|i| prob.delta_apply_cached(p, cuts_at, i, c, t, f).3)
+            .sum::<f64>()
+            / n as f64;
+        let current_score = GraphPartitionProblem::score_from_state(c, t, f);
+        weight * neighbour_avg + (1.0 - weight) * current_score
+    })
 }
 
-fn make_snapshot<Sm>(
-    prob: &GraphPartitionProblem,
-    sm: &Sm,
-    current: &Partition,
-    current_smoothed: f64,
-    step: usize,
-) -> StepRecord
-where
-    Sm: Smoothing<Partition> + ?Sized,
-{
-    let current_real = prob.score(current);
-
-    // スムージング空間から山登り
-    let basin_smoothed_pt = hill_climb_smoothed(prob, sm, current);
-    let basin_smoothed_from_smoothed = sm.score(prob, &basin_smoothed_pt);
-    let basin_real_from_smoothed = prob.score(&basin_smoothed_pt);
-
-    // 元空間から山登り
-    let basin_real_pt = hill_climb_real(prob, current);
-    let basin_smoothed_from_real = sm.score(prob, &basin_real_pt);
-    let basin_real_from_real = prob.score(&basin_real_pt);
-
-    StepRecord {
-        step,
-        current_smoothed,
-        current_real,
-        basin_smoothed_from_smoothed,
-        basin_real_from_smoothed,
-        basin_smoothed_from_real,
-        basin_real_from_real,
-    }
-}
+// ============================================================================
+// 公開 API
+// ============================================================================
 
 /// 単一シードの実行を行い、結果を返す（保存はしない）。
 pub fn execute(
@@ -322,18 +514,10 @@ pub fn execute(
     let t0 = std::time::Instant::now();
     let sm_seed = seed.wrapping_add(0xDEAD_BEEF);
     let (final_p, records) = match cfg.smoothing {
-        // 差分計算を使う高速パス。スムージング空間 = 元空間なので
-        // 6 トレースは全て同値、山登りも 1 回で済む。
-        SmoothingSpec::None => run_sa_no_smoothing(prob, cfg, seed),
-        SmoothingSpec::KAverage(k) => {
-            run_sa_with_smoothing(prob, &KAveragingSmoothing::new(k), cfg, seed)
-        }
-        SmoothingSpec::RandomKAverage(k) => {
-            run_sa_with_smoothing(prob, &RandomKSmoothing::new(k, sm_seed), cfg, seed)
-        }
-        SmoothingSpec::WeightedAverage(k) => {
-            run_sa_with_smoothing(prob, &WeightedNeighbourSmoothing::new(k), cfg, seed)
-        }
+        SmoothingSpec::None => run_sa_none(prob, cfg, seed),
+        SmoothingSpec::KAverage(k) => run_sa_kavg(prob, k, cfg, seed),
+        SmoothingSpec::RandomKAverage(k) => run_sa_random_k(prob, k, sm_seed, cfg, seed),
+        SmoothingSpec::WeightedAverage(k) => run_sa_weighted(prob, k, cfg, seed),
     };
     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
     RunResult {
@@ -448,7 +632,12 @@ mod tests {
     #[test]
     fn test_execute_runs() {
         use crate::graph_spec::{GraphKind, StoredGraph};
-        let spec = GraphSpec { kind: GraphKind::Random, n: 30, d: 4.0, seed: 0 };
+        let spec = GraphSpec {
+            kind: GraphKind::Random,
+            n: 30,
+            d: 4.0,
+            seed: 0,
+        };
         let stored = StoredGraph::generate(spec);
         let prob = stored.problem();
         let mut cfg = RunConfig::new("t");
