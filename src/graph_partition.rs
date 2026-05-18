@@ -110,54 +110,9 @@ impl GraphPartitionProblem {
         Self { graph }
     }
 
-    /// 幾何グラフを生成し、頂点座標と共に問題インスタンスを返す（GUI可視化用）。
-    pub fn generate_geometric_with_coords(
-        node_count: usize,
-        expected_degree: f64,
-        rng: &mut Mt19937GenRand64,
-    ) -> (Self, Vec<(f64, f64)>) {
-        let (graph, coords) = Self::generate_geometric_graph(node_count, expected_degree, rng);
-        (Self { graph }, coords)
-    }
-
     /// 内部グラフへの参照を返す（可視化用）。
     pub fn graph(&self) -> &Graph {
         &self.graph
-    }
-
-    /// 頂点 `i` をフリップしたときのスコア差分を返す（O(deg(i))）。
-    /// `sizes` は現在の `(|V_T|, |V_F|)`。SA や HC で増分計算するために使う。
-    pub fn flip_delta_with_sizes(
-        &self,
-        partition: &Partition,
-        i: usize,
-        sizes: (usize, usize),
-    ) -> f64 {
-        let bi = partition[i];
-        let mut cut_now: i64 = 0;
-        let mut deg: i64 = 0;
-        for &v in &self.graph.adjacency_list[i] {
-            deg += 1;
-            if partition[v] != bi {
-                cut_now += 1;
-            }
-        }
-        // フリップ後のカット = deg - cut_now、よってカット差分 = deg - 2*cut_now
-        let cut_delta = deg - 2 * cut_now;
-
-        let t = sizes.0 as i64;
-        let f = sizes.1 as i64;
-        let diff_now = t - f;
-        let diff_after = if bi { diff_now - 2 } else { diff_now + 2 };
-        let pen_delta =
-            ALPHA * ((diff_after * diff_after) as f64 - (diff_now * diff_now) as f64);
-        cut_delta as f64 + pen_delta
-    }
-
-    /// `flip_delta_with_sizes` のサイズ自動計算版（O(n + deg(i))）。
-    pub fn flip_delta(&self, partition: &Partition, i: usize) -> f64 {
-        let sizes = get_partition_sizes(partition);
-        self.flip_delta_with_sizes(partition, i, sizes)
     }
 
     /// 指定 partition の cut 数を i32 で計算する（O(E)）。
@@ -284,8 +239,9 @@ impl GraphPartitionProblem {
         (new_cut, new_t, new_f, new_score)
     }
 
-    /// Erdős–Rényi ランダムグラフを生成する。
-    fn generate_random_graph(
+    /// Erdős–Rényi ランダムグラフ G(n, p) を生成する。
+    /// 各辺を独立に確率 p = expected_degree / (node_count − 1) で張る。
+    pub fn generate_random_graph(
         node_count: usize,
         expected_degree: f64,
         rng: &mut Mt19937GenRand64,
@@ -309,8 +265,9 @@ impl GraphPartitionProblem {
         graph
     }
 
-    /// 幾何ランダムグラフを生成する。
-    fn generate_geometric_graph(
+    /// 幾何ランダムグラフを生成し、グラフと頂点座標を返す。
+    /// [0,1]² 上に頂点を一様配置し、距離が閾値以下の頂点対に辺を張る。
+    pub fn generate_geometric_graph(
         node_count: usize,
         expected_degree: f64,
         rng: &mut Mt19937GenRand64,
@@ -738,28 +695,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_flip_delta_matches_full_recompute() {
-        let method = GraphGenerationMethod::Random {
-            node_count: 30,
-            expected_degree: 4.0,
-        };
-        let mut rng = Mt19937GenRand64::new(7);
-        let problem = GraphPartitionProblem::generate(method, &mut rng);
-        let partition = problem.random_solution(&mut rng);
-        let base = problem.score(&partition);
-        for i in 0..partition.len() {
-            let mut flipped = partition.clone();
-            flipped[i] = !flipped[i];
-            let direct = problem.score(&flipped) - base;
-            let delta = problem.flip_delta(&partition, i);
-            assert!(
-                (direct - delta).abs() < 1e-9,
-                "vertex {}: full={} delta={}",
-                i,
-                direct,
-                delta
-            );
-        }
-    }
 }

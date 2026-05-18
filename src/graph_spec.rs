@@ -5,7 +5,6 @@
 
 use std::path::{Path, PathBuf};
 
-use rand::Rng;
 use rand_mt::Mt19937GenRand64;
 use serde::{Deserialize, Serialize};
 
@@ -75,9 +74,13 @@ impl StoredGraph {
     pub fn generate(spec: GraphSpec) -> Self {
         let mut rng = Mt19937GenRand64::new(spec.seed);
         let (graph, coords) = match spec.kind {
-            GraphKind::Random => (generate_random(spec.n, spec.d, &mut rng), None),
+            GraphKind::Random => (
+                GraphPartitionProblem::generate_random_graph(spec.n, spec.d, &mut rng),
+                None,
+            ),
             GraphKind::Geometric => {
-                let (g, c) = generate_geometric(spec.n, spec.d, &mut rng);
+                let (g, c) =
+                    GraphPartitionProblem::generate_geometric_graph(spec.n, spec.d, &mut rng);
                 (g, Some(c))
             }
         };
@@ -178,39 +181,6 @@ impl GraphLibrary {
         });
         v
     }
-}
-
-fn generate_random(n: usize, d: f64, rng: &mut Mt19937GenRand64) -> Graph {
-    let mut g = Graph::new(n);
-    let p = if n > 1 { d / (n - 1) as f64 } else { 0.0 };
-    for i in 0..n {
-        for j in (i + 1)..n {
-            if rng.r#gen::<f64>() < p {
-                g.add_edge(i, j);
-            }
-        }
-    }
-    g
-}
-
-fn generate_geometric(n: usize, d: f64, rng: &mut Mt19937GenRand64) -> (Graph, Vec<(f64, f64)>) {
-    let mut g = Graph::new(n);
-    let mut pts = Vec::with_capacity(n);
-    for _ in 0..n {
-        pts.push((rng.r#gen::<f64>(), rng.r#gen::<f64>()));
-    }
-    let pi = std::f64::consts::PI;
-    let threshold = (d / (n as f64 * pi)).sqrt();
-    for u in 0..n {
-        for v in (u + 1)..n {
-            let dx = pts[u].0 - pts[v].0;
-            let dy = pts[u].1 - pts[v].1;
-            if (dx * dx + dy * dy).sqrt() <= threshold {
-                g.add_edge(u, v);
-            }
-        }
-    }
-    (g, pts)
 }
 
 #[cfg(test)]
