@@ -73,6 +73,8 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 860.0])
             .with_title("GPP Experiment Runner"),
+        // OpenGL 非対応環境でも動くよう wgpu (DX12/Vulkan) を使う。
+        renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
     eframe::run_native(
