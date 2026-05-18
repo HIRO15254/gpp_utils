@@ -69,12 +69,40 @@ const CONFIG_COLORS: &[Color32] = &[
 ];
 
 fn main() -> eframe::Result<()> {
+    use std::sync::Arc;
+
+    // wgpu のアダプタ選択をカスタマイズする。
+    // eframe のデフォルトはハードウェア GPU を要求し、見つからないと
+    // `NoSuitableAdapterFound` で起動に失敗する（GPU 非搭載の Azure VM 等）。
+    // ここでは列挙された全アダプタからハードウェアを優先しつつ、無ければ
+    // WARP（Windows 同梱のソフトウェアラスタライザ）にフォールバックする。
+    let mut wgpu_options = eframe::egui_wgpu::WgpuConfiguration::default();
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut wgpu_options.wgpu_setup {
+        setup.native_adapter_selector = Some(Arc::new(|adapters, _surface| {
+            adapters
+                .iter()
+                .max_by_key(|a| match a.get_info().device_type {
+                    eframe::wgpu::DeviceType::DiscreteGpu => 4,
+                    eframe::wgpu::DeviceType::IntegratedGpu => 3,
+                    eframe::wgpu::DeviceType::VirtualGpu => 2,
+                    eframe::wgpu::DeviceType::Cpu => 1, // WARP ソフトウェアラスタライザ
+                    eframe::wgpu::DeviceType::Other => 0,
+                })
+                .cloned()
+                .ok_or_else(|| {
+                    "利用可能な wgpu アダプタが見つかりません（ハードウェア・WARP とも不在）"
+                        .to_owned()
+                })
+        }));
+    }
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 860.0])
             .with_title("GPP Experiment Runner"),
-        // OpenGL 非対応環境でも動くよう wgpu (DX12/Vulkan) を使う。
+        // OpenGL 非対応環境でも動くよう wgpu (DX12/Vulkan/WARP) を使う。
         renderer: eframe::Renderer::Wgpu,
+        wgpu_options,
         ..Default::default()
     };
     eframe::run_native(
