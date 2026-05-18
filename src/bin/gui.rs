@@ -7,20 +7,20 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use eframe::egui;
 use egui::{Color32, CornerRadius, RichText, Stroke};
 use egui_plot::{Line, LineStyle, Plot, PlotPoints};
-use rayon::prelude::*;
 
-use gpp_utils::graph_partition::GraphPartitionProblem;
+use gpp_utils::batch::{BatchEvent, BatchSpec, run_batch};
 use gpp_utils::graph_spec::{
     EXPECTED_DEGREES, GraphKind, GraphLibrary, GraphSpec, NODE_COUNTS, StoredGraph,
 };
 use gpp_utils::run_config::{RunConfig, SmoothingSpec};
-use gpp_utils::run_executor::{RunResult, ResultStore, StepRecord, execute};
+use gpp_utils::run_executor::{RunResult, ResultStore, StepRecord};
 
 const GNUPLOT_DIR: &str = "data/gnuplot";
 
@@ -189,22 +189,12 @@ enum ViewMode {
     AveragedByConfig,
 }
 
-/// 並列ワーカが消化する 1 単位の実行ジョブ。
-struct Job {
-    graph_spec: GraphSpec,
-    /// グラフ単位で 1 つ作って Arc 共有する（毎ジョブ作り直さない）。
-    problem: Arc<GraphPartitionProblem>,
-    config: RunConfig,
-    seed: u64,
-}
-
 #[derive(Default)]
 struct RunStatus {
     in_progress: bool,
     total: usize,
     done: usize,
     skipped: usize,
-    cancel: bool,
     log: Vec<String>,
 }
 
@@ -247,6 +237,8 @@ struct App {
 
     // Run status (shared with thread)
     run_status: Arc<Mutex<RunStatus>>,
+    /// 実行キャンセル要求フラグ（裏スレッドの run_batch と共有）。
+    cancel: Arc<AtomicBool>,
 
     // Results
     loaded_results: Vec<RunResult>,
@@ -314,6 +306,7 @@ impl App {
             num_threads: detected_cpus,
             detected_cpus,
             run_status: Arc::new(Mutex::new(RunStatus::default())),
+            cancel: Arc::new(AtomicBool::new(false)),
             loaded_results: Vec::new(),
             selected_result: None,
             show_trace: [true, true, false, true, false, true],
@@ -427,104 +420,69 @@ impl App {
                 total,
                 done: 0,
                 skipped: 0,
-                cancel: false,
-                log: vec![format!(
-                    "Starting {} runs ({} graphs x {} configs x {} seeds, {} threads)",
-                    total,
-                    graphs.len(),
-                    cfgs.len(),
-                    self.num_seeds,
-                    num_threads
-                )],
+                log: Vec::new(),
             };
         }
 
-        // ジョブ列を構築。Problem はグラフ単位で 1 度だけ計算し Arc 共有。
-        let start_seed = self.start_seed;
-        let num_seeds = self.num_seeds;
-        let mut jobs: Vec<Job> = Vec::with_capacity(total);
-        for graph in &graphs {
-            let problem = Arc::new(graph.problem());
-            for cfg in &cfgs {
-                for s_off in 0..num_seeds {
-                    let seed = start_seed.wrapping_add(s_off as u64);
-                    jobs.push(Job {
-                        graph_spec: graph.spec,
-                        problem: Arc::clone(&problem),
-                        config: cfg.clone(),
-                        seed,
-                    });
-                }
-            }
-        }
+        // 選択中のグラフ・設定・シード範囲を共通バッチ定義へ変換する。
+        let spec = BatchSpec {
+            graphs: graphs.iter().map(|g| g.spec).collect(),
+            configs: cfgs,
+            seed_start: self.start_seed,
+            seed_count: self.num_seeds,
+        };
+        let graph_dir = self.library.base_dir.clone();
         let store_dir = self.store.base_dir.clone();
         let status_arc = Arc::clone(&self.run_status);
+        let cancel = Arc::clone(&self.cancel);
+        cancel.store(false, Ordering::Relaxed);
 
-        // rayon のローカルスレッドプールでジョブを並列消化する。
-        // プールの駆動は 1 本の裏スレッドに任せ、UI スレッドはブロックしない。
+        // 実行は CLI と共通の batch::run_batch に委ねる。駆動は 1 本の裏スレッドに
+        // 任せ、UI スレッドはブロックしない。進捗イベントを run_status へ反映する。
         thread::spawn(move || {
-            let pool = match rayon::ThreadPoolBuilder::new()
-                .num_threads(num_threads)
-                .build()
-            {
-                Ok(p) => p,
-                Err(e) => {
+            run_batch(
+                &spec,
+                &graph_dir,
+                &store_dir,
+                num_threads,
+                true,
+                cancel,
+                |ev| {
                     let mut st = status_arc.lock().unwrap();
-                    st.push_log(format!("thread pool error: {}", e));
-                    st.in_progress = false;
-                    return;
-                }
-            };
-
-            pool.install(|| {
-                jobs.into_par_iter().for_each(|job| {
-                    // Cancel 済みなら即 return する（残りジョブも素通りする）。
-                    {
-                        let st = status_arc.lock().unwrap();
-                        if st.cancel {
-                            return;
+                    match ev {
+                        BatchEvent::Started { total, graphs, configs, seeds, threads } => st
+                            .push_log(format!(
+                                "Starting {} runs ({} graphs x {} configs x {} seeds, {} threads)",
+                                total, graphs, configs, seeds, threads
+                            )),
+                        BatchEvent::Skipped { graph, config, seed } => {
+                            st.skipped += 1;
+                            st.done += 1;
+                            st.push_log(format!("skip {} / {} / seed={}", graph, config, seed));
+                        }
+                        BatchEvent::Done { graph, config, seed, elapsed_s, final_real } => {
+                            st.done += 1;
+                            st.push_log(format!(
+                                "done {} / {} / seed={} ({:.1}s, real={:.2})",
+                                graph, config, seed, elapsed_s, final_real
+                            ));
+                        }
+                        BatchEvent::SaveError { message } => {
+                            st.push_log(format!("save error: {}", message))
+                        }
+                        BatchEvent::PoolError { message } => {
+                            st.push_log(format!("thread pool error: {}", message))
+                        }
+                        BatchEvent::GraphError { spec, message } => {
+                            st.push_log(format!("graph error {}: {}", spec.id(), message))
+                        }
+                        BatchEvent::Finished => {
+                            st.in_progress = false;
+                            st.push_log("--- finished ---");
                         }
                     }
-                    let store = ResultStore::new(store_dir.clone());
-                    if store.exists(&job.graph_spec, &job.config, job.seed) {
-                        let mut st = status_arc.lock().unwrap();
-                        st.skipped += 1;
-                        st.done += 1;
-                        st.push_log(format!(
-                            "skip {} / {} / seed={}",
-                            job.graph_spec.id(),
-                            job.config.id(),
-                            job.seed
-                        ));
-                        return;
-                    }
-                    let t0 = std::time::Instant::now();
-                    let result = execute(job.graph_spec, &job.config, &job.problem, job.seed);
-                    let elapsed = t0.elapsed().as_secs_f64();
-                    if let Err(e) = store.save(&result) {
-                        let mut st = status_arc.lock().unwrap();
-                        st.push_log(format!("save error: {}", e));
-                    }
-                    let mut st = status_arc.lock().unwrap();
-                    st.done += 1;
-                    st.push_log(format!(
-                        "done {} / {} / seed={} ({:.1}s, real={:.2})",
-                        job.graph_spec.id(),
-                        job.config.id(),
-                        job.seed,
-                        elapsed,
-                        result
-                            .records
-                            .last()
-                            .map(|r| r.current_real)
-                            .unwrap_or(f64::NAN)
-                    ));
-                });
-            });
-
-            let mut st = status_arc.lock().unwrap();
-            st.in_progress = false;
-            st.push_log("--- finished ---");
+                },
+            );
         });
 
         self.status = format!("Run started ({} threads).", num_threads);
@@ -533,7 +491,7 @@ impl App {
     fn cancel_run(&mut self) {
         let mut st = self.run_status.lock().unwrap();
         if st.in_progress {
-            st.cancel = true;
+            self.cancel.store(true, Ordering::Relaxed);
             st.push_log("cancel requested");
         }
     }

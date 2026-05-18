@@ -1,0 +1,11 @@
+{
+  "graphs": [
+    { "kind": "Random", "n": 124, "d": 5.0, "seed": 0 }
+  ],
+  "configs": [
+    { "name": "T=1, 10^4, none", "theta": 0.0, "log10_iterations": 4, "smoothing": "None" },
+    { "name": "greedy, 10^4, kavg8", "theta": null, "log10_iterations": 4, "smoothing": { "KAverage": 8 } }
+  ],
+  "seed_start": 0,
+  "seed_count": 3
+}

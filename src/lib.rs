@@ -10,3 +10,4 @@ pub mod graph_partition;
 pub mod graph_spec;
 pub mod run_config;
 pub mod run_executor;
+pub mod batch;

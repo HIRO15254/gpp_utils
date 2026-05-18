@@ -12,10 +12,16 @@ serde_json = "1.0"
 # wgpu バックエンド有効化: OpenGL 非対応環境（RDP/VM 等）でも描画できる。
 eframe = { version = "0.31", features = ["wgpu"] }
 egui_plot = "0.31"
+clap = { version = "4", features = ["derive"] }
 
 [[bin]]
 name = "gui"
 path = "src/bin/gui.rs"
+
+# ヘッドレスなバッチ実行 CLI（GPU 不要、Azure VM 等で利用）。
+[[bin]]
+name = "cli"
+path = "src/bin/cli.rs"
 
 # 実験・ベンチは release で実行する前提の最適化設定。
 # lto + 単一 codegen-unit でクレート横断のインライン化を効かせる。

@@ -24,7 +24,9 @@ src/
 ├── graph_spec.rs           # グラフ仕様とライブラリ (data/graphs に永続化)
 ├── run_config.rs           # SA 実行条件 (Theta / 10^N 反復 / Smoothing)
 ├── run_executor.rs         # 対数刻み 6 トレース計測と結果ストア
-└── bin/gui.rs              # 4 タブ構成の実験 GUI
+├── batch.rs                # GUI/CLI 共通のバッチ実行ランナー
+├── bin/gui.rs              # 4 タブ構成の実験 GUI
+└── bin/cli.rs              # ヘッドレスなバッチ実行 CLI
 ```
 
 ### optimization — 最適化フレームワークのトレイト
@@ -192,6 +194,73 @@ data/
 └── tsv/<graph_id>/<config_id>/       # gnuplot 用 TSV
 ```
 
+### CLI（`cargo run --bin cli`）
+
+GPU やディスプレイの無い環境（Azure VM など）向けのヘッドレスなバッチ実行。
+GUI の Run タブと**同じ実行パス**（`batch::run_batch` → `run_executor::execute`）を
+共有しているため、最適化の速度・出力フォーマットは GUI と完全に一致する。結果は
+`data/results/` に GUI と同一レイアウトで保存され、ローカルの GUI Results タブで
+そのまま閲覧できる。
+
+```
+cargo run --release --bin cli -- --batch <定義>.json [オプション]
+```
+
+| オプション | 既定値 | 説明 |
+|---|---|---|
+| `--batch <FILE>` | （必須） | JSON バッチ定義ファイル |
+| `--out <DIR>` | `data/results` | 結果 JSON の保存先 |
+| `--graphs <DIR>` | `data/graphs` | グラフのロード／生成キャッシュ先 |
+| `--threads <N>` | 論理コア数 | 並列ワーカ数 |
+| `--overwrite` | （オフ） | 既存結果も上書き再計算する（既定は既存をスキップ） |
+
+#### バッチ定義 JSON の書式
+
+`graphs × configs × seeds` の直積がジョブとして実行される。サンプルは
+[`examples/batch.example.json`](examples/batch.example.json) を参照。
+
+```json
+{
+  "graphs": [
+    { "kind": "Random", "n": 124, "d": 5.0, "seed": 0 }
+  ],
+  "configs": [
+    { "name": "T=1, 10^4, none", "theta": 0.0, "log10_iterations": 4, "smoothing": "None" },
+    { "name": "greedy, kavg8", "theta": null, "log10_iterations": 4, "smoothing": { "KAverage": 8 } }
+  ],
+  "seed_start": 0,
+  "seed_count": 3
+}
+```
+
+| フィールド | 型 | 説明 |
+|---|---|---|
+| `graphs` | 配列 | 実行対象グラフの仕様。未生成なら自動生成・キャッシュされる |
+| `graphs[].kind` | `"Random"` / `"Geometric"` | グラフ生成方式 |
+| `graphs[].n` | 整数 | 頂点数 |
+| `graphs[].d` | 実数 | 期待次数 |
+| `graphs[].seed` | 整数 | グラフ生成シード |
+| `configs` | 配列 | SA 実行条件 `RunConfig` |
+| `configs[].name` | 文字列 | 表示用ラベル（キャッシュキー `id()` には影響しない） |
+| `configs[].theta` | 実数 / `null` | 温度 Θ = log10(T)。`null` で T = 0（貪欲） |
+| `configs[].log10_iterations` | 整数 | 反復回数 = 10^N |
+| `configs[].smoothing` | 下表参照 | スムージング戦略 |
+| `seed_start` | 整数 | 実行シードの開始値 |
+| `seed_count` | 整数 | シード本数（`seed_start, seed_start+1, …` を `seed_count` 個） |
+
+`smoothing`（`SmoothingSpec`）の JSON 表記:
+
+| 戦略 | 表記 |
+|---|---|
+| 平滑化なし | `"None"` |
+| 決定論的 K 近傍平均 | `{ "KAverage": 8 }` |
+| 確率的 K 近傍平均 | `{ "RandomKAverage": 8 }` |
+| 重み付き平均 | `{ "WeightedAverage": 8 }` |
+
+既に結果が存在する `(graph, config, seed)` 三つ組は既定でスキップされる
+（`--overwrite` で再計算）。グラフのロード／生成や保存に失敗した場合は
+標準エラーに出力し、終了コードを非 0 にする。
+
 ## 使い方
 
 ### 依存関係の追加
@@ -265,3 +334,4 @@ println!("記録されたスナップショット数: {}", result.records.len())
 | `serde_json` | 1.0 | JSON 入出力 |
 | `eframe` | 0.31 | ネイティブ GUI フレームワーク（`bin/gui.rs`） |
 | `egui_plot` | 0.31 | プロット描画（`bin/gui.rs`） |
+| `clap` | 4 | コマンドライン引数の解析（`bin/cli.rs`） |
