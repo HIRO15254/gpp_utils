@@ -1,7 +1,16 @@
-//! τ-Extremal Optimization ソルバー。
+//! τ-Extremal Optimization ソルバー（汎用 `Solver` トレイト版）。
 //!
 //! 各近傍のスムージングスコアを「適応度」として使用し、
 //! べき乗則確率で低適応度の構成要素を選択・変更する。
+//!
+//! # 注意: これは簡易・汎用版である
+//!
+//! このトレイト実装は任意の `Problem<S>` 上で動く汎用版で、「2 集合・スワップ・
+//! バランス制約」という概念を持たない（単一構成要素のフリップのみ）。
+//! グラフ二分割スペック（Boettcher–Percus）に忠実な、**厳密バランスのスワップ版
+//! τ-EO は [`crate::run_executor::run_eo`]** にある。実験ワークフロー
+//! （GUI / CLI / batch）はこの汎用トレイトではなく `run_executor::execute` 経由で
+//! 忠実版 τ-EO を実行する。本ファイルは比較・教育用の汎用実装として残している。
 
 use crate::optimization::{Problem, Smoothing, Solver, SolverStats};
 use rand::Rng;

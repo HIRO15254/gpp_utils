@@ -11,7 +11,7 @@
 //! - `records` 内の f64 値は 1e-12 許容誤差で比較
 
 use gpp_utils::graph_spec::{GraphSpec, StoredGraph};
-use gpp_utils::run_config::{RunConfig, SmoothingSpec};
+use gpp_utils::run_config::{RunConfig, SmoothingSpec, SolverSpec};
 use gpp_utils::run_executor::execute;
 use serde::Deserialize;
 
@@ -23,12 +23,24 @@ struct BaselineEntry {
     records: Vec<(usize, f64, f64, f64, f64, f64, f64)>,
 }
 
+/// τ-EO の baseline エントリ。
+#[derive(Deserialize)]
+struct EoEntry {
+    tau: f64,
+    seed: u64,
+    final_partition: Vec<bool>,
+    records: Vec<(usize, f64, f64, f64, f64, f64, f64)>,
+}
+
 #[derive(Deserialize)]
 struct Baseline {
     graph_spec: GraphSpec,
     log10_iterations: u32,
     theta: Option<f64>,
     entries: Vec<BaselineEntry>,
+    /// EO エントリ（加法的拡張。古い baseline には無いので default = 空）。
+    #[serde(default)]
+    eo_entries: Vec<EoEntry>,
 }
 
 fn load_baseline() -> Baseline {
@@ -114,4 +126,71 @@ fn regression_final_partition_bitwise_match() {
     );
 
     assert_eq!(total, 80, "expected 4 smoothings × 20 seeds = 80 entries");
+}
+
+#[test]
+fn regression_eo_final_partition_bitwise_match() {
+    let baseline = load_baseline();
+    // 古い baseline（eo_entries 無し）では何も検証しない（後方互換）。
+    if baseline.eo_entries.is_empty() {
+        return;
+    }
+    let stored = StoredGraph::generate(baseline.graph_spec);
+    let prob = stored.problem();
+
+    let mut total = 0;
+    let mut mismatched_records = Vec::new();
+
+    for entry in &baseline.eo_entries {
+        let mut cfg = RunConfig::new("regression-eo");
+        cfg.theta = None;
+        cfg.smoothing = SmoothingSpec::None;
+        cfg.log10_iterations = baseline.log10_iterations;
+        cfg.solver = SolverSpec::Eo { tau: entry.tau };
+
+        let result = execute(baseline.graph_spec, &cfg, &prob, entry.seed);
+
+        assert_eq!(
+            result.final_partition, entry.final_partition,
+            "EO final_partition mismatch: tau={}, seed={}",
+            entry.tau, entry.seed
+        );
+        assert_eq!(
+            result.records.len(),
+            entry.records.len(),
+            "EO records length mismatch: tau={}, seed={}",
+            entry.tau, entry.seed
+        );
+        for (i, (new, old)) in result.records.iter().zip(entry.records.iter()).enumerate() {
+            let fields: [(f64, f64, &str); 6] = [
+                (new.current_smoothed, old.1, "current_smoothed"),
+                (new.current_real, old.2, "current_real"),
+                (new.basin_smoothed_from_smoothed, old.3, "basin_smoothed_from_smoothed"),
+                (new.basin_real_from_smoothed, old.4, "basin_real_from_smoothed"),
+                (new.basin_smoothed_from_real, old.5, "basin_smoothed_from_real"),
+                (new.basin_real_from_real, old.6, "basin_real_from_real"),
+            ];
+            assert_eq!(new.step, old.0, "EO step mismatch at record {}", i);
+            for &(n, o, name) in &fields {
+                let diff = (n - o).abs();
+                let tol = 1e-12 * (1.0 + n.abs().max(o.abs()));
+                if diff > tol {
+                    mismatched_records.push(format!(
+                        "tau={}, seed={}, rec={}, field={}, new={}, old={}, diff={}",
+                        entry.tau, entry.seed, i, name, n, o, diff
+                    ));
+                }
+            }
+        }
+        total += 1;
+    }
+
+    assert!(
+        mismatched_records.is_empty(),
+        "EO f64 record mismatches ({} entries):\n{}",
+        mismatched_records.len(),
+        mismatched_records.join("\n")
+    );
+
+    assert_eq!(total, 40, "expected 2 taus × 20 seeds = 40 EO entries");
 }

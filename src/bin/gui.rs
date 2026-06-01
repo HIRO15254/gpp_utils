@@ -20,7 +20,9 @@ use gpp_utils::file_utils::save_json;
 use gpp_utils::graph_spec::{
     EXPECTED_DEGREES, GraphKind, GraphLibrary, GraphSpec, NODE_COUNTS, StoredGraph,
 };
-use gpp_utils::run_config::{ConfigSweep, RunConfig, SmoothingKind, SmoothingSpec};
+use gpp_utils::run_config::{
+    ConfigSweep, RunConfig, SmoothingKind, SmoothingSpec, SolverKind, SolverSpec, DEFAULT_TAU,
+};
 use gpp_utils::run_executor::{RunResult, ResultStore, StepRecord};
 
 const GNUPLOT_DIR: &str = "data/gnuplot";
@@ -232,12 +234,15 @@ struct App {
     next_config_id: usize,
 
     // Config sweep generator inputs (Configs タブ)
+    sweep_solver: SolverKind,
     sweep_thetas: String,
     sweep_include_greedy: bool,
     sweep_iters: String,
     sweep_kind: SmoothingKind,
     sweep_ks: String,
     sweep_weights: String,
+    /// EO sweep の τ 値リスト（カンマ区切り）。
+    sweep_taus: String,
 
     // Run params
     start_seed: u64,
@@ -291,12 +296,14 @@ impl App {
             theta: Some(0.0),
             log10_iterations: 4,
             smoothing: SmoothingSpec::None,
+            solver: SolverSpec::Sa,
         });
         configs.push(RunConfig {
             name: "T=0, 10^4 (greedy)".into(),
             theta: None,
             log10_iterations: 4,
             smoothing: SmoothingSpec::None,
+            solver: SolverSpec::Sa,
         });
         let config_selected_for_run = vec![true; configs.len()];
 
@@ -323,12 +330,14 @@ impl App {
             configs,
             config_selected_for_run,
             next_config_id: 3,
+            sweep_solver: SolverKind::Sa,
             sweep_thetas: "-1, 0, 1".into(),
             sweep_include_greedy: false,
             sweep_iters: "4".into(),
             sweep_kind: SmoothingKind::None,
             sweep_ks: "4, 8".into(),
             sweep_weights: "0.25, 0.5, 1".into(),
+            sweep_taus: "1.3, 1.4, 1.5".into(),
             start_seed: 0,
             num_seeds: 1,
             num_threads: detected_cpus,
@@ -568,45 +577,70 @@ impl App {
         }
     }
 
-    /// Configs タブの sweep 入力をパースし、温度×反復回数×平滑化の直積で
-    /// 生成した `RunConfig` 群を設定リストへ追記する。
+    /// Configs タブの sweep 入力をパースし、直積で生成した `RunConfig` 群を設定リストへ追記する。
+    ///
+    /// - SA: 温度 × 反復回数 × 平滑化。
+    /// - EO: 反復回数 × τ（theta/smoothing は無視）。
     fn generate_sweep_configs(&mut self) {
-        let mut thetas: Vec<Option<f64>> = parse_num_list::<f64>(&self.sweep_thetas)
-            .into_iter()
-            .map(Some)
-            .collect();
-        if self.sweep_include_greedy {
-            thetas.push(None);
-        }
         let log10_iterations = parse_num_list::<u32>(&self.sweep_iters);
-        let ks = parse_num_list::<usize>(&self.sweep_ks);
-        let weights = parse_num_list::<f64>(&self.sweep_weights);
-
-        if thetas.is_empty() {
-            self.status = "Sweep: specify at least one Theta (or enable greedy).".into();
-            return;
-        }
         if log10_iterations.is_empty() {
             self.status = "Sweep: specify at least one log10(iter) value.".into();
             return;
         }
-        if self.sweep_kind.uses_k() && ks.is_empty() {
-            self.status = "Sweep: specify at least one K value for this smoothing.".into();
-            return;
-        }
-        if self.sweep_kind.uses_weight() && weights.is_empty() {
-            self.status =
-                "Sweep: specify at least one weight (0..1) for weighted smoothing.".into();
-            return;
-        }
 
-        let sweep = ConfigSweep {
-            thetas,
-            log10_iterations,
-            smoothing_kind: self.sweep_kind,
-            ks,
-            weights,
+        let sweep = match self.sweep_solver {
+            SolverKind::Sa => {
+                let mut thetas: Vec<Option<f64>> = parse_num_list::<f64>(&self.sweep_thetas)
+                    .into_iter()
+                    .map(Some)
+                    .collect();
+                if self.sweep_include_greedy {
+                    thetas.push(None);
+                }
+                let ks = parse_num_list::<usize>(&self.sweep_ks);
+                let weights = parse_num_list::<f64>(&self.sweep_weights);
+
+                if thetas.is_empty() {
+                    self.status = "Sweep: specify at least one Theta (or enable greedy).".into();
+                    return;
+                }
+                if self.sweep_kind.uses_k() && ks.is_empty() {
+                    self.status = "Sweep: specify at least one K value for this smoothing.".into();
+                    return;
+                }
+                if self.sweep_kind.uses_weight() && weights.is_empty() {
+                    self.status =
+                        "Sweep: specify at least one weight (0..1) for weighted smoothing.".into();
+                    return;
+                }
+                ConfigSweep {
+                    thetas,
+                    log10_iterations,
+                    smoothing_kind: self.sweep_kind,
+                    ks,
+                    weights,
+                    solver_kind: SolverKind::Sa,
+                    taus: vec![],
+                }
+            }
+            SolverKind::Eo => {
+                let taus = parse_num_list::<f64>(&self.sweep_taus);
+                if taus.is_empty() {
+                    self.status = "Sweep: specify at least one tau value for EO.".into();
+                    return;
+                }
+                ConfigSweep {
+                    thetas: vec![],
+                    log10_iterations,
+                    smoothing_kind: SmoothingKind::None,
+                    ks: vec![],
+                    weights: vec![],
+                    solver_kind: SolverKind::Eo,
+                    taus,
+                }
+            }
         };
+
         let generated = sweep.expand();
         let n = generated.len();
         self.configs.extend(generated);
@@ -1089,6 +1123,7 @@ impl App {
                         theta: Some(0.0),
                         log10_iterations: 4,
                         smoothing: SmoothingSpec::None,
+                        solver: SolverSpec::Sa,
                     });
                     self.ensure_config_selection_len();
                 }
@@ -1103,7 +1138,7 @@ impl App {
         );
         ui.add_space(4.0);
 
-        egui::CollapsingHeader::new("Generate from sweep (Theta x iterations x smoothing)")
+        egui::CollapsingHeader::new("Generate from sweep (SA: Theta x iter x smoothing / EO: iter x tau)")
             .default_open(false)
             .show(ui, |ui| {
                 ui.label(
@@ -1113,23 +1148,25 @@ impl App {
                     .small()
                     .weak(),
                 );
+                let sweep_is_eo = matches!(self.sweep_solver, SolverKind::Eo);
                 egui::Grid::new("sweep_grid")
                     .num_columns(2)
                     .spacing([8.0, 6.0])
                     .show(ui, |ui| {
-                        ui.label("Theta values:");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.sweep_thetas)
-                                .desired_width(240.0)
-                                .hint_text("e.g. -1, 0, 1"),
-                        );
-                        ui.end_row();
-
-                        ui.label("");
-                        ui.checkbox(
-                            &mut self.sweep_include_greedy,
-                            "also include T = 0 (greedy)",
-                        );
+                        ui.label("Solver:");
+                        egui::ComboBox::from_id_salt("sweep_solver")
+                            .selected_text(match self.sweep_solver {
+                                SolverKind::Sa => "SA",
+                                SolverKind::Eo => "EO (tau)",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.sweep_solver, SolverKind::Sa, "SA");
+                                ui.selectable_value(
+                                    &mut self.sweep_solver,
+                                    SolverKind::Eo,
+                                    "EO (tau)",
+                                );
+                            });
                         ui.end_row();
 
                         ui.label("log10(iter) values:");
@@ -1140,55 +1177,81 @@ impl App {
                         );
                         ui.end_row();
 
-                        ui.label("Smoothing kind:");
-                        egui::ComboBox::from_id_salt("sweep_kind")
-                            .selected_text(self.sweep_kind.label())
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    &mut self.sweep_kind,
-                                    SmoothingKind::None,
-                                    "none",
-                                );
-                                ui.selectable_value(
-                                    &mut self.sweep_kind,
-                                    SmoothingKind::KAverage,
-                                    "kavg (det)",
-                                );
-                                ui.selectable_value(
-                                    &mut self.sweep_kind,
-                                    SmoothingKind::RandomKAverage,
-                                    "rkavg (rand)",
-                                );
-                                ui.selectable_value(
-                                    &mut self.sweep_kind,
-                                    SmoothingKind::WeightedAverage,
-                                    "wavg (weighted)",
-                                );
-                            });
-                        ui.end_row();
-
-                        if self.sweep_kind.uses_weight() {
-                            ui.label("Weight values (0..1):");
+                        if sweep_is_eo {
+                            // EO: τ 軸のみ（theta/smoothing は無視）。
+                            ui.label("tau values:");
                             ui.add(
-                                egui::TextEdit::singleline(&mut self.sweep_weights)
+                                egui::TextEdit::singleline(&mut self.sweep_taus)
                                     .desired_width(240.0)
-                                    .hint_text("e.g. 0.25, 0.5, 1"),
+                                    .hint_text("e.g. 1.3, 1.4, 1.5"),
                             );
+                            ui.end_row();
                         } else {
-                            ui.label("K values:");
-                            ui.add_enabled(
-                                self.sweep_kind.uses_k(),
-                                egui::TextEdit::singleline(&mut self.sweep_ks)
+                            ui.label("Theta values:");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.sweep_thetas)
                                     .desired_width(240.0)
-                                    .hint_text("e.g. 4, 8, 16"),
+                                    .hint_text("e.g. -1, 0, 1"),
                             );
+                            ui.end_row();
+
+                            ui.label("");
+                            ui.checkbox(
+                                &mut self.sweep_include_greedy,
+                                "also include T = 0 (greedy)",
+                            );
+                            ui.end_row();
+
+                            ui.label("Smoothing kind:");
+                            egui::ComboBox::from_id_salt("sweep_kind")
+                                .selected_text(self.sweep_kind.label())
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut self.sweep_kind,
+                                        SmoothingKind::None,
+                                        "none",
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.sweep_kind,
+                                        SmoothingKind::KAverage,
+                                        "kavg (det)",
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.sweep_kind,
+                                        SmoothingKind::RandomKAverage,
+                                        "rkavg (rand)",
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.sweep_kind,
+                                        SmoothingKind::WeightedAverage,
+                                        "wavg (weighted)",
+                                    );
+                                });
+                            ui.end_row();
+
+                            if self.sweep_kind.uses_weight() {
+                                ui.label("Weight values (0..1):");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.sweep_weights)
+                                        .desired_width(240.0)
+                                        .hint_text("e.g. 0.25, 0.5, 1"),
+                                );
+                            } else {
+                                ui.label("K values:");
+                                ui.add_enabled(
+                                    self.sweep_kind.uses_k(),
+                                    egui::TextEdit::singleline(&mut self.sweep_ks)
+                                        .desired_width(240.0)
+                                        .hint_text("e.g. 4, 8, 16"),
+                                );
+                            }
+                            ui.end_row();
                         }
-                        ui.end_row();
                     });
                 if ui
                     .button(RichText::new("Generate configs").strong())
                     .on_hover_text(
-                        "Append every Theta x iteration x smoothing combination to the list below.",
+                        "Append every combination (SA: Theta x iter x smoothing, EO: iter x tau) to the list below.",
                     )
                     .clicked()
                 {
@@ -1243,26 +1306,71 @@ impl App {
                             });
                         });
 
+                        // Solver セレクタ。EO のときは τ スライダを表示し、
+                        // theta / smoothing 行は無視される旨を示す。
                         ui.horizontal(|ui| {
-                            let mut has_theta = cfg.theta.is_some();
-                            if ui
-                                .checkbox(&mut has_theta, "use Theta")
-                                .on_hover_text("If unchecked, T = 0 (no acceptance of worse moves)")
-                                .changed()
-                            {
-                                cfg.theta = if has_theta { Some(0.0) } else { None };
-                            }
-                            if let Some(t) = &mut cfg.theta {
-                                ui.add(
-                                    // step_by は付けない（sweep 生成の細かい
-                                    // theta 値が丸められて壊れるのを防ぐ）。
-                                    egui::Slider::new(t, -3.0..=3.0)
-                                        .text("Theta = log10(T)"),
-                                );
-                            } else {
-                                ui.colored_label(Color32::GRAY, "T = 0");
+                            ui.label("Solver:");
+                            let sel_text = match cfg.solver {
+                                SolverSpec::Sa => "SA".to_string(),
+                                SolverSpec::Eo { tau } => format!("EO (tau={:.2})", tau),
+                            };
+                            egui::ComboBox::from_id_salt(format!("solver_{}", idx))
+                                .selected_text(sel_text)
+                                .show_ui(ui, |ui| {
+                                    if ui
+                                        .selectable_label(
+                                            matches!(cfg.solver, SolverSpec::Sa),
+                                            "SA",
+                                        )
+                                        .clicked()
+                                    {
+                                        cfg.solver = SolverSpec::Sa;
+                                    }
+                                    if ui
+                                        .selectable_label(
+                                            matches!(cfg.solver, SolverSpec::Eo { .. }),
+                                            "EO (tau)",
+                                        )
+                                        .clicked()
+                                        && !matches!(cfg.solver, SolverSpec::Eo { .. })
+                                    {
+                                        cfg.solver = SolverSpec::Eo { tau: DEFAULT_TAU };
+                                    }
+                                });
+                            if let SolverSpec::Eo { tau } = &mut cfg.solver {
+                                ui.add(egui::Slider::new(tau, 1.0..=2.0).text("tau"));
                             }
                         });
+
+                        if matches!(cfg.solver, SolverSpec::Sa) {
+                            ui.horizontal(|ui| {
+                                let mut has_theta = cfg.theta.is_some();
+                                if ui
+                                    .checkbox(&mut has_theta, "use Theta")
+                                    .on_hover_text(
+                                        "If unchecked, T = 0 (no acceptance of worse moves)",
+                                    )
+                                    .changed()
+                                {
+                                    cfg.theta = if has_theta { Some(0.0) } else { None };
+                                }
+                                if let Some(t) = &mut cfg.theta {
+                                    ui.add(
+                                        // step_by は付けない（sweep 生成の細かい
+                                        // theta 値が丸められて壊れるのを防ぐ）。
+                                        egui::Slider::new(t, -3.0..=3.0)
+                                            .text("Theta = log10(T)"),
+                                    );
+                                } else {
+                                    ui.colored_label(Color32::GRAY, "T = 0");
+                                }
+                            });
+                        } else {
+                            ui.colored_label(
+                                Color32::GRAY,
+                                "Theta / Smoothing は EO では無視されます",
+                            );
+                        }
 
                         ui.horizontal(|ui| {
                             let mut n = cfg.log10_iterations as i32;
@@ -1275,6 +1383,7 @@ impl App {
                             ui.label(format!("= {} iterations", cfg.iterations()));
                         });
 
+                        if matches!(cfg.solver, SolverSpec::Sa) {
                         ui.horizontal(|ui| {
                             ui.label("Smoothing:");
                             let label = match cfg.smoothing {
@@ -1346,6 +1455,7 @@ impl App {
                                 }
                             }
                         });
+                        }
                     });
             }
         });

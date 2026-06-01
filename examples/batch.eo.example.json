@@ -1,0 +1,16 @@
+{
+  "graphs": [
+    { "kind": "Random", "n": 124, "d": 5.0, "seed": 0 }
+  ],
+  "configs": [
+    { "name": "eo tau=1.4, 10^5", "theta": null, "log10_iterations": 5, "smoothing": "None", "solver": { "Eo": { "tau": 1.4 } } },
+    { "name": "sa T=1, 10^5 (compare)", "theta": 0.0, "log10_iterations": 5, "smoothing": "None" }
+  ],
+  "config_sweep": {
+    "log10_iterations": [5],
+    "solver_kind": "Eo",
+    "taus": [1.2, 1.4, 1.6]
+  },
+  "seed_start": 0,
+  "seed_count": 3
+}

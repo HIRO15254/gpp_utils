@@ -29,7 +29,7 @@ use crate::file_utils::{ensure_dir_exists, load_json, save_json};
 use crate::graph_partition::{get_partition_sizes, GraphPartitionProblem, Partition};
 use crate::graph_spec::GraphSpec;
 use crate::optimization::Problem;
-use crate::run_config::{RunConfig, SmoothingSpec};
+use crate::run_config::{RunConfig, SmoothingSpec, SolverSpec};
 
 /// ベイスン山登りのタイブレーク用 RNG シードを、SA 本体のシードから派生させる際の塩。
 /// SA・スムージングの乱数列と独立にすることで `final_partition` への影響を避ける。
@@ -540,6 +540,210 @@ fn run_sa_weighted(
 }
 
 // ============================================================================
+// τ-Extremal Optimization（厳密バランスのスワップ版）
+// ============================================================================
+
+/// べき乗則 P(k) ∝ k^{-τ} の累積分布関数を構築する（1-indexed ランク）。
+///
+/// `cdf[k-1] = (Σ_{j=1}^{k} j^{-τ}) / (Σ_{j=1}^{n} j^{-τ})`。
+/// `u ~ U(0,1)` を二分探索することでランク k を引ける。
+fn build_power_law_cdf(n: usize, tau: f64) -> Vec<f64> {
+    let mut cdf = Vec::with_capacity(n);
+    let mut cumulative = 0.0;
+    for k in 1..=n {
+        cumulative += (k as f64).powf(-tau);
+        cdf.push(cumulative);
+    }
+    let z = cumulative;
+    for val in &mut cdf {
+        *val /= z;
+    }
+    cdf
+}
+
+/// 厳密にバランスした初期分割を作る（`t = n - n/2` 個を `true`、残りを `false`）。
+/// Fisher–Yates でシャッフルするため、`rng` 由来で再現可能。
+fn balanced_init(n: usize, rng: &mut Mt19937GenRand64) -> Partition {
+    let t = n - n / 2; // 偶数: N/2、奇数: ⌈N/2⌉
+    let mut p = vec![false; n];
+    for slot in p.iter_mut().take(t) {
+        *slot = true;
+    }
+    // Fisher–Yates シャッフル。
+    for i in (1..n).rev() {
+        let j = rng.gen_range(0..=i);
+        p.swap(i, j);
+    }
+    p
+}
+
+/// プレーン EO 用のスナップショット。平滑化を行わないので smoothed == real。
+/// `current_*` は現在の生スコア、`basin_*`（4 フィールド）は best-so-far の m_best を表す。
+fn make_eo_snapshot(step: usize, current_real: f64, best_so_far: f64) -> StepRecord {
+    StepRecord {
+        step,
+        current_smoothed: current_real,
+        current_real,
+        basin_smoothed_from_smoothed: best_so_far,
+        basin_real_from_smoothed: best_so_far,
+        basin_smoothed_from_real: best_so_far,
+        basin_real_from_real: best_so_far,
+    }
+}
+
+/// スペック忠実な τ-EO（厳密バランスのスワップ版）の高速パス。
+///
+/// - **適応度** λ_v = g_v / deg_v = (deg_v − cuts_at[v]) / deg_v（孤立頂点は 1.0）。
+///   λ が小さいほど「悪い」（誤った集合にいる疑いが濃い）。
+/// - **統一ランク**: 全 N 頂点を λ 昇順にランク付けし、`P(k) ∝ k^{-τ}` でランク k1 を引く。
+///   v1 の所属集合と反対側になるまで k2 を引き直し（再抽選上限超過時は反対集合から一様ランダム）、
+///   v1 と v2 を**スワップ**する（2 連続フリップ）。これにより `|A| = |B|` が全ステップで厳密維持される。
+/// - **無条件受理**: カットの増減にかかわらず常にスワップを適用する。
+/// - **S_best 別途保存**: 最良解を `best` に保持し、`final_partition` として返す。
+///
+/// バランス維持時はペナルティ項が一定（偶数 N なら 0）なので、実スコアの最小化 ≡ カットの最小化。
+fn run_eo(
+    prob: &GraphPartitionProblem,
+    cfg: &RunConfig,
+    seed: u64,
+    tau: f64,
+) -> (Partition, Vec<StepRecord>) {
+    let mut rng = Mt19937GenRand64::new(seed);
+    let n = prob.neighbour_size();
+
+    let mut current = balanced_init(n, &mut rng);
+    let mut cur_cut = prob.count_cut_edges(&current);
+    let (mut cur_t, mut cur_f) = get_partition_sizes(&current);
+    let mut cuts_at = prob.compute_cuts_at(&current);
+
+    let mut best = current.clone();
+    let mut best_score = GraphPartitionProblem::score_from_state(cur_cut, cur_t, cur_f);
+
+    // 頂点次数は不変なので 1 度だけ取得する。
+    let degrees: Vec<usize> = (0..n)
+        .map(|v| prob.graph().adjacency_list[v].len())
+        .collect();
+
+    let max_iter = cfg.iterations();
+    let snap_steps = logarithmic_steps(max_iter);
+    let mut snap_iter = snap_steps.iter().copied().peekable();
+    let mut records = Vec::with_capacity(snap_steps.len() + 1);
+
+    // 初期スナップショット (step = 0)。
+    let initial_real = GraphPartitionProblem::score_from_state(cur_cut, cur_t, cur_f);
+    records.push(make_eo_snapshot(0, initial_real, best_score));
+
+    // スワップには両集合に最低 1 頂点ずつ必要。
+    if n < 2 {
+        return (best, records);
+    }
+
+    let cdf = build_power_law_cdf(n, tau);
+    // 反対集合の頂点が当たるまでの k2 再抽選上限。超過時は反対集合から一様ランダムにフォールバック。
+    const MAX_RESELECT: usize = 50;
+
+    for it in 1..=max_iter {
+        // --- 適応度 λ を全頂点について計算（cuts_at から O(N)）---
+        // PHASE 2: 毎ステップの全ソートは O(N log N)。順序統計木/ヒープで λ を保持し、
+        // スワップで変化する v1,v2 とその隣接頂点の λ のみ局所更新すれば O(deg log N) にできる。
+        let lambdas: Vec<f64> = (0..n)
+            .map(|v| {
+                let deg = degrees[v];
+                if deg == 0 {
+                    1.0
+                } else {
+                    (deg as f64 - cuts_at[v] as f64) / deg as f64
+                }
+            })
+            .collect();
+
+        // λ 昇順ランク（order[0] = 最悪 = ランク 1）。
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| lambdas[a].partial_cmp(&lambdas[b]).unwrap());
+
+        // --- 統一ランクから v1 を引く ---
+        let k1 = draw_rank(&cdf, &mut rng, n);
+        let v1 = order[k1];
+        let set1 = current[v1];
+
+        // --- 反対集合から v2 を引く（再抽選上限 → 一様ランダムフォールバック）---
+        let mut v2 = None;
+        for _ in 0..MAX_RESELECT {
+            let k2 = draw_rank(&cdf, &mut rng, n);
+            let cand = order[k2];
+            if current[cand] != set1 {
+                v2 = Some(cand);
+                break;
+            }
+        }
+        let v2 = v2.unwrap_or_else(|| {
+            // フォールバック: 反対集合から一様ランダム（両集合とも非空なので必ず終了）。
+            loop {
+                let cand = rng.gen_range(0..n);
+                if current[cand] != set1 {
+                    break cand;
+                }
+            }
+        });
+
+        // --- 無条件スワップ（2 連続フリップ）---
+        // v1 をフリップ → 更新後の cuts_at で v2 をフリップ。隣接していても正しく処理される。
+        let (c1, t1, f1, _) =
+            prob.delta_apply_cached(&current, &cuts_at, v1, cur_cut, cur_t, cur_f);
+        prob.flip_vertex(&mut current, &mut cuts_at, v1);
+        let (c2, t2, f2, _) = prob.delta_apply_cached(&current, &cuts_at, v2, c1, t1, f1);
+        prob.flip_vertex(&mut current, &mut cuts_at, v2);
+        cur_cut = c2;
+        cur_t = t2; // スワップ後は元の値に戻る（バランス維持）。
+        cur_f = f2;
+
+        let real_score = GraphPartitionProblem::score_from_state(cur_cut, cur_t, cur_f);
+        if real_score < best_score {
+            best_score = real_score;
+            best = current.clone();
+        }
+
+        // デバッグビルドでの不変条件アサーション（バランス・カット・cuts_at の drift 検出）。
+        #[cfg(debug_assertions)]
+        if it % 1000 == 0 {
+            debug_assert_eq!(cur_t, n - n / 2, "balance drift at it={}", it);
+            debug_assert_eq!(
+                cur_cut,
+                prob.count_cut_edges(&current),
+                "cut drift at it={}",
+                it
+            );
+            let (rt, rf) = get_partition_sizes(&current);
+            debug_assert_eq!((cur_t, cur_f), (rt, rf), "size drift at it={}", it);
+            debug_assert_eq!(
+                cuts_at,
+                prob.compute_cuts_at(&current),
+                "cuts_at drift at it={}",
+                it
+            );
+        }
+
+        if let Some(&want) = snap_iter.peek() {
+            if it == want {
+                records.push(make_eo_snapshot(it, real_score, best_score));
+                snap_iter.next();
+            }
+        }
+    }
+
+    (best, records)
+}
+
+/// べき乗則 CDF から `u ~ U(0,1)` を二分探索してランク（0-indexed）を引く。
+fn draw_rank(cdf: &[f64], rng: &mut Mt19937GenRand64, n: usize) -> usize {
+    let u: f64 = rng.r#gen::<f64>();
+    match cdf.binary_search_by(|probe| probe.partial_cmp(&u).unwrap()) {
+        Ok(pos) => pos,
+        Err(pos) => pos.min(n - 1),
+    }
+}
+
+// ============================================================================
 // 公開 API
 // ============================================================================
 
@@ -552,11 +756,14 @@ pub fn execute(
 ) -> RunResult {
     let t0 = std::time::Instant::now();
     let sm_seed = seed.wrapping_add(0xDEAD_BEEF);
-    let (final_p, records) = match cfg.smoothing {
-        SmoothingSpec::None => run_sa_none(prob, cfg, seed),
-        SmoothingSpec::KAverage(k) => run_sa_kavg(prob, k, cfg, seed),
-        SmoothingSpec::RandomKAverage(k) => run_sa_random_k(prob, k, sm_seed, cfg, seed),
-        SmoothingSpec::WeightedAverage(w) => run_sa_weighted(prob, w, cfg, seed),
+    let (final_p, records) = match cfg.solver {
+        SolverSpec::Eo { tau } => run_eo(prob, cfg, seed, tau),
+        SolverSpec::Sa => match cfg.smoothing {
+            SmoothingSpec::None => run_sa_none(prob, cfg, seed),
+            SmoothingSpec::KAverage(k) => run_sa_kavg(prob, k, cfg, seed),
+            SmoothingSpec::RandomKAverage(k) => run_sa_random_k(prob, k, sm_seed, cfg, seed),
+            SmoothingSpec::WeightedAverage(w) => run_sa_weighted(prob, w, cfg, seed),
+        },
     };
     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
     RunResult {
@@ -685,5 +892,147 @@ mod tests {
         let r = execute(spec, &cfg, &prob, 42);
         assert!(!r.records.is_empty());
         assert_eq!(r.records[0].step, 0);
+    }
+
+    // ------------------------------------------------------------------
+    // τ-EO テスト
+    // ------------------------------------------------------------------
+
+    fn eo_cfg(log10_iterations: u32, tau: f64) -> RunConfig {
+        let mut cfg = RunConfig::new("eo");
+        cfg.theta = None;
+        cfg.smoothing = SmoothingSpec::None;
+        cfg.log10_iterations = log10_iterations;
+        cfg.solver = SolverSpec::Eo { tau };
+        cfg
+    }
+
+    /// 偶数 N: 全ステップでバランス維持 ＋ 決定論 ＋ best ≤ 初期。
+    /// log10_iter=4（10000 step）で debug ビルドの drift アサート（balance / cut / cuts_at）も通る。
+    #[test]
+    fn test_eo_balanced_and_deterministic() {
+        use crate::graph_spec::{GraphKind, StoredGraph};
+        let spec = GraphSpec {
+            kind: GraphKind::Random,
+            n: 30,
+            d: 4.0,
+            seed: 0,
+        };
+        let prob = StoredGraph::generate(spec).problem();
+        let cfg = eo_cfg(4, 1.4);
+
+        let (p1, r1) = run_eo(&prob, &cfg, 42, 1.4);
+        let (p2, r2) = run_eo(&prob, &cfg, 42, 1.4);
+        assert_eq!(p1, p2, "EO は同一シードで決定論的であるべき");
+        assert_eq!(r1.len(), r2.len());
+
+        // 最終解は厳密にバランスしている。
+        let (t, f) = get_partition_sizes(&p1);
+        assert_eq!((t, f), (15, 15));
+
+        // best（最終 basin）は初期カット（step0 current）以下。
+        let initial = r1[0].current_real;
+        let final_best = r1.last().unwrap().basin_real_from_real;
+        assert!(final_best <= initial + 1e-9);
+
+        // 返した best のカットは、整数状態から再構成した best_score と一致する。
+        let (bt, bf) = get_partition_sizes(&p1);
+        let best_cut = prob.count_cut_edges(&p1);
+        let best_score = GraphPartitionProblem::score_from_state(best_cut, bt, bf);
+        assert!((best_score - final_best).abs() < 1e-9);
+
+        assert_eq!(r1[0].step, 0);
+    }
+
+    /// 既知最適: パス P4 (0-1-2-3) のバランス分割の最小カットは 1（{0,1}|{2,3}）。
+    #[test]
+    fn test_eo_reaches_known_optimum_path4() {
+        let mut graph = crate::graph_partition::Graph::new(4);
+        graph.add_edge(0, 1);
+        graph.add_edge(1, 2);
+        graph.add_edge(2, 3);
+        let prob = GraphPartitionProblem::new(graph);
+        let cfg = eo_cfg(3, 1.4);
+
+        let (best, records) = run_eo(&prob, &cfg, 7, 1.4);
+        let best_cut = prob.count_cut_edges(&best);
+        assert_eq!(best_cut, 1, "P4 のバランス最小カットは 1");
+        // 記録された best-so-far も 1.0 に到達している。
+        assert!((records.last().unwrap().basin_real_from_real - 1.0).abs() < 1e-9);
+        // バランス維持。
+        assert_eq!(get_partition_sizes(&best), (2, 2));
+    }
+
+    /// τ 依存性: 大きく異なる τ では探索軌跡（records）が一致しない。
+    #[test]
+    fn test_eo_tau_effect() {
+        use crate::graph_spec::{GraphKind, StoredGraph};
+        let spec = GraphSpec {
+            kind: GraphKind::Random,
+            n: 60,
+            d: 4.0,
+            seed: 1,
+        };
+        let prob = StoredGraph::generate(spec).problem();
+
+        let (_p_lo, r_lo) = run_eo(&prob, &eo_cfg(3, 1.05), 99, 1.05);
+        let (_p_hi, r_hi) = run_eo(&prob, &eo_cfg(3, 1.9), 99, 1.9);
+
+        let traj_lo: Vec<f64> = r_lo.iter().map(|r| r.current_real).collect();
+        let traj_hi: Vec<f64> = r_hi.iter().map(|r| r.current_real).collect();
+        assert_ne!(traj_lo, traj_hi, "τ を大きく変えれば軌跡は変わるはず");
+    }
+
+    /// 奇数 N で panic せず、サイズが ⌈N/2⌉ / ⌊N/2⌋ に固定される。
+    #[test]
+    fn test_eo_odd_n_no_panic() {
+        use crate::graph_spec::{GraphKind, StoredGraph};
+        let spec = GraphSpec {
+            kind: GraphKind::Random,
+            n: 31,
+            d: 4.0,
+            seed: 2,
+        };
+        let prob = StoredGraph::generate(spec).problem();
+        let cfg = eo_cfg(3, 1.4);
+        let (best, _records) = run_eo(&prob, &cfg, 5, 1.4);
+        let (t, f) = get_partition_sizes(&best);
+        assert_eq!((t, f), (16, 15));
+    }
+
+    /// 孤立頂点（deg=0）があっても 0 除算せず動く（λ=1.0 として扱う）。
+    #[test]
+    fn test_eo_isolated_vertex() {
+        // 6 頂点。頂点 5 は孤立。
+        let mut graph = crate::graph_partition::Graph::new(6);
+        graph.add_edge(0, 1);
+        graph.add_edge(1, 2);
+        graph.add_edge(2, 3);
+        graph.add_edge(3, 4);
+        let prob = GraphPartitionProblem::new(graph);
+        let cfg = eo_cfg(3, 1.4);
+        let (best, _records) = run_eo(&prob, &cfg, 3, 1.4);
+        assert_eq!(get_partition_sizes(&best), (3, 3));
+        // best のカットは妥当な範囲（≤ 初期）。
+        assert!(prob.count_cut_edges(&best) <= 4);
+    }
+
+    /// execute() 経由でも EO がディスパッチされ、結果が得られる。
+    #[test]
+    fn test_execute_dispatches_eo() {
+        use crate::graph_spec::{GraphKind, StoredGraph};
+        let spec = GraphSpec {
+            kind: GraphKind::Random,
+            n: 20,
+            d: 3.0,
+            seed: 0,
+        };
+        let prob = StoredGraph::generate(spec).problem();
+        let cfg = eo_cfg(2, 1.4);
+        let r = execute(spec, &cfg, &prob, 42);
+        assert!(!r.records.is_empty());
+        assert_eq!(r.records[0].step, 0);
+        assert_eq!(get_partition_sizes(&r.final_partition), (10, 10));
+        assert_eq!(r.config.id(), "eo_iter2_tau1p4");
     }
 }

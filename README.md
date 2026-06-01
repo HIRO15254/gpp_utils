@@ -91,8 +91,10 @@ score = カットエッジ数 + ALPHA * (|V1| - |V2|)^2
 |---|---|
 | `HillClimbingSolver` | 貪欲な局所探索。改善がなくなるまで最良近傍へ移動 |
 | `SimulatedAnnealingSolver` | 固定温度のメトロポリス法による焼きなまし |
-| `ExtremalOptimizationSolver` | τ-EO。べき乗則確率で低適応度の構成要素を変更 |
+| `ExtremalOptimizationSolver` | τ-EO（汎用版）。べき乗則確率で低適応度の構成要素を変更 |
 | `SimulatedQuantumAnnealingSolver` | 鈴木–トロッター分解による SQA（P レプリカ） |
+
+> 実験ワークフロー（GUI / CLI / batch）は汎用トレイトではなく `run_executor::execute` を使う。SA は specialized fast path、**τ-EO はグラフ二分割スペックに忠実な厳密バランスのスワップ版 `run_executor::run_eo`**（`SolverSpec::Eo { tau }` で選択）で実行される。`ExtremalOptimizationSolver` はバランス・スワップ概念を持たない汎用版で、ワークフローでは使われない。
 
 ### smoothing — スムージング戦略
 
@@ -138,21 +140,25 @@ score = カットエッジ数 + ALPHA * (|V1| - |V2|)^2
 - `GraphLibrary::load_or_generate(spec)` — 既存ファイルがあれば読み込み、無ければ生成して保存（保存先は `data/graphs/<id>.json`）
 - `GraphLibrary::list()` — ディレクトリ内のグラフを列挙
 
-### run_config — SA 実行条件
+### run_config — 実行条件
 
 ```rust
 pub struct RunConfig {
     pub name: String,
-    pub theta: Option<f64>,      // 温度を Theta = log10(T) で指定。None なら T = 0
+    pub theta: Option<f64>,      // 温度を Theta = log10(T) で指定。None なら T = 0（SA のみ）
     pub log10_iterations: u32,   // 反復回数 = 10^N
     pub smoothing: SmoothingSpec,
+    pub solver: SolverSpec,      // 既定 = Sa。Eo { tau } のとき theta/smoothing は無視
 }
 ```
 
 - `temperature()` — `theta = None` のとき `0.0`、それ以外は `10^theta`
 - `iterations()` — `10^log10_iterations`（最大 `10^9`）
-- `id()` — キャッシュキー。例: `th+0_iter4_kavg8`, `T0_iter5_none`
-- `SmoothingSpec` バリアント: `None` / `KAverage(k)` / `RandomKAverage(k)` / `WeightedAverage(k)`
+- `id()` — キャッシュキー。SA は従来形式 (`th+0_iter4_kavg8`, `T0_iter5_none`)、
+  EO は `eo_iter5_tau1p4` のように独立した名前空間
+- `SmoothingSpec` バリアント: `None` / `KAverage(k)` / `RandomKAverage(k)` / `WeightedAverage(w)`
+- `SolverSpec` バリアント: `Sa`（固定温度メトロポリス）/ `Eo { tau }`（厳密バランスの τ-EO、
+  τ 既定 1.4）。`#[serde(default)]` なので `solver` を持たない既存 JSON は `Sa` として読まれる
 
 ### run_executor — 対数刻み実行と結果ストア
 
@@ -181,7 +187,7 @@ pub struct RunConfig {
 4 つのタブで実験を回す:
 
 1. **Graphs** — `kind` / `N` / `D` / `seed` を選んで `Generate / Load`。既に `data/graphs` に同 ID のグラフがあれば再利用、無ければ生成して保存。下部のリストから 1 つ選ぶと可視化される。
-2. **Configs** — `RunConfig` のリストを編集する。`use Theta` チェックボックスで `Theta` を有効化（無効なら `T = 0` の貪欲）、`log10(iter)` スライダで反復数を設定、スムージング種別と K を選択。`Generate from sweep` を開くと、温度・反復回数・K をカンマ区切りで複数指定し、その総当たり組み合わせを設定リストへ一括追加できる。
+2. **Configs** — `RunConfig` のリストを編集する。各設定で `Solver`（`SA` / `EO`）を選ぶ。SA では `use Theta` チェックボックスで `Theta` を有効化（無効なら `T = 0` の貪欲）、`log10(iter)` スライダで反復数を設定、スムージング種別と K を選択。EO を選ぶと `tau` スライダ（1.0〜2.0、既定 1.4）が出て、theta/smoothing 行は無視される。`Generate from sweep` を開くと、Solver を選んで SA は温度・反復回数・K を、EO は反復回数・τ をカンマ区切りで複数指定し、その総当たり組み合わせを設定リストへ一括追加できる。
 3. **Run** — 選択中のグラフ・チェック済み Config・`start_seed` / `# seeds` で一括実行する。実行は裏スレッドで進み、`ResultStore` にキャッシュされた `(graph, config, seed)` 三つ組はスキップされる。プログレスバーとログで進捗を確認できる。`Export batch JSON` ボタンで、同じ選択内容を CLI 用バッチ定義 (`data/batch.json`) として書き出せる（`cli --batch data/batch.json` でそのまま再実行可能）。
 4. **Results** — 現在の選択（グラフ・Config・seed 範囲）にマッチする結果を `Load matching` で読み込み、6 トレースを log-step 軸でプロット。各トレースはチェックボックスで個別に表示切替できる。`Export TSV` で選択結果を `data/tsv/<graph_id>/<config_id>/seed_<seed>.tsv` に書き出す。
 
@@ -219,8 +225,9 @@ cargo run --release --bin cli -- --batch <定義>.json [オプション]
 `graphs × configs × seeds` の直積がジョブとして実行される。実行する設定は
 `configs`（明示列挙）と `config_sweep`（総当たり展開）の連結で、どちらか一方だけでも
 両方でもよい。サンプルは [`examples/batch.example.json`](examples/batch.example.json)
-（明示列挙）と [`examples/batch.sweep.example.json`](examples/batch.sweep.example.json)
-（sweep）を参照。
+（明示列挙）、[`examples/batch.sweep.example.json`](examples/batch.sweep.example.json)
+（sweep）、[`examples/batch.eo.example.json`](examples/batch.eo.example.json)
+（τ-EO）を参照。
 
 ```json
 {
@@ -243,12 +250,13 @@ cargo run --release --bin cli -- --batch <定義>.json [オプション]
 | `graphs[].n` | 整数 | 頂点数 |
 | `graphs[].d` | 実数 | 期待次数 |
 | `graphs[].seed` | 整数 | グラフ生成シード |
-| `configs` | 配列（任意） | 明示列挙する SA 実行条件 `RunConfig`。省略可 |
+| `configs` | 配列（任意） | 明示列挙する実行条件 `RunConfig`。省略可 |
 | `configs[].name` | 文字列 | 表示用ラベル（キャッシュキー `id()` には影響しない） |
-| `configs[].theta` | 実数 / `null` | 温度 Θ = log10(T)。`null` で T = 0（貪欲） |
+| `configs[].theta` | 実数 / `null` | 温度 Θ = log10(T)。`null` で T = 0（貪欲）。EO では無視 |
 | `configs[].log10_iterations` | 整数 | 反復回数 = 10^N |
-| `configs[].smoothing` | 下表参照 | スムージング戦略 |
-| `config_sweep` | オブジェクト（任意） | 温度×反復回数×平滑化を総当たり展開する指定（下記） |
+| `configs[].smoothing` | 下表参照 | スムージング戦略。EO では無視 |
+| `configs[].solver` | `"Sa"` / `{ "Eo": { "tau": 1.4 } }`（任意、既定 `"Sa"`） | ソルバー選択 |
+| `config_sweep` | オブジェクト（任意） | 総当たり展開する指定（下記） |
 | `seed_start` | 整数 | 実行シードの開始値 |
 | `seed_count` | 整数 | シード本数（`seed_start, seed_start+1, …` を `seed_count` 個） |
 
@@ -264,10 +272,24 @@ cargo run --release --bin cli -- --batch <定義>.json [オプション]
 `WeightedAverage` の値は重み `w` で、`w × 全近傍平均 + (1 − w) × 実スコア` のブレンド比。
 `w = 0` は平滑化なし相当、`w = 1` は全近傍平均。グラフサイズに依存しない（範囲外は 0〜1 にクランプ）。
 
+`solver` を `Eo` にすると τ-EO（厳密バランスのスワップ版、[アルゴリズム 5.3 節](docs/algorithms.md)）で
+実行する。EO では `theta` / `smoothing` は無視される。
+
+```json
+{
+  "name": "eo tau=1.4, 10^5",
+  "theta": null,
+  "log10_iterations": 5,
+  "smoothing": "None",
+  "solver": { "Eo": { "tau": 1.4 } }
+}
+```
+
 #### `config_sweep` — パラメータ総当たり
 
-`thetas × log10_iterations × (smoothing_kind × ks)` の直積を取り、自動的に
-`RunConfig` 群を生成する。多数の温度・平滑化パラメータを一括で網羅実験したいときに使う。
+SA では `thetas × log10_iterations × (smoothing_kind × ks)` の直積、EO
+（`solver_kind: "Eo"`）では `log10_iterations × taus` の直積を取り、自動的に
+`RunConfig` 群を生成する。多数のパラメータを一括で網羅実験したいときに使う。
 
 ```json
 {
@@ -287,16 +309,28 @@ cargo run --release --bin cli -- --batch <定義>.json [オプション]
 
 | フィールド | 型 | 説明 |
 |---|---|---|
-| `thetas` | 配列 | 温度 Θ の候補。`null` は T = 0（貪欲） |
+| `thetas` | 配列 | 温度 Θ の候補。`null` は T = 0（貪欲）。`solver_kind = "Eo"` では無視 |
 | `log10_iterations` | 整数配列 | 反復回数指数 N（= 10^N）の候補 |
-| `smoothing_kind` | 下表参照 | 平滑化の種別（生成される全設定で共通） |
+| `smoothing_kind` | 下表参照 | 平滑化の種別（生成される全設定で共通）。`solver_kind = "Eo"` では無視 |
 | `ks` | 整数配列 | K 近傍個数の候補。`smoothing_kind` が `"KAverage"` / `"RandomKAverage"` のとき使用 |
 | `weights` | 実数配列 | 重み（0〜1）の候補。`smoothing_kind` が `"WeightedAverage"` のとき使用 |
+| `solver_kind` | `"Sa"` / `"Eo"`（任意、既定 `"Sa"`） | ソルバー種別 |
+| `taus` | 実数配列（任意） | τ の候補。`solver_kind = "Eo"` のとき直積軸に使う（空なら既定 1.4 の 1 通り） |
 
 `smoothing_kind`（`SmoothingKind`）の表記: `"None"` / `"KAverage"` / `"RandomKAverage"` / `"WeightedAverage"`。
 `KAverage` / `RandomKAverage` は `ks` を、`WeightedAverage` は `weights` を直積軸に使う（`None` はどちらも無視）。
 
-上記の例は `4 thetas × 2 iterations × 3 Ks = 24` 設定に展開され、`1 graph × 24 configs × 3 seeds = 72` ジョブが実行される。GUI では Configs タブの「Generate from sweep」から同じ展開を行える。
+SA の例は `4 thetas × 2 iterations × 3 Ks = 24` 設定に展開され、`1 graph × 24 configs × 3 seeds = 72` ジョブが実行される。EO の sweep は次のように書く（`2 iterations × 3 taus = 6` 設定）:
+
+```json
+"config_sweep": {
+  "log10_iterations": [4, 5],
+  "solver_kind": "Eo",
+  "taus": [1.2, 1.4, 1.6]
+}
+```
+
+GUI では Configs タブの「Generate from sweep」で Solver を選ぶと同じ展開を行える。
 
 既に結果が存在する `(graph, config, seed)` 三つ組は既定でスキップされる
 （`--overwrite` で再計算）。グラフのロード／生成や保存に失敗した場合は

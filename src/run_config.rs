@@ -27,6 +27,49 @@ fn fmt_weight(w: f64) -> String {
     }
 }
 
+/// τ 値を id 文字列用に整形する（小数点 `.` は `p` に置換）。例: 1.4 → `1p4`、2.0 → `2`。
+fn fmt_tau(t: f64) -> String {
+    if t.fract().abs() < 1e-9 {
+        format!("{}", t as i64)
+    } else {
+        format!("{}", t).replace('.', "p")
+    }
+}
+
+/// τ-EO の既定の指数 τ（スペック既定値、実用範囲 1.3〜1.6）。
+pub const DEFAULT_TAU: f64 = 1.4;
+
+/// ソルバー指定。`Sa` は固定温度メトロポリス（既存）、`Eo` は τ-EO（厳密バランスのスワップ）。
+///
+/// `RunConfig` に `#[serde(default)]` で埋め込まれるため、`solver` フィールドを持たない
+/// 既存の JSON（結果・batch・回帰 baseline）は `Sa` として読み込まれる（後方互換）。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum SolverSpec {
+    /// 固定温度シミュレーテッドアニーリング（温度は `RunConfig::theta`）。
+    Sa,
+    /// τ-Extremal Optimization。`tau` はべき乗則指数（既定 [`DEFAULT_TAU`]）。
+    Eo { tau: f64 },
+}
+
+impl Default for SolverSpec {
+    fn default() -> Self {
+        SolverSpec::Sa
+    }
+}
+
+/// ソルバーの種別（パラメータを持たない）。sweep で「種別 × 複数 τ」を表すのに使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SolverKind {
+    Sa,
+    Eo,
+}
+
+impl Default for SolverKind {
+    fn default() -> Self {
+        SolverKind::Sa
+    }
+}
+
 impl SmoothingSpec {
     pub fn label(&self) -> String {
         match self {
@@ -53,6 +96,9 @@ pub struct RunConfig {
     pub log10_iterations: u32,
     /// スムージング戦略。
     pub smoothing: SmoothingSpec,
+    /// ソルバー（既定 = SA）。`Eo` のときは `theta`・`smoothing` は無視される。
+    #[serde(default)]
+    pub solver: SolverSpec,
 }
 
 impl RunConfig {
@@ -62,6 +108,7 @@ impl RunConfig {
             theta: Some(0.0),
             log10_iterations: 4,
             smoothing: SmoothingSpec::None,
+            solver: SolverSpec::Sa,
         }
     }
 
@@ -80,18 +127,28 @@ impl RunConfig {
     }
 
     /// 一意な識別子（キャッシュキー用）。
+    ///
+    /// SA の id は従来形式をバイト単位で維持する（既存キャッシュ dir・回帰 baseline 温存）。
+    /// EO は theta/smoothing を無視するため、それらを含めない独立した名前空間にする。
     pub fn id(&self) -> String {
-        let theta = match self.theta {
-            None => "T0".to_string(),
-            Some(t) => {
-                if (t.fract()).abs() < 1e-9 {
-                    format!("th{:+}", t as i64)
-                } else {
-                    format!("th{:+.2}", t).replace('.', "p")
-                }
+        match self.solver {
+            SolverSpec::Sa => {
+                let theta = match self.theta {
+                    None => "T0".to_string(),
+                    Some(t) => {
+                        if (t.fract()).abs() < 1e-9 {
+                            format!("th{:+}", t as i64)
+                        } else {
+                            format!("th{:+.2}", t).replace('.', "p")
+                        }
+                    }
+                };
+                format!("{}_iter{}_{}", theta, self.log10_iterations, self.smoothing.label())
             }
-        };
-        format!("{}_iter{}_{}", theta, self.log10_iterations, self.smoothing.label())
+            SolverSpec::Eo { tau } => {
+                format!("eo_iter{}_tau{}", self.log10_iterations, fmt_tau(tau))
+            }
+        }
     }
 }
 
@@ -102,6 +159,12 @@ pub enum SmoothingKind {
     KAverage,
     RandomKAverage,
     WeightedAverage,
+}
+
+impl Default for SmoothingKind {
+    fn default() -> Self {
+        SmoothingKind::None
+    }
 }
 
 impl SmoothingKind {
@@ -131,11 +194,13 @@ impl SmoothingKind {
 /// `ks` を無視し、平滑化なしの 1 通りとなる）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigSweep {
-    /// 温度 Θ の候補。`null` は T = 0（貪欲）。
+    /// 温度 Θ の候補。`null` は T = 0（貪欲）。EO sweep では不要（省略可）。
+    #[serde(default)]
     pub thetas: Vec<Option<f64>>,
     /// 反復回数指数 N（max_iter = 10^N）の候補。
     pub log10_iterations: Vec<u32>,
-    /// 平滑化の種別（生成される全 `RunConfig` で共通）。
+    /// 平滑化の種別（生成される全 `RunConfig` で共通）。EO sweep では不要（省略可、既定 None）。
+    #[serde(default)]
     pub smoothing_kind: SmoothingKind,
     /// 平滑化の K 値候補（`smoothing_kind` が KAverage / RandomKAverage のとき使用）。
     #[serde(default)]
@@ -143,12 +208,28 @@ pub struct ConfigSweep {
     /// 平滑化の重み候補 0〜1（`smoothing_kind` が WeightedAverage のとき使用）。
     #[serde(default)]
     pub weights: Vec<f64>,
+    /// ソルバー種別（生成される全 `RunConfig` で共通、既定 = SA）。
+    #[serde(default)]
+    pub solver_kind: SolverKind,
+    /// τ-EO の指数 τ 候補（`solver_kind` が `Eo` のとき直積軸に使う。空なら [`DEFAULT_TAU`] 1 通り）。
+    #[serde(default)]
+    pub taus: Vec<f64>,
 }
 
 impl ConfigSweep {
-    /// `thetas × log10_iterations × smoothings` の直積を取り `RunConfig` 群を生成する。
-    /// 各 `RunConfig` の `name` には一意な `id()` 文字列が入る。
+    /// `RunConfig` 群を直積展開する。各 `RunConfig` の `name` には一意な `id()` 文字列が入る。
+    ///
+    /// - `solver_kind = Sa`（既定）: 従来どおり `thetas × log10_iterations × smoothings`。
+    /// - `solver_kind = Eo`: theta/smoothing/ks/weights を無視し `log10_iterations × taus`
+    ///   （`taus` が空なら `[DEFAULT_TAU]`）を展開する。各 cfg は `theta: None, smoothing: None`。
     pub fn expand(&self) -> Vec<RunConfig> {
+        match self.solver_kind {
+            SolverKind::Sa => self.expand_sa(),
+            SolverKind::Eo => self.expand_eo(),
+        }
+    }
+
+    fn expand_sa(&self) -> Vec<RunConfig> {
         let smoothings: Vec<SmoothingSpec> = match self.smoothing_kind {
             SmoothingKind::None => vec![SmoothingSpec::None],
             SmoothingKind::KAverage => {
@@ -170,10 +251,34 @@ impl ConfigSweep {
                         theta,
                         log10_iterations,
                         smoothing,
+                        solver: SolverSpec::Sa,
                     };
                     cfg.name = cfg.id();
                     out.push(cfg);
                 }
+            }
+        }
+        out
+    }
+
+    fn expand_eo(&self) -> Vec<RunConfig> {
+        let taus: Vec<f64> = if self.taus.is_empty() {
+            vec![DEFAULT_TAU]
+        } else {
+            self.taus.clone()
+        };
+        let mut out = Vec::new();
+        for &log10_iterations in &self.log10_iterations {
+            for &tau in &taus {
+                let mut cfg = RunConfig {
+                    name: String::new(),
+                    theta: None,
+                    log10_iterations,
+                    smoothing: SmoothingSpec::None,
+                    solver: SolverSpec::Eo { tau },
+                };
+                cfg.name = cfg.id();
+                out.push(cfg);
             }
         }
         out
@@ -211,6 +316,7 @@ mod tests {
             theta: Some(0.0),
             log10_iterations: 4,
             smoothing: SmoothingSpec::KAverage(8),
+            solver: SolverSpec::Sa,
         };
         assert_eq!(c.id(), "th+0_iter4_kavg8");
         let c0 = RunConfig {
@@ -218,8 +324,46 @@ mod tests {
             theta: None,
             log10_iterations: 5,
             smoothing: SmoothingSpec::None,
+            solver: SolverSpec::Sa,
         };
         assert_eq!(c0.id(), "T0_iter5_none");
+    }
+
+    #[test]
+    fn test_id_format_eo() {
+        // EO は theta/smoothing を無視し、独立した名前空間の id を持つ。
+        let c = RunConfig {
+            name: "a".into(),
+            theta: Some(0.0),
+            log10_iterations: 4,
+            smoothing: SmoothingSpec::KAverage(8),
+            solver: SolverSpec::Eo { tau: 1.4 },
+        };
+        assert_eq!(c.id(), "eo_iter4_tau1p4");
+        let c2 = RunConfig {
+            name: "a".into(),
+            theta: None,
+            log10_iterations: 6,
+            smoothing: SmoothingSpec::None,
+            solver: SolverSpec::Eo { tau: 2.0 },
+        };
+        assert_eq!(c2.id(), "eo_iter6_tau2");
+    }
+
+    #[test]
+    fn test_solver_serde_default() {
+        // `solver` フィールドを持たない JSON は Sa として読み込まれる（後方互換）。
+        let json = r#"{"name":"x","theta":0.0,"log10_iterations":4,"smoothing":"None"}"#;
+        let cfg: RunConfig = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(cfg.solver, SolverSpec::Sa);
+        assert_eq!(cfg.id(), "th+0_iter4_none");
+
+        // EO は明示的にデシリアライズできる。
+        let json_eo =
+            r#"{"name":"x","theta":null,"log10_iterations":5,"smoothing":"None","solver":{"Eo":{"tau":1.4}}}"#;
+        let cfg_eo: RunConfig = serde_json::from_str(json_eo).expect("deserialize eo");
+        assert_eq!(cfg_eo.solver, SolverSpec::Eo { tau: 1.4 });
+        assert_eq!(cfg_eo.id(), "eo_iter5_tau1p4");
     }
 
     #[test]
@@ -230,6 +374,8 @@ mod tests {
             smoothing_kind: SmoothingKind::KAverage,
             ks: vec![4, 8],
             weights: vec![],
+            solver_kind: SolverKind::Sa,
+            taus: vec![],
         };
         // 2 thetas x 2 iters x 2 Ks = 8
         let cfgs = sweep.expand();
@@ -237,6 +383,7 @@ mod tests {
         // 生成された RunConfig の name は id() と一致する。
         for c in &cfgs {
             assert_eq!(c.name, c.id());
+            assert_eq!(c.solver, SolverSpec::Sa);
         }
 
         // None 種別は ks / weights を無視し、平滑化なしの 1 通りに展開される。
@@ -246,6 +393,8 @@ mod tests {
             smoothing_kind: SmoothingKind::None,
             ks: vec![4, 8, 16],
             weights: vec![0.5],
+            solver_kind: SolverKind::Sa,
+            taus: vec![],
         };
         let none_cfgs = none_sweep.expand();
         assert_eq!(none_cfgs.len(), 1);
@@ -258,9 +407,49 @@ mod tests {
             smoothing_kind: SmoothingKind::WeightedAverage,
             ks: vec![4, 8],
             weights: vec![0.25, 0.5, 1.0],
+            solver_kind: SolverKind::Sa,
+            taus: vec![],
         };
         let w_cfgs = w_sweep.expand();
         assert_eq!(w_cfgs.len(), 3);
         assert_eq!(w_cfgs[0].smoothing, SmoothingSpec::WeightedAverage(0.25));
+    }
+
+    #[test]
+    fn test_config_sweep_expand_eo() {
+        // EO sweep: log10_iterations × taus（theta/smoothing/ks/weights は無視）。
+        let sweep = ConfigSweep {
+            thetas: vec![Some(0.0), None],
+            log10_iterations: vec![4, 5],
+            smoothing_kind: SmoothingKind::KAverage,
+            ks: vec![4, 8],
+            weights: vec![0.5],
+            solver_kind: SolverKind::Eo,
+            taus: vec![1.2, 1.4, 1.6],
+        };
+        // 2 iters x 3 taus = 6（thetas/ks は無視される）。
+        let cfgs = sweep.expand();
+        assert_eq!(cfgs.len(), 6);
+        for c in &cfgs {
+            assert_eq!(c.name, c.id());
+            assert!(matches!(c.solver, SolverSpec::Eo { .. }));
+            assert_eq!(c.theta, None);
+            assert_eq!(c.smoothing, SmoothingSpec::None);
+        }
+        assert_eq!(cfgs[0].solver, SolverSpec::Eo { tau: 1.2 });
+
+        // taus が空なら DEFAULT_TAU の 1 通り。
+        let default_sweep = ConfigSweep {
+            thetas: vec![],
+            log10_iterations: vec![3],
+            smoothing_kind: SmoothingKind::None,
+            ks: vec![],
+            weights: vec![],
+            solver_kind: SolverKind::Eo,
+            taus: vec![],
+        };
+        let d_cfgs = default_sweep.expand();
+        assert_eq!(d_cfgs.len(), 1);
+        assert_eq!(d_cfgs[0].solver, SolverSpec::Eo { tau: DEFAULT_TAU });
     }
 }
