@@ -26,7 +26,7 @@ use rand_mt::Mt19937GenRand64;
 use serde::{Deserialize, Serialize};
 
 use crate::file_utils::{ensure_dir_exists, load_json, save_json};
-use crate::graph_partition::{get_partition_sizes, GraphPartitionProblem, Partition};
+use crate::graph_partition::{get_partition_sizes, GraphPartitionProblem, Partition, ALPHA};
 use crate::graph_spec::GraphSpec;
 use crate::optimization::Problem;
 use crate::run_config::{RunConfig, SmoothingSpec, SolverSpec};
@@ -744,6 +744,161 @@ fn draw_rank(cdf: &[f64], rng: &mut Mt19937GenRand64, n: usize) -> usize {
 }
 
 // ============================================================================
+// τ-Extremal Optimization（フリップ近傍版・SA と同一ランドスケープ）
+// ============================================================================
+
+/// flip近傍版 EO の適応度 λ_eff を計算する。
+///
+/// バランスペナルティを「悪い辺 / 良い辺」として g/deg に織り込む対称版:
+/// - `improvement = α(diff² − diff'²)`（>0: flip でペナルティ減 / <0: 増）、`q = |improvement|`
+/// - `improvement > 0`（多数派側）: `q` を全辺(deg)と悪い辺(b)に足す → `λ_eff = g/(deg+q)`（小さく＝選ばれやすく）
+/// - `improvement < 0`（少数派側）: `q` を全辺(deg)と良い辺(g)に足す → `λ_eff = (g+q)/(deg+q)`（大きく＝守られる）
+/// - `improvement = 0`: 変化なし → `λ_eff = g/deg`
+/// - `deg+q = 0`（孤立かつ q=0）: `λ_eff = 1.0`
+///
+/// `deg = 0` かつ多数派側（q>0）なら `λ_eff = 0/(0+q) = 0` となり、カット0コストの
+/// 自由な是正フリップとして最優先で選ばれる。
+fn eo_flip_lambda(deg: usize, cuts: i32, diff_after: i64, diff: i64) -> f64 {
+    let deg_f = deg as f64;
+    let g = deg_f - cuts as f64;
+    let d = diff as f64;
+    let da = diff_after as f64;
+    let improvement = ALPHA * (d * d - da * da);
+    let q = improvement.abs();
+    let deg_eff = deg_f + q;
+    if deg_eff == 0.0 {
+        1.0
+    } else if improvement > 0.0 {
+        g / deg_eff
+    } else if improvement < 0.0 {
+        (g + q) / deg_eff
+    } else {
+        g / deg_f
+    }
+}
+
+/// フリップ近傍版 τ-EO の高速パス。
+///
+/// SA（`run_sa_*`）と **同一の近傍（単一フリップ）・目的関数（cut + α·diff²）・初期化
+/// （`random_solution`）・ベイスン算出（`make_snapshot_fast` + `hill_climb_real_fast`）**を共有し、
+/// 違いは「内側の1手の選び方」だけ:
+/// 全頂点を [`eo_flip_lambda`] で計算した λ_eff の昇順にランク付けし、べき乗則 `P(k)∝k^{-τ}`
+/// で1頂点を引いて **無条件にフリップ**する（受理判定なし）。最良解 `best` を別途保存して返す。
+///
+/// バランスはペナルティ項で扱う（厳密制約ではない）ため、スワップ版 `run_eo` と異なり
+/// 解は厳密 N/2 にはならない。これにより SA と StepRecord が1対1で比較できる。
+fn run_eo_flip(
+    prob: &GraphPartitionProblem,
+    cfg: &RunConfig,
+    seed: u64,
+    tau: f64,
+) -> (Partition, Vec<StepRecord>) {
+    let mut rng = Mt19937GenRand64::new(seed);
+    // ベイスン山登りのタイブレーク専用 RNG（SA と同一の派生）。
+    let mut tie_rng = Mt19937GenRand64::new(seed ^ TIEBREAK_SALT);
+
+    let mut current: Partition = prob.random_solution(&mut rng);
+    let mut cur_cut = prob.count_cut_edges(&current);
+    let (mut cur_t, mut cur_f) = get_partition_sizes(&current);
+    let mut cuts_at = prob.compute_cuts_at(&current);
+
+    let n = prob.neighbour_size();
+    let degrees: Vec<usize> = (0..n)
+        .map(|v| prob.graph().adjacency_list[v].len())
+        .collect();
+
+    let mut best = current.clone();
+    let mut best_score = GraphPartitionProblem::score_from_state(cur_cut, cur_t, cur_f);
+
+    // プレーン EO: smoothed == real。SA の make_snapshot_fast を no_smoothing=true で使う。
+    let mut sm = |_p: &Partition, _cuts: &[i32], c: i32, t: usize, f: usize| {
+        GraphPartitionProblem::score_from_state(c, t, f)
+    };
+
+    let max_iter = cfg.iterations();
+    let snap_steps = logarithmic_steps(max_iter);
+    let mut snap_iter = snap_steps.iter().copied().peekable();
+    let mut records = Vec::with_capacity(snap_steps.len() + 1);
+
+    // 初期スナップショット (step = 0)。ベイスンは SA と同じ単一フリップ山登り。
+    let cs0 = GraphPartitionProblem::score_from_state(cur_cut, cur_t, cur_f);
+    records.push(make_snapshot_fast(
+        prob, &current, &cuts_at, cur_cut, cur_t, cur_f, cs0, 0, &mut sm, true, &mut tie_rng,
+    ));
+
+    if n == 0 {
+        return (best, records);
+    }
+
+    let cdf = build_power_law_cdf(n, tau);
+
+    for it in 1..=max_iter {
+        let diff = cur_t as i64 - cur_f as i64;
+
+        // 各頂点の適応度 λ_eff（O(N)）。
+        // PHASE 2: 毎ステップ全ソートは O(N log N)。順序統計木で λ_eff を保持し、
+        // フリップで変化する頂点と隣接頂点だけ局所更新すれば落とせる。
+        let lambdas: Vec<f64> = (0..n)
+            .map(|i| {
+                let diff_after = if current[i] { diff - 2 } else { diff + 2 };
+                eo_flip_lambda(degrees[i], cuts_at[i], diff_after, diff)
+            })
+            .collect();
+
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| lambdas[a].partial_cmp(&lambdas[b]).unwrap());
+
+        let k = draw_rank(&cdf, &mut rng, n);
+        let idx = order[k];
+
+        // 無条件フリップ（受理判定なし）。
+        let (nc, nt, nf, _) =
+            prob.delta_apply_cached(&current, &cuts_at, idx, cur_cut, cur_t, cur_f);
+        prob.flip_vertex(&mut current, &mut cuts_at, idx);
+        cur_cut = nc;
+        cur_t = nt;
+        cur_f = nf;
+
+        let real_score = GraphPartitionProblem::score_from_state(cur_cut, cur_t, cur_f);
+        if real_score < best_score {
+            best_score = real_score;
+            best = current.clone();
+        }
+
+        #[cfg(debug_assertions)]
+        if it % 1000 == 0 {
+            debug_assert_eq!(
+                cur_cut,
+                prob.count_cut_edges(&current),
+                "cut drift at it={}",
+                it
+            );
+            let (rt, rf) = get_partition_sizes(&current);
+            debug_assert_eq!((cur_t, cur_f), (rt, rf), "size drift at it={}", it);
+            debug_assert_eq!(
+                cuts_at,
+                prob.compute_cuts_at(&current),
+                "cuts_at drift at it={}",
+                it
+            );
+        }
+
+        if let Some(&want) = snap_iter.peek() {
+            if it == want {
+                let cs = GraphPartitionProblem::score_from_state(cur_cut, cur_t, cur_f);
+                records.push(make_snapshot_fast(
+                    prob, &current, &cuts_at, cur_cut, cur_t, cur_f, cs, it, &mut sm, true,
+                    &mut tie_rng,
+                ));
+                snap_iter.next();
+            }
+        }
+    }
+
+    (best, records)
+}
+
+// ============================================================================
 // 公開 API
 // ============================================================================
 
@@ -758,6 +913,7 @@ pub fn execute(
     let sm_seed = seed.wrapping_add(0xDEAD_BEEF);
     let (final_p, records) = match cfg.solver {
         SolverSpec::Eo { tau } => run_eo(prob, cfg, seed, tau),
+        SolverSpec::EoFlip { tau } => run_eo_flip(prob, cfg, seed, tau),
         SolverSpec::Sa => match cfg.smoothing {
             SmoothingSpec::None => run_sa_none(prob, cfg, seed),
             SmoothingSpec::KAverage(k) => run_sa_kavg(prob, k, cfg, seed),
@@ -1015,6 +1171,102 @@ mod tests {
         assert_eq!(get_partition_sizes(&best), (3, 3));
         // best のカットは妥当な範囲（≤ 初期）。
         assert!(prob.count_cut_edges(&best) <= 4);
+    }
+
+    // ------------------------------------------------------------------
+    // τ-EO（flip 近傍版）テスト
+    // ------------------------------------------------------------------
+
+    fn eoflip_cfg(log10_iterations: u32, tau: f64) -> RunConfig {
+        let mut cfg = RunConfig::new("eoflip");
+        cfg.theta = None;
+        cfg.smoothing = SmoothingSpec::None;
+        cfg.log10_iterations = log10_iterations;
+        cfg.solver = SolverSpec::EoFlip { tau };
+        cfg
+    }
+
+    /// eo_flip_lambda の方向性（多数派は λ_eff 低下、少数派は上昇）と balance時の挙動。
+    #[test]
+    fn test_eo_flip_lambda_direction() {
+        // diff=10（true集合が多数派）, deg=4, cuts=1 (g=3)
+        // 多数派(true): diff_after=8 → improvement>0 → g/(deg+q)
+        let maj = eo_flip_lambda(4, 1, 8, 10);
+        // 少数派(false): diff_after=12 → improvement<0 → (g+q)/(deg+q)
+        let min = eo_flip_lambda(4, 1, 12, 10);
+        assert!(maj < min, "多数派の λ_eff は少数派より小さい（選ばれやすい）: maj={maj}, min={min}");
+
+        // balance時 (diff=0): どちらも diff_after=±2 → improvement<0、同じ q=4α
+        let a = eo_flip_lambda(4, 1, 2, 0);
+        let b = eo_flip_lambda(4, 1, -2, 0);
+        assert!((a - b).abs() < 1e-12, "balance時は左右対称");
+    }
+
+    /// flip版: 決定論 ＋ スナップショット ＋ ベイスンが現在解以下（局所最適）。
+    #[test]
+    fn test_eo_flip_runs_and_basin_le_current() {
+        use crate::graph_spec::{GraphKind, StoredGraph};
+        let spec = GraphSpec { kind: GraphKind::Random, n: 40, d: 4.0, seed: 0 };
+        let prob = StoredGraph::generate(spec).problem();
+        let cfg = eoflip_cfg(4, 1.4);
+
+        let (p1, r1) = run_eo_flip(&prob, &cfg, 42, 1.4);
+        let (p2, _r2) = run_eo_flip(&prob, &cfg, 42, 1.4);
+        assert_eq!(p1, p2, "flip版も決定論的");
+        assert_eq!(r1[0].step, 0);
+        assert!(!r1.is_empty());
+
+        // SA と同じベイスン算出: 単一フリップ山登りの局所最適は現在解以下。
+        for rec in &r1 {
+            assert!(
+                rec.basin_real_from_real <= rec.current_real + 1e-9,
+                "basin は current 以下のはず: step={}, basin={}, current={}",
+                rec.step, rec.basin_real_from_real, rec.current_real
+            );
+            // プレーン EO は smoothed == real。
+            assert!((rec.current_smoothed - rec.current_real).abs() < 1e-12);
+        }
+    }
+
+    /// flip版: 退化（全頂点が片側へ collapse）しないこと。ペナルティによる復元力で
+    /// 最良解はある程度バランスしている。
+    #[test]
+    fn test_eo_flip_no_degenerate_collapse() {
+        use crate::graph_spec::{GraphKind, StoredGraph};
+        let spec = GraphSpec { kind: GraphKind::Random, n: 60, d: 4.0, seed: 3 };
+        let prob = StoredGraph::generate(spec).problem();
+        let cfg = eoflip_cfg(4, 1.4);
+        let (best, _r) = run_eo_flip(&prob, &cfg, 7, 1.4);
+        let (t, f) = get_partition_sizes(&best);
+        // 完全片側 (0/60) には陥らない。ペナルティ α=0.05 下では概ね均衡近傍。
+        let imbalance = (t as i64 - f as i64).abs();
+        assert!(imbalance <= 20, "退化的に偏りすぎ: t={t}, f={f}");
+        assert!(t > 0 && f > 0, "片側集合が空になってはいけない");
+    }
+
+    /// τ 依存性: 大きく異なる τ では軌跡が一致しない。
+    #[test]
+    fn test_eo_flip_tau_effect() {
+        use crate::graph_spec::{GraphKind, StoredGraph};
+        let spec = GraphSpec { kind: GraphKind::Random, n: 60, d: 4.0, seed: 1 };
+        let prob = StoredGraph::generate(spec).problem();
+        let (_p1, r_lo) = run_eo_flip(&prob, &eoflip_cfg(3, 1.05), 99, 1.05);
+        let (_p2, r_hi) = run_eo_flip(&prob, &eoflip_cfg(3, 1.9), 99, 1.9);
+        let lo: Vec<f64> = r_lo.iter().map(|r| r.current_real).collect();
+        let hi: Vec<f64> = r_hi.iter().map(|r| r.current_real).collect();
+        assert_ne!(lo, hi);
+    }
+
+    /// execute() 経由でも EoFlip がディスパッチされる。
+    #[test]
+    fn test_execute_dispatches_eo_flip() {
+        use crate::graph_spec::{GraphKind, StoredGraph};
+        let spec = GraphSpec { kind: GraphKind::Random, n: 20, d: 3.0, seed: 0 };
+        let prob = StoredGraph::generate(spec).problem();
+        let cfg = eoflip_cfg(2, 1.4);
+        let r = execute(spec, &cfg, &prob, 42);
+        assert!(!r.records.is_empty());
+        assert_eq!(r.config.id(), "eoflip_iter2_tau1p4");
     }
 
     /// execute() 経由でも EO がディスパッチされ、結果が得られる。

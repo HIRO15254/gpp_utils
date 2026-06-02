@@ -34,8 +34,10 @@ struct Baseline {
     log10_iterations: u32,
     theta: Option<f64>,
     entries: Vec<BaselineEntry>,
-    /// EO エントリ（加法的拡張。読み込み側は `#[serde(default)]`）。
+    /// EO（swap版）エントリ（加法的拡張。読み込み側は `#[serde(default)]`）。
     eo_entries: Vec<EoEntry>,
+    /// EO（flip版）エントリ（加法的拡張）。
+    eoflip_entries: Vec<EoEntry>,
 }
 
 fn main() {
@@ -132,12 +134,49 @@ fn main() {
         })
         .collect();
 
+    // EoFlip baseline: τ ∈ {1.2, 1.4} × 20 seed（同じ N=30 グラフ, log10_iter=3）。
+    let eoflip_entries: Vec<EoEntry> = taus
+        .par_iter()
+        .flat_map(|&tau| {
+            (0..20u64).into_par_iter().map(move |seed| {
+                let mut cfg = RunConfig::new("regression-eoflip");
+                cfg.theta = None;
+                cfg.smoothing = SmoothingSpec::None;
+                cfg.log10_iterations = 3;
+                cfg.solver = SolverSpec::EoFlip { tau };
+                let r = execute(spec, &cfg, prob, seed);
+                let records: Vec<_> = r
+                    .records
+                    .iter()
+                    .map(|sr| {
+                        (
+                            sr.step,
+                            sr.current_smoothed,
+                            sr.current_real,
+                            sr.basin_smoothed_from_smoothed,
+                            sr.basin_real_from_smoothed,
+                            sr.basin_smoothed_from_real,
+                            sr.basin_real_from_real,
+                        )
+                    })
+                    .collect();
+                EoEntry {
+                    tau,
+                    seed,
+                    final_partition: r.final_partition,
+                    records,
+                }
+            })
+        })
+        .collect();
+
     let baseline = Baseline {
         graph_spec: spec,
         log10_iterations: 3,
         theta: Some(0.0),
         entries,
         eo_entries,
+        eoflip_entries,
     };
 
     let json = serde_json::to_string_pretty(&baseline).expect("serialize");

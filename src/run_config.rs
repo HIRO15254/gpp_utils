@@ -47,8 +47,12 @@ pub const DEFAULT_TAU: f64 = 1.4;
 pub enum SolverSpec {
     /// 固定温度シミュレーテッドアニーリング（温度は `RunConfig::theta`）。
     Sa,
-    /// τ-Extremal Optimization。`tau` はべき乗則指数（既定 [`DEFAULT_TAU`]）。
+    /// τ-Extremal Optimization（厳密バランスのスワップ版）。`tau` はべき乗則指数（既定 [`DEFAULT_TAU`]）。
     Eo { tau: f64 },
+    /// τ-Extremal Optimization（フリップ近傍版）。SA と同一の近傍・目的関数・ベイスン算出を共有し、
+    /// バランスはペナルティ項で扱う。適応度は g/deg にバランスペナルティを「悪い辺/良い辺」として
+    /// 織り込んだもの。`tau` はべき乗則指数（既定 [`DEFAULT_TAU`]）。
+    EoFlip { tau: f64 },
 }
 
 impl Default for SolverSpec {
@@ -62,6 +66,7 @@ impl Default for SolverSpec {
 pub enum SolverKind {
     Sa,
     Eo,
+    EoFlip,
 }
 
 impl Default for SolverKind {
@@ -148,6 +153,9 @@ impl RunConfig {
             SolverSpec::Eo { tau } => {
                 format!("eo_iter{}_tau{}", self.log10_iterations, fmt_tau(tau))
             }
+            SolverSpec::EoFlip { tau } => {
+                format!("eoflip_iter{}_tau{}", self.log10_iterations, fmt_tau(tau))
+            }
         }
     }
 }
@@ -225,7 +233,8 @@ impl ConfigSweep {
     pub fn expand(&self) -> Vec<RunConfig> {
         match self.solver_kind {
             SolverKind::Sa => self.expand_sa(),
-            SolverKind::Eo => self.expand_eo(),
+            SolverKind::Eo => self.expand_eo(false),
+            SolverKind::EoFlip => self.expand_eo(true),
         }
     }
 
@@ -261,7 +270,7 @@ impl ConfigSweep {
         out
     }
 
-    fn expand_eo(&self) -> Vec<RunConfig> {
+    fn expand_eo(&self, flip: bool) -> Vec<RunConfig> {
         let taus: Vec<f64> = if self.taus.is_empty() {
             vec![DEFAULT_TAU]
         } else {
@@ -270,12 +279,17 @@ impl ConfigSweep {
         let mut out = Vec::new();
         for &log10_iterations in &self.log10_iterations {
             for &tau in &taus {
+                let solver = if flip {
+                    SolverSpec::EoFlip { tau }
+                } else {
+                    SolverSpec::Eo { tau }
+                };
                 let mut cfg = RunConfig {
                     name: String::new(),
                     theta: None,
                     log10_iterations,
                     smoothing: SmoothingSpec::None,
-                    solver: SolverSpec::Eo { tau },
+                    solver,
                 };
                 cfg.name = cfg.id();
                 out.push(cfg);
@@ -348,6 +362,14 @@ mod tests {
             solver: SolverSpec::Eo { tau: 2.0 },
         };
         assert_eq!(c2.id(), "eo_iter6_tau2");
+        let c3 = RunConfig {
+            name: "a".into(),
+            theta: Some(0.0),
+            log10_iterations: 5,
+            smoothing: SmoothingSpec::None,
+            solver: SolverSpec::EoFlip { tau: 1.4 },
+        };
+        assert_eq!(c3.id(), "eoflip_iter5_tau1p4");
     }
 
     #[test]
@@ -451,5 +473,27 @@ mod tests {
         let d_cfgs = default_sweep.expand();
         assert_eq!(d_cfgs.len(), 1);
         assert_eq!(d_cfgs[0].solver, SolverSpec::Eo { tau: DEFAULT_TAU });
+    }
+
+    #[test]
+    fn test_config_sweep_expand_eoflip() {
+        let sweep = ConfigSweep {
+            thetas: vec![],
+            log10_iterations: vec![4, 5],
+            smoothing_kind: SmoothingKind::None,
+            ks: vec![],
+            weights: vec![],
+            solver_kind: SolverKind::EoFlip,
+            taus: vec![1.3, 1.5],
+        };
+        // 2 iters x 2 taus = 4
+        let cfgs = sweep.expand();
+        assert_eq!(cfgs.len(), 4);
+        for c in &cfgs {
+            assert_eq!(c.name, c.id());
+            assert!(matches!(c.solver, SolverSpec::EoFlip { .. }));
+        }
+        assert_eq!(cfgs[0].solver, SolverSpec::EoFlip { tau: 1.3 });
+        assert_eq!(cfgs[0].id(), "eoflip_iter4_tau1p3");
     }
 }

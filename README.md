@@ -94,7 +94,7 @@ score = カットエッジ数 + ALPHA * (|V1| - |V2|)^2
 | `ExtremalOptimizationSolver` | τ-EO（汎用版）。べき乗則確率で低適応度の構成要素を変更 |
 | `SimulatedQuantumAnnealingSolver` | 鈴木–トロッター分解による SQA（P レプリカ） |
 
-> 実験ワークフロー（GUI / CLI / batch）は汎用トレイトではなく `run_executor::execute` を使う。SA は specialized fast path、**τ-EO はグラフ二分割スペックに忠実な厳密バランスのスワップ版 `run_executor::run_eo`**（`SolverSpec::Eo { tau }` で選択）で実行される。`ExtremalOptimizationSolver` はバランス・スワップ概念を持たない汎用版で、ワークフローでは使われない。
+> 実験ワークフロー（GUI / CLI / batch）は汎用トレイトではなく `run_executor::execute` を使う。SA は specialized fast path、**τ-EO は 2 種**：厳密バランスのスワップ版 `run_executor::run_eo`（`SolverSpec::Eo { tau }`、スペック忠実）と、SA と同一の近傍・目的関数・ベイスン算出を共有するフリップ近傍版 `run_executor::run_eo_flip`（`SolverSpec::EoFlip { tau }`、SA 比較用）。`ExtremalOptimizationSolver` はバランス・スワップ概念を持たない汎用トレイト版で、ワークフローでは使われない。
 
 ### smoothing — スムージング戦略
 
@@ -157,8 +157,9 @@ pub struct RunConfig {
 - `id()` — キャッシュキー。SA は従来形式 (`th+0_iter4_kavg8`, `T0_iter5_none`)、
   EO は `eo_iter5_tau1p4` のように独立した名前空間
 - `SmoothingSpec` バリアント: `None` / `KAverage(k)` / `RandomKAverage(k)` / `WeightedAverage(w)`
-- `SolverSpec` バリアント: `Sa`（固定温度メトロポリス）/ `Eo { tau }`（厳密バランスの τ-EO、
-  τ 既定 1.4）。`#[serde(default)]` なので `solver` を持たない既存 JSON は `Sa` として読まれる
+- `SolverSpec` バリアント: `Sa`（固定温度メトロポリス）/ `Eo { tau }`（厳密バランスのスワップ版 τ-EO）/
+  `EoFlip { tau }`（フリップ近傍版 τ-EO。SA と同一の近傍・目的関数・ベイスン算出を共有、バランスはペナルティで扱う。τ 既定 1.4）。
+  `#[serde(default)]` なので `solver` を持たない既存 JSON は `Sa` として読まれる
 
 ### run_executor — 対数刻み実行と結果ストア
 
@@ -187,7 +188,7 @@ pub struct RunConfig {
 4 つのタブで実験を回す:
 
 1. **Graphs** — `kind` / `N` / `D` / `seed` を選んで `Generate / Load`。既に `data/graphs` に同 ID のグラフがあれば再利用、無ければ生成して保存。下部のリストから 1 つ選ぶと可視化される。
-2. **Configs** — `RunConfig` のリストを編集する。各設定で `Solver`（`SA` / `EO`）を選ぶ。SA では `use Theta` チェックボックスで `Theta` を有効化（無効なら `T = 0` の貪欲）、`log10(iter)` スライダで反復数を設定、スムージング種別と K を選択。EO を選ぶと `tau` スライダ（1.0〜2.0、既定 1.4）が出て、theta/smoothing 行は無視される。`Generate from sweep` を開くと、Solver を選んで SA は温度・反復回数・K を、EO は反復回数・τ をカンマ区切りで複数指定し、その総当たり組み合わせを設定リストへ一括追加できる。
+2. **Configs** — `RunConfig` のリストを編集する。各設定で `Solver`（`SA` / `EO swap` / `EO flip`）を選ぶ。SA では `use Theta` チェックボックスで `Theta` を有効化（無効なら `T = 0` の貪欲）、`log10(iter)` スライダで反復数を設定、スムージング種別と K を選択。EO（swap/flip いずれか）を選ぶと `tau` スライダ（1.0〜2.0、既定 1.4）が出て、theta/smoothing 行は無視される。`Generate from sweep` を開くと、Solver を選んで SA は温度・反復回数・K を、EO は反復回数・τ をカンマ区切りで複数指定し、その総当たり組み合わせを設定リストへ一括追加できる。
 3. **Run** — 選択中のグラフ・チェック済み Config・`start_seed` / `# seeds` で一括実行する。実行は裏スレッドで進み、`ResultStore` にキャッシュされた `(graph, config, seed)` 三つ組はスキップされる。プログレスバーとログで進捗を確認できる。`Export batch JSON` ボタンで、同じ選択内容を CLI 用バッチ定義 (`data/batch.json`) として書き出せる（`cli --batch data/batch.json` でそのまま再実行可能）。
 4. **Results** — 現在の選択（グラフ・Config・seed 範囲）にマッチする結果を `Load matching` で読み込み、6 トレースを log-step 軸でプロット。各トレースはチェックボックスで個別に表示切替できる。`Export TSV` で選択結果を `data/tsv/<graph_id>/<config_id>/seed_<seed>.tsv` に書き出す。
 
@@ -255,7 +256,7 @@ cargo run --release --bin cli -- --batch <定義>.json [オプション]
 | `configs[].theta` | 実数 / `null` | 温度 Θ = log10(T)。`null` で T = 0（貪欲）。EO では無視 |
 | `configs[].log10_iterations` | 整数 | 反復回数 = 10^N |
 | `configs[].smoothing` | 下表参照 | スムージング戦略。EO では無視 |
-| `configs[].solver` | `"Sa"` / `{ "Eo": { "tau": 1.4 } }`（任意、既定 `"Sa"`） | ソルバー選択 |
+| `configs[].solver` | `"Sa"` / `{ "Eo": { "tau": 1.4 } }`（スワップ版）/ `{ "EoFlip": { "tau": 1.4 } }`（フリップ版）（任意、既定 `"Sa"`） | ソルバー選択 |
 | `config_sweep` | オブジェクト（任意） | 総当たり展開する指定（下記） |
 | `seed_start` | 整数 | 実行シードの開始値 |
 | `seed_count` | 整数 | シード本数（`seed_start, seed_start+1, …` を `seed_count` 個） |
@@ -272,17 +273,13 @@ cargo run --release --bin cli -- --batch <定義>.json [オプション]
 `WeightedAverage` の値は重み `w` で、`w × 全近傍平均 + (1 − w) × 実スコア` のブレンド比。
 `w = 0` は平滑化なし相当、`w = 1` は全近傍平均。グラフサイズに依存しない（範囲外は 0〜1 にクランプ）。
 
-`solver` を `Eo` にすると τ-EO（厳密バランスのスワップ版、[アルゴリズム 5.3 節](docs/algorithms.md)）で
-実行する。EO では `theta` / `smoothing` は無視される。
+`solver` を `Eo`（厳密バランスのスワップ版）または `EoFlip`（フリップ近傍版＝SA と同一の
+近傍・目的関数・ベイスンを共有）にすると τ-EO で実行する（[アルゴリズム 5.3 節](docs/algorithms.md)）。
+どちらも `theta` / `smoothing` は無視される。
 
 ```json
-{
-  "name": "eo tau=1.4, 10^5",
-  "theta": null,
-  "log10_iterations": 5,
-  "smoothing": "None",
-  "solver": { "Eo": { "tau": 1.4 } }
-}
+{ "name": "eo-swap tau=1.4", "theta": null, "log10_iterations": 5, "smoothing": "None", "solver": { "Eo":     { "tau": 1.4 } } }
+{ "name": "eo-flip tau=1.4", "theta": null, "log10_iterations": 5, "smoothing": "None", "solver": { "EoFlip": { "tau": 1.4 } } }
 ```
 
 #### `config_sweep` — パラメータ総当たり
@@ -314,7 +311,7 @@ SA では `thetas × log10_iterations × (smoothing_kind × ks)` の直積、EO
 | `smoothing_kind` | 下表参照 | 平滑化の種別（生成される全設定で共通）。`solver_kind = "Eo"` では無視 |
 | `ks` | 整数配列 | K 近傍個数の候補。`smoothing_kind` が `"KAverage"` / `"RandomKAverage"` のとき使用 |
 | `weights` | 実数配列 | 重み（0〜1）の候補。`smoothing_kind` が `"WeightedAverage"` のとき使用 |
-| `solver_kind` | `"Sa"` / `"Eo"`（任意、既定 `"Sa"`） | ソルバー種別 |
+| `solver_kind` | `"Sa"` / `"Eo"`（スワップ版）/ `"EoFlip"`（フリップ版）（任意、既定 `"Sa"`） | ソルバー種別 |
 | `taus` | 実数配列（任意） | τ の候補。`solver_kind = "Eo"` のとき直積軸に使う（空なら既定 1.4 の 1 通り） |
 
 `smoothing_kind`（`SmoothingKind`）の表記: `"None"` / `"KAverage"` / `"RandomKAverage"` / `"WeightedAverage"`。

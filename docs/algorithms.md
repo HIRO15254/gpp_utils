@@ -429,6 +429,40 @@ $O(N \log N)$/反復。フェーズ2では順序統計木/ヒープで $\lambda$
 変化する $v_1, v_2$ とその隣接頂点の $\lambda$ のみ局所更新すれば $O(\deg \log N)$/反復に
 できる（コード内に `// PHASE 2:` で置換余地を明示）。
 
+#### 5.3.1 フリップ近傍版（`run_eo_flip` / `SolverSpec::EoFlip`）
+
+スワップ版（厳密バランス）とは別に、**SA と同一の近傍・目的関数・ベイスン算出を共有する
+フリップ近傍版**を併設している。違いは「1 手の選び方」だけ:
+
+- **近傍 = 単一フリップ**、**目的関数 = SA と同じ** $\text{cut} + \alpha(|V_1|-|V_2|)^2$、
+  初期解は `random_solution`（SA と同じ）。バランスは厳密制約ではなくペナルティ項で扱う。
+- **適応度**: $g/\deg$ にバランスペナルティを「悪い辺 / 良い辺」として織り込む対称版。
+  頂点 $i$ をフリップしたときの符号付き不均衡 $\text{diff}=t-f$ の変化を $\text{diff}'$ とし、
+  $\text{improvement}_i = \alpha(\text{diff}^2 - \text{diff}'^2)$、$q=|\text{improvement}_i|$ とすると:
+
+$$
+\lambda^{\text{eff}}_i =
+\begin{cases}
+\dfrac{g_i}{\deg_i + q} & (\text{improvement}_i > 0,\ \text{多数派側 → 悪い辺と deg に } q) \\[8pt]
+\dfrac{g_i + q}{\deg_i + q} & (\text{improvement}_i < 0,\ \text{少数派側 → 良い辺と deg に } q) \\[8pt]
+\dfrac{g_i}{\deg_i} & (\text{improvement}_i = 0)
+\end{cases}
+$$
+
+  多数派頂点は $\lambda^{\text{eff}}$ が下がって選ばれやすく（不均衡を是正）、少数派頂点は
+  上がって守られる。$\lambda^{\text{eff}}\in[0,1]$ を保ち暴走しない。孤立頂点は $\deg_i=0$ で
+  多数派側なら $\lambda^{\text{eff}}=0/(0+q)=0$（カット0コストの自由な是正フリップとして最優先）、
+  $q=0$ なら $1.0$。
+- **選択・受理**: スワップ版と同じく $\lambda^{\text{eff}}$ 昇順ランクをべき乗則 $P(k)\propto k^{-\tau}$ で
+  引き、選ばれた頂点を**無条件にフリップ**。最良解 $S_{\text{best}}$ を別途保存して返す。
+- **ベイスン**: `make_snapshot_fast`（`no_smoothing=true`）＋ `hill_climb_real_fast` ＋
+  タイブレーク RNG（`seed ^ TIEBREAK_SALT`）を **SA の `None` ケースと同一に**使う。
+  よって `StepRecord` の 6 トレースは SA と1対1で比較でき、`basin_*` は（m_best ではなく）
+  **本物の単一フリップ局所最適**になる（`current_*` は揺らぐ現在解、smoothed==real）。
+
+用途: スワップ版は論文に忠実な厳密バランス比較用、フリップ版は **SA との直接比較
+（同一ベイスン枠組み）** 用。`τ` の役割は両者共通。
+
 ### 5.4 Simulated Quantum Annealing (SQA)
 
 実装: `solvers/simulated_quantum_annealing.rs`
@@ -484,6 +518,8 @@ GUI（`bin/gui.rs`）が回す実験のバックボーン。**プリセット条
   `run_sa_none` / `run_sa_kavg` / `run_sa_random_k` / `run_sa_weighted` を呼ぶ。
 - `SolverSpec::Eo { tau }`: 厳密バランスのスワップ版 τ-EO `run_eo` を呼ぶ
   （[5.3 節](#53-extremal-optimization-τ-eo)）。
+- `SolverSpec::EoFlip { tau }`: フリップ近傍版 τ-EO `run_eo_flip` を呼ぶ
+  （[5.3.1 節](#531-フリップ近傍版-run_eo_flip--solverspeceoflip)）。SA と同一のベイスン算出を共有する。
 
 ここで使う SA は [5.2 節](#52-焼きなまし法-simulated-annealing)の汎用ソルバーとは
 **別実装**で、`GraphPartitionProblem` に特化して差分評価で高速化したもの。
@@ -519,15 +555,15 @@ $10^N$ 反復でも記録数は $O(9N)$ に収まる。
 4 フィールドが同値となり、山登りは 1 回で済む。
 
 **EO のトレース解釈（プレーン EO）**: τ-EO は平滑化を行わないので smoothed = real。
-`run_eo` は 6 トレースを次のように埋める（スキーマは SA と共通）:
+両版とも `current_smoothed = current_real = その時点の現在解の生スコア`（無条件受理のため
+非単調に揺らぐ EO 本来の軌跡）、`final_partition = S_best`。`basin_*` の意味だけが異なる:
 
-- `current_smoothed` = `current_real` = **その時点の現在解の生カット**
-  （無条件受理のため非単調に揺らぐ EO 本来の軌跡）。
-- 4 つの `basin_*` = **その時点までの best-so-far の $m_{\text{best}}$**（単調減少。
-  スペックのべき則検証 $m_{\text{best}} \sim t^{-0.4}$ を既存スキーマのまま提供する）。
-
-バランス保存型のスワップ降下によるベイスンは $O(N^2)$ で高コストのため採らず、
-`basin_*` を $m_{\text{best}}$ の搬送に流用している。`final_partition` は $S_{\text{best}}$。
+- **スワップ版 `run_eo`**: 4 つの `basin_*` = **best-so-far の $m_{\text{best}}$**（単調減少）。
+  バランス保存型のスワップ降下は $O(N^2)$ で高コストのため採らず、`basin_*` を
+  $m_{\text{best}}$ の搬送に流用（べき則検証 $m_{\text{best}} \sim t^{-0.4}$ を既存スキーマで提供）。
+- **フリップ版 `run_eo_flip`**: SA と同じ `hill_climb_real_fast`（単一フリップ山登り）で
+  **本物のベイスン（局所最適）**を算出する。よって SA の `None` ケースと 6 トレースが
+  1対1で比較でき、$m_{\text{best}}$ は記録の `current_real` の累積最小から得る。
 
 ベイスン計算の山登りも [5.1 節](#51-山登り法-hill-climbing)と同様、同スコア近傍を
 一様ランダムにタイブレークする。タイブレーク用の乱数列は SA 本体（`rng`）とは

@@ -623,7 +623,7 @@ impl App {
                     taus: vec![],
                 }
             }
-            SolverKind::Eo => {
+            SolverKind::Eo | SolverKind::EoFlip => {
                 let taus = parse_num_list::<f64>(&self.sweep_taus);
                 if taus.is_empty() {
                     self.status = "Sweep: specify at least one tau value for EO.".into();
@@ -635,7 +635,7 @@ impl App {
                     smoothing_kind: SmoothingKind::None,
                     ks: vec![],
                     weights: vec![],
-                    solver_kind: SolverKind::Eo,
+                    solver_kind: self.sweep_solver,
                     taus,
                 }
             }
@@ -1148,7 +1148,7 @@ impl App {
                     .small()
                     .weak(),
                 );
-                let sweep_is_eo = matches!(self.sweep_solver, SolverKind::Eo);
+                let sweep_is_eo = !matches!(self.sweep_solver, SolverKind::Sa);
                 egui::Grid::new("sweep_grid")
                     .num_columns(2)
                     .spacing([8.0, 6.0])
@@ -1157,14 +1157,20 @@ impl App {
                         egui::ComboBox::from_id_salt("sweep_solver")
                             .selected_text(match self.sweep_solver {
                                 SolverKind::Sa => "SA",
-                                SolverKind::Eo => "EO (tau)",
+                                SolverKind::Eo => "EO swap (tau)",
+                                SolverKind::EoFlip => "EO flip (tau)",
                             })
                             .show_ui(ui, |ui| {
                                 ui.selectable_value(&mut self.sweep_solver, SolverKind::Sa, "SA");
                                 ui.selectable_value(
                                     &mut self.sweep_solver,
                                     SolverKind::Eo,
-                                    "EO (tau)",
+                                    "EO swap (tau)",
+                                );
+                                ui.selectable_value(
+                                    &mut self.sweep_solver,
+                                    SolverKind::EoFlip,
+                                    "EO flip (tau)",
                                 );
                             });
                         ui.end_row();
@@ -1312,7 +1318,8 @@ impl App {
                             ui.label("Solver:");
                             let sel_text = match cfg.solver {
                                 SolverSpec::Sa => "SA".to_string(),
-                                SolverSpec::Eo { tau } => format!("EO (tau={:.2})", tau),
+                                SolverSpec::Eo { tau } => format!("EO swap (tau={:.2})", tau),
+                                SolverSpec::EoFlip { tau } => format!("EO flip (tau={:.2})", tau),
                             };
                             egui::ComboBox::from_id_salt(format!("solver_{}", idx))
                                 .selected_text(sel_text)
@@ -1329,15 +1336,27 @@ impl App {
                                     if ui
                                         .selectable_label(
                                             matches!(cfg.solver, SolverSpec::Eo { .. }),
-                                            "EO (tau)",
+                                            "EO swap (strict balance)",
                                         )
                                         .clicked()
                                         && !matches!(cfg.solver, SolverSpec::Eo { .. })
                                     {
                                         cfg.solver = SolverSpec::Eo { tau: DEFAULT_TAU };
                                     }
+                                    if ui
+                                        .selectable_label(
+                                            matches!(cfg.solver, SolverSpec::EoFlip { .. }),
+                                            "EO flip (penalty balance, SA-comparable basin)",
+                                        )
+                                        .clicked()
+                                        && !matches!(cfg.solver, SolverSpec::EoFlip { .. })
+                                    {
+                                        cfg.solver = SolverSpec::EoFlip { tau: DEFAULT_TAU };
+                                    }
                                 });
-                            if let SolverSpec::Eo { tau } = &mut cfg.solver {
+                            if let SolverSpec::Eo { tau } | SolverSpec::EoFlip { tau } =
+                                &mut cfg.solver
+                            {
                                 ui.add(egui::Slider::new(tau, 1.0..=2.0).text("tau"));
                             }
                         });
