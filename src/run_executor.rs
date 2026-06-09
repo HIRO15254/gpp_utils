@@ -899,6 +899,118 @@ fn run_eo_flip(
 }
 
 // ============================================================================
+// SA（スワップ近傍・厳密バランス）
+// ============================================================================
+
+/// 固定温度 SA をスワップ近傍（厳密バランス）で実行する版。
+///
+/// スワップ版 EO（[`run_eo`]）と **同一の近傍（v1∈A ↔ v2∈B のスワップ）・厳密バランス
+/// `|A|=|B|=N/2`・初期化（`balanced_init`）・ベイスン記録（`basin_*` = m_best）**を共有し、
+/// 違いは「1 手の選び方」だけ: ランダムに 1 スワップを提案し、**メトロポリス基準**で受理する
+/// （温度 `θ = RunConfig::theta`）。`θ = None`（T=0）は改善スワップのみ受理する貪欲降下。
+///
+/// 厳密バランスなのでペナルティ項は一定（偶数 N なら 0）、実スコア = カット数。
+/// `final_partition` には最良解 `S_best` を返す。`smoothing` は無視する。
+fn run_sa_swap(
+    prob: &GraphPartitionProblem,
+    cfg: &RunConfig,
+    seed: u64,
+) -> (Partition, Vec<StepRecord>) {
+    let mut rng = Mt19937GenRand64::new(seed);
+    let n = prob.neighbour_size();
+
+    let mut current = balanced_init(n, &mut rng);
+    let mut cur_cut = prob.count_cut_edges(&current);
+    let (mut cur_t, mut cur_f) = get_partition_sizes(&current);
+    let mut cuts_at = prob.compute_cuts_at(&current);
+
+    let mut best = current.clone();
+    let mut best_score = GraphPartitionProblem::score_from_state(cur_cut, cur_t, cur_f);
+
+    let temperature = cfg.temperature();
+    let max_iter = cfg.iterations();
+    let snap_steps = logarithmic_steps(max_iter);
+    let mut snap_iter = snap_steps.iter().copied().peekable();
+    let mut records = Vec::with_capacity(snap_steps.len() + 1);
+
+    let initial_real = GraphPartitionProblem::score_from_state(cur_cut, cur_t, cur_f);
+    records.push(make_eo_snapshot(0, initial_real, best_score));
+
+    if n < 2 {
+        return (best, records);
+    }
+
+    for it in 1..=max_iter {
+        // ランダムスワップ: v1 を一様、v2 を反対集合から一様（バランスなので数回で当たる）。
+        let v1 = rng.gen_range(0..n);
+        let set1 = current[v1];
+        let v2 = loop {
+            let cand = rng.gen_range(0..n);
+            if current[cand] != set1 {
+                break cand;
+            }
+        };
+
+        let cur_score = GraphPartitionProblem::score_from_state(cur_cut, cur_t, cur_f);
+        // v1 をフリップ → 更新後 cuts_at で v2 のスワップ結果スコアを得る。
+        let (c1, t1, f1, _) =
+            prob.delta_apply_cached(&current, &cuts_at, v1, cur_cut, cur_t, cur_f);
+        prob.flip_vertex(&mut current, &mut cuts_at, v1);
+        let (c2, t2, f2, swap_score) =
+            prob.delta_apply_cached(&current, &cuts_at, v2, c1, t1, f1);
+
+        let delta = swap_score - cur_score;
+        let accept = if delta < 0.0 {
+            true
+        } else if temperature > 0.0 {
+            rng.r#gen::<f64>() < (-delta / temperature).exp()
+        } else {
+            false
+        };
+
+        if accept {
+            prob.flip_vertex(&mut current, &mut cuts_at, v2); // スワップ完成
+            cur_cut = c2;
+            cur_t = t2;
+            cur_f = f2;
+            if swap_score < best_score {
+                best_score = swap_score;
+                best = current.clone();
+            }
+        } else {
+            prob.flip_vertex(&mut current, &mut cuts_at, v1); // v1 を戻す（対合）
+        }
+
+        #[cfg(debug_assertions)]
+        if it % 1000 == 0 {
+            debug_assert_eq!(cur_t, n - n / 2, "balance drift at it={}", it);
+            debug_assert_eq!(
+                cur_cut,
+                prob.count_cut_edges(&current),
+                "cut drift at it={}",
+                it
+            );
+            debug_assert_eq!(
+                cuts_at,
+                prob.compute_cuts_at(&current),
+                "cuts_at drift at it={}",
+                it
+            );
+        }
+
+        if let Some(&want) = snap_iter.peek() {
+            if it == want {
+                let real = GraphPartitionProblem::score_from_state(cur_cut, cur_t, cur_f);
+                records.push(make_eo_snapshot(it, real, best_score));
+                snap_iter.next();
+            }
+        }
+    }
+
+    (best, records)
+}
+
+// ============================================================================
 // 公開 API
 // ============================================================================
 
@@ -914,6 +1026,7 @@ pub fn execute(
     let (final_p, records) = match cfg.solver {
         SolverSpec::Eo { tau } => run_eo(prob, cfg, seed, tau),
         SolverSpec::EoFlip { tau } => run_eo_flip(prob, cfg, seed, tau),
+        SolverSpec::SaSwap => run_sa_swap(prob, cfg, seed),
         SolverSpec::Sa => match cfg.smoothing {
             SmoothingSpec::None => run_sa_none(prob, cfg, seed),
             SmoothingSpec::KAverage(k) => run_sa_kavg(prob, k, cfg, seed),
@@ -1267,6 +1380,64 @@ mod tests {
         let r = execute(spec, &cfg, &prob, 42);
         assert!(!r.records.is_empty());
         assert_eq!(r.config.id(), "eoflip_iter2_tau1p4");
+    }
+
+    // ------------------------------------------------------------------
+    // SA（スワップ近傍・厳密バランス）テスト
+    // ------------------------------------------------------------------
+
+    fn saswap_cfg(log10_iterations: u32, theta: Option<f64>) -> RunConfig {
+        let mut cfg = RunConfig::new("saswap");
+        cfg.theta = theta;
+        cfg.smoothing = SmoothingSpec::None;
+        cfg.log10_iterations = log10_iterations;
+        cfg.solver = SolverSpec::SaSwap;
+        cfg
+    }
+
+    /// 厳密バランス維持 ＋ 決定論 ＋ best ≤ 初期（偶数 N）。
+    /// log10_iter=4 で debug ビルドの drift アサート（balance/cut/cuts_at）も通る。
+    #[test]
+    fn test_sa_swap_balanced_and_deterministic() {
+        use crate::graph_spec::{GraphKind, StoredGraph};
+        let spec = GraphSpec { kind: GraphKind::Random, n: 30, d: 4.0, seed: 0 };
+        let prob = StoredGraph::generate(spec).problem();
+        let cfg = saswap_cfg(4, Some(0.0));
+
+        let (p1, r1) = run_sa_swap(&prob, &cfg, 42);
+        let (p2, _r2) = run_sa_swap(&prob, &cfg, 42);
+        assert_eq!(p1, p2, "SaSwap は同一シードで決定論的");
+        assert_eq!(get_partition_sizes(&p1), (15, 15), "厳密バランス維持");
+        let initial = r1[0].current_real;
+        let final_best = r1.last().unwrap().basin_real_from_real;
+        assert!(final_best <= initial + 1e-9);
+    }
+
+    /// 貪欲（T=0）は現在解が単調非増加（reject は据え置き、accept は改善のみ）。
+    #[test]
+    fn test_sa_swap_greedy_monotone() {
+        use crate::graph_spec::{GraphKind, StoredGraph};
+        let spec = GraphSpec { kind: GraphKind::Random, n: 40, d: 4.0, seed: 1 };
+        let prob = StoredGraph::generate(spec).problem();
+        let cfg = saswap_cfg(4, None); // T = 0 → 貪欲スワップ降下
+        let (_best, records) = run_sa_swap(&prob, &cfg, 9);
+        let cur: Vec<f64> = records.iter().map(|r| r.current_real).collect();
+        for w in cur.windows(2) {
+            assert!(w[1] <= w[0] + 1e-9, "T=0 では current は単調非増加: {:?}", w);
+        }
+    }
+
+    /// execute() 経由でも SaSwap がディスパッチされ、厳密バランスが保たれる。
+    #[test]
+    fn test_execute_dispatches_sa_swap() {
+        use crate::graph_spec::{GraphKind, StoredGraph};
+        let spec = GraphSpec { kind: GraphKind::Random, n: 20, d: 3.0, seed: 0 };
+        let prob = StoredGraph::generate(spec).problem();
+        let cfg = saswap_cfg(2, Some(0.0));
+        let r = execute(spec, &cfg, &prob, 42);
+        assert!(!r.records.is_empty());
+        assert_eq!(get_partition_sizes(&r.final_partition), (10, 10));
+        assert_eq!(r.config.id(), "saswap_th+0_iter2");
     }
 
     /// execute() 経由でも EO がディスパッチされ、結果が得られる。

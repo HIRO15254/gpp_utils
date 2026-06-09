@@ -45,8 +45,12 @@ pub const DEFAULT_TAU: f64 = 1.4;
 /// 既存の JSON（結果・batch・回帰 baseline）は `Sa` として読み込まれる（後方互換）。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum SolverSpec {
-    /// 固定温度シミュレーテッドアニーリング（温度は `RunConfig::theta`）。
+    /// 固定温度シミュレーテッドアニーリング（フリップ近傍、温度は `RunConfig::theta`）。
     Sa,
+    /// 固定温度 SA をスワップ近傍（厳密バランス）で実行する版。温度は `RunConfig::theta`。
+    /// Eo（スワップ版）と同一の近傍・厳密バランス・ベイスン(=m_best)を共有し、
+    /// 受理がメトロポリス（無条件ではない）である点だけが異なる。`smoothing` は無視。
+    SaSwap,
     /// τ-Extremal Optimization（厳密バランスのスワップ版）。`tau` はべき乗則指数（既定 [`DEFAULT_TAU`]）。
     Eo { tau: f64 },
     /// τ-Extremal Optimization（フリップ近傍版）。SA と同一の近傍・目的関数・ベイスン算出を共有し、
@@ -65,6 +69,7 @@ impl Default for SolverSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SolverKind {
     Sa,
+    SaSwap,
     Eo,
     EoFlip,
 }
@@ -138,23 +143,35 @@ impl RunConfig {
     pub fn id(&self) -> String {
         match self.solver {
             SolverSpec::Sa => {
-                let theta = match self.theta {
-                    None => "T0".to_string(),
-                    Some(t) => {
-                        if (t.fract()).abs() < 1e-9 {
-                            format!("th{:+}", t as i64)
-                        } else {
-                            format!("th{:+.2}", t).replace('.', "p")
-                        }
-                    }
-                };
-                format!("{}_iter{}_{}", theta, self.log10_iterations, self.smoothing.label())
+                format!(
+                    "{}_iter{}_{}",
+                    fmt_theta(self.theta),
+                    self.log10_iterations,
+                    self.smoothing.label()
+                )
+            }
+            SolverSpec::SaSwap => {
+                format!("saswap_{}_iter{}", fmt_theta(self.theta), self.log10_iterations)
             }
             SolverSpec::Eo { tau } => {
                 format!("eo_iter{}_tau{}", self.log10_iterations, fmt_tau(tau))
             }
             SolverSpec::EoFlip { tau } => {
                 format!("eoflip_iter{}_tau{}", self.log10_iterations, fmt_tau(tau))
+            }
+        }
+    }
+}
+
+/// 温度 Θ を id 文字列用に整形する。`None`→`T0`、整数→`th{+/-N}`、小数→`th{+/-N.NN}`（`.`→`p`）。
+fn fmt_theta(theta: Option<f64>) -> String {
+    match theta {
+        None => "T0".to_string(),
+        Some(t) => {
+            if (t.fract()).abs() < 1e-9 {
+                format!("th{:+}", t as i64)
+            } else {
+                format!("th{:+.2}", t).replace('.', "p")
             }
         }
     }
@@ -233,9 +250,29 @@ impl ConfigSweep {
     pub fn expand(&self) -> Vec<RunConfig> {
         match self.solver_kind {
             SolverKind::Sa => self.expand_sa(),
+            SolverKind::SaSwap => self.expand_sa_swap(),
             SolverKind::Eo => self.expand_eo(false),
             SolverKind::EoFlip => self.expand_eo(true),
         }
+    }
+
+    /// SaSwap: `thetas × log10_iterations`（smoothing なし）を展開する。
+    fn expand_sa_swap(&self) -> Vec<RunConfig> {
+        let mut out = Vec::new();
+        for &theta in &self.thetas {
+            for &log10_iterations in &self.log10_iterations {
+                let mut cfg = RunConfig {
+                    name: String::new(),
+                    theta,
+                    log10_iterations,
+                    smoothing: SmoothingSpec::None,
+                    solver: SolverSpec::SaSwap,
+                };
+                cfg.name = cfg.id();
+                out.push(cfg);
+            }
+        }
+        out
     }
 
     fn expand_sa(&self) -> Vec<RunConfig> {
@@ -370,6 +407,23 @@ mod tests {
             solver: SolverSpec::EoFlip { tau: 1.4 },
         };
         assert_eq!(c3.id(), "eoflip_iter5_tau1p4");
+        // SaSwap は theta を使い smoothing を含めない。
+        let c4 = RunConfig {
+            name: "a".into(),
+            theta: Some(0.0),
+            log10_iterations: 4,
+            smoothing: SmoothingSpec::KAverage(8),
+            solver: SolverSpec::SaSwap,
+        };
+        assert_eq!(c4.id(), "saswap_th+0_iter4");
+        let c5 = RunConfig {
+            name: "a".into(),
+            theta: None,
+            log10_iterations: 5,
+            smoothing: SmoothingSpec::None,
+            solver: SolverSpec::SaSwap,
+        };
+        assert_eq!(c5.id(), "saswap_T0_iter5");
     }
 
     #[test]
@@ -495,5 +549,27 @@ mod tests {
         }
         assert_eq!(cfgs[0].solver, SolverSpec::EoFlip { tau: 1.3 });
         assert_eq!(cfgs[0].id(), "eoflip_iter4_tau1p3");
+    }
+
+    #[test]
+    fn test_config_sweep_expand_sa_swap() {
+        let sweep = ConfigSweep {
+            thetas: vec![Some(-1.0), Some(0.0), None],
+            log10_iterations: vec![4, 5],
+            smoothing_kind: SmoothingKind::KAverage,
+            ks: vec![4, 8],
+            weights: vec![],
+            solver_kind: SolverKind::SaSwap,
+            taus: vec![],
+        };
+        // 3 thetas x 2 iters = 6（smoothing/ks は無視）。
+        let cfgs = sweep.expand();
+        assert_eq!(cfgs.len(), 6);
+        for c in &cfgs {
+            assert_eq!(c.name, c.id());
+            assert_eq!(c.solver, SolverSpec::SaSwap);
+            assert_eq!(c.smoothing, SmoothingSpec::None);
+        }
+        assert_eq!(cfgs[0].id(), "saswap_th-1_iter4");
     }
 }

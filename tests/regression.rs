@@ -32,6 +32,15 @@ struct EoEntry {
     records: Vec<(usize, f64, f64, f64, f64, f64, f64)>,
 }
 
+/// SaSwap の baseline エントリ。
+#[derive(Deserialize)]
+struct SaSwapEntry {
+    theta: Option<f64>,
+    seed: u64,
+    final_partition: Vec<bool>,
+    records: Vec<(usize, f64, f64, f64, f64, f64, f64)>,
+}
+
 #[derive(Deserialize)]
 struct Baseline {
     graph_spec: GraphSpec,
@@ -44,6 +53,9 @@ struct Baseline {
     /// EO（flip版）エントリ（加法的拡張）。
     #[serde(default)]
     eoflip_entries: Vec<EoEntry>,
+    /// SA（swap版）エントリ（加法的拡張）。
+    #[serde(default)]
+    saswap_entries: Vec<SaSwapEntry>,
 }
 
 fn load_baseline() -> Baseline {
@@ -262,4 +274,70 @@ fn regression_eoflip_final_partition_bitwise_match() {
     );
 
     assert_eq!(total, 40, "expected 2 taus × 20 seeds = 40 EoFlip entries");
+}
+
+#[test]
+fn regression_saswap_final_partition_bitwise_match() {
+    let baseline = load_baseline();
+    if baseline.saswap_entries.is_empty() {
+        return;
+    }
+    let stored = StoredGraph::generate(baseline.graph_spec);
+    let prob = stored.problem();
+
+    let mut total = 0;
+    let mut mismatched_records = Vec::new();
+
+    for entry in &baseline.saswap_entries {
+        let mut cfg = RunConfig::new("regression-saswap");
+        cfg.theta = entry.theta;
+        cfg.smoothing = SmoothingSpec::None;
+        cfg.log10_iterations = baseline.log10_iterations;
+        cfg.solver = SolverSpec::SaSwap;
+
+        let result = execute(baseline.graph_spec, &cfg, &prob, entry.seed);
+
+        assert_eq!(
+            result.final_partition, entry.final_partition,
+            "SaSwap final_partition mismatch: theta={:?}, seed={}",
+            entry.theta, entry.seed
+        );
+        assert_eq!(
+            result.records.len(),
+            entry.records.len(),
+            "SaSwap records length mismatch: theta={:?}, seed={}",
+            entry.theta, entry.seed
+        );
+        for (i, (new, old)) in result.records.iter().zip(entry.records.iter()).enumerate() {
+            let fields: [(f64, f64, &str); 6] = [
+                (new.current_smoothed, old.1, "current_smoothed"),
+                (new.current_real, old.2, "current_real"),
+                (new.basin_smoothed_from_smoothed, old.3, "basin_smoothed_from_smoothed"),
+                (new.basin_real_from_smoothed, old.4, "basin_real_from_smoothed"),
+                (new.basin_smoothed_from_real, old.5, "basin_smoothed_from_real"),
+                (new.basin_real_from_real, old.6, "basin_real_from_real"),
+            ];
+            assert_eq!(new.step, old.0, "SaSwap step mismatch at record {}", i);
+            for &(n, o, name) in &fields {
+                let diff = (n - o).abs();
+                let tol = 1e-12 * (1.0 + n.abs().max(o.abs()));
+                if diff > tol {
+                    mismatched_records.push(format!(
+                        "theta={:?}, seed={}, rec={}, field={}, new={}, old={}, diff={}",
+                        entry.theta, entry.seed, i, name, n, o, diff
+                    ));
+                }
+            }
+        }
+        total += 1;
+    }
+
+    assert!(
+        mismatched_records.is_empty(),
+        "SaSwap f64 record mismatches ({} entries):\n{}",
+        mismatched_records.len(),
+        mismatched_records.join("\n")
+    );
+
+    assert_eq!(total, 40, "expected 2 thetas × 20 seeds = 40 SaSwap entries");
 }

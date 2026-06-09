@@ -623,6 +623,29 @@ impl App {
                     taus: vec![],
                 }
             }
+            SolverKind::SaSwap => {
+                // スワップ近傍 SA: theta × iters（smoothing なし）。
+                let mut thetas: Vec<Option<f64>> = parse_num_list::<f64>(&self.sweep_thetas)
+                    .into_iter()
+                    .map(Some)
+                    .collect();
+                if self.sweep_include_greedy {
+                    thetas.push(None);
+                }
+                if thetas.is_empty() {
+                    self.status = "Sweep: specify at least one Theta (or enable greedy).".into();
+                    return;
+                }
+                ConfigSweep {
+                    thetas,
+                    log10_iterations,
+                    smoothing_kind: SmoothingKind::None,
+                    ks: vec![],
+                    weights: vec![],
+                    solver_kind: SolverKind::SaSwap,
+                    taus: vec![],
+                }
+            }
             SolverKind::Eo | SolverKind::EoFlip => {
                 let taus = parse_num_list::<f64>(&self.sweep_taus);
                 if taus.is_empty() {
@@ -1148,7 +1171,10 @@ impl App {
                     .small()
                     .weak(),
                 );
-                let sweep_is_eo = !matches!(self.sweep_solver, SolverKind::Sa);
+                let sweep_is_eo =
+                    matches!(self.sweep_solver, SolverKind::Eo | SolverKind::EoFlip);
+                // smoothing 軸はプレーン SA（フリップ近傍）のみ。SaSwap は theta のみ。
+                let sweep_show_smoothing = matches!(self.sweep_solver, SolverKind::Sa);
                 egui::Grid::new("sweep_grid")
                     .num_columns(2)
                     .spacing([8.0, 6.0])
@@ -1156,12 +1182,22 @@ impl App {
                         ui.label("Solver:");
                         egui::ComboBox::from_id_salt("sweep_solver")
                             .selected_text(match self.sweep_solver {
-                                SolverKind::Sa => "SA",
+                                SolverKind::Sa => "SA (flip)",
+                                SolverKind::SaSwap => "SA swap",
                                 SolverKind::Eo => "EO swap (tau)",
                                 SolverKind::EoFlip => "EO flip (tau)",
                             })
                             .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.sweep_solver, SolverKind::Sa, "SA");
+                                ui.selectable_value(
+                                    &mut self.sweep_solver,
+                                    SolverKind::Sa,
+                                    "SA (flip)",
+                                );
+                                ui.selectable_value(
+                                    &mut self.sweep_solver,
+                                    SolverKind::SaSwap,
+                                    "SA swap",
+                                );
                                 ui.selectable_value(
                                     &mut self.sweep_solver,
                                     SolverKind::Eo,
@@ -1208,50 +1244,52 @@ impl App {
                             );
                             ui.end_row();
 
-                            ui.label("Smoothing kind:");
-                            egui::ComboBox::from_id_salt("sweep_kind")
-                                .selected_text(self.sweep_kind.label())
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(
-                                        &mut self.sweep_kind,
-                                        SmoothingKind::None,
-                                        "none",
-                                    );
-                                    ui.selectable_value(
-                                        &mut self.sweep_kind,
-                                        SmoothingKind::KAverage,
-                                        "kavg (det)",
-                                    );
-                                    ui.selectable_value(
-                                        &mut self.sweep_kind,
-                                        SmoothingKind::RandomKAverage,
-                                        "rkavg (rand)",
-                                    );
-                                    ui.selectable_value(
-                                        &mut self.sweep_kind,
-                                        SmoothingKind::WeightedAverage,
-                                        "wavg (weighted)",
-                                    );
-                                });
-                            ui.end_row();
+                            if sweep_show_smoothing {
+                                ui.label("Smoothing kind:");
+                                egui::ComboBox::from_id_salt("sweep_kind")
+                                    .selected_text(self.sweep_kind.label())
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut self.sweep_kind,
+                                            SmoothingKind::None,
+                                            "none",
+                                        );
+                                        ui.selectable_value(
+                                            &mut self.sweep_kind,
+                                            SmoothingKind::KAverage,
+                                            "kavg (det)",
+                                        );
+                                        ui.selectable_value(
+                                            &mut self.sweep_kind,
+                                            SmoothingKind::RandomKAverage,
+                                            "rkavg (rand)",
+                                        );
+                                        ui.selectable_value(
+                                            &mut self.sweep_kind,
+                                            SmoothingKind::WeightedAverage,
+                                            "wavg (weighted)",
+                                        );
+                                    });
+                                ui.end_row();
 
-                            if self.sweep_kind.uses_weight() {
-                                ui.label("Weight values (0..1):");
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.sweep_weights)
-                                        .desired_width(240.0)
-                                        .hint_text("e.g. 0.25, 0.5, 1"),
-                                );
-                            } else {
-                                ui.label("K values:");
-                                ui.add_enabled(
-                                    self.sweep_kind.uses_k(),
-                                    egui::TextEdit::singleline(&mut self.sweep_ks)
-                                        .desired_width(240.0)
-                                        .hint_text("e.g. 4, 8, 16"),
-                                );
+                                if self.sweep_kind.uses_weight() {
+                                    ui.label("Weight values (0..1):");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.sweep_weights)
+                                            .desired_width(240.0)
+                                            .hint_text("e.g. 0.25, 0.5, 1"),
+                                    );
+                                } else {
+                                    ui.label("K values:");
+                                    ui.add_enabled(
+                                        self.sweep_kind.uses_k(),
+                                        egui::TextEdit::singleline(&mut self.sweep_ks)
+                                            .desired_width(240.0)
+                                            .hint_text("e.g. 4, 8, 16"),
+                                    );
+                                }
+                                ui.end_row();
                             }
-                            ui.end_row();
                         }
                     });
                 if ui
@@ -1317,7 +1355,8 @@ impl App {
                         ui.horizontal(|ui| {
                             ui.label("Solver:");
                             let sel_text = match cfg.solver {
-                                SolverSpec::Sa => "SA".to_string(),
+                                SolverSpec::Sa => "SA (flip)".to_string(),
+                                SolverSpec::SaSwap => "SA swap".to_string(),
                                 SolverSpec::Eo { tau } => format!("EO swap (tau={:.2})", tau),
                                 SolverSpec::EoFlip { tau } => format!("EO flip (tau={:.2})", tau),
                             };
@@ -1327,11 +1366,20 @@ impl App {
                                     if ui
                                         .selectable_label(
                                             matches!(cfg.solver, SolverSpec::Sa),
-                                            "SA",
+                                            "SA (flip)",
                                         )
                                         .clicked()
                                     {
                                         cfg.solver = SolverSpec::Sa;
+                                    }
+                                    if ui
+                                        .selectable_label(
+                                            matches!(cfg.solver, SolverSpec::SaSwap),
+                                            "SA swap (strict balance, Metropolis)",
+                                        )
+                                        .clicked()
+                                    {
+                                        cfg.solver = SolverSpec::SaSwap;
                                     }
                                     if ui
                                         .selectable_label(
@@ -1361,7 +1409,8 @@ impl App {
                             }
                         });
 
-                        if matches!(cfg.solver, SolverSpec::Sa) {
+                        // theta は SA / SaSwap で有効（メトロポリス温度）。EO では無視。
+                        if matches!(cfg.solver, SolverSpec::Sa | SolverSpec::SaSwap) {
                             ui.horizontal(|ui| {
                                 let mut has_theta = cfg.theta.is_some();
                                 if ui

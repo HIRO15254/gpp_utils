@@ -374,6 +374,23 @@ $$
 温度はパラメータ $\Theta = \log_{10} T$ で与える（`RunConfig::theta`）。
 $T = 10^\Theta$ なので $\Theta$ を等間隔に振ると温度が対数スケールで並ぶ。
 
+#### 5.2.1 スワップ近傍版（`run_sa_swap` / `SolverSpec::SaSwap`）
+
+フリップ近傍の SA とは別に、**スワップ近傍版 EO（[5.3 節](#53-extremal-optimization-τ-eo)）と
+同一の近傍・厳密バランス・初期化・ベイスン記録を共有する SA** を併設している。違いは
+受理規則だけ:
+
+- **近傍 = スワップ**（$v_1\in A \leftrightarrow v_2\in B$）、**厳密バランス** $|A|=|B|=N/2$、
+  初期解は `balanced_init`。ペナルティ項は一定（偶数 $N$ なら 0）なので実スコア = カット数。
+- **1 手**: ランダムに 1 スワップを提案し、**メトロポリス基準**（温度 $\Theta=\log_{10}T$）で受理。
+  $T=0$（`theta=None`）は改善スワップのみ受理する貪欲スワップ降下。
+- `basin_*` は EO スワップ版と同じく **best-so-far $m_{\text{best}}$**（スワップ保存型ベイスン降下が
+  $O(N^2)$ で高コストのため）、`final_partition = S_{\text{best}}$、smoothed == real。
+
+これにより **同一のスワップ近傍上で EO（ランク選択＋無条件受理）と SA（ランダム＋メトロポリス）を
+直接比較**できる。フリップ近傍では SA ↔ EoFlip（[5.3.1 節](#531-フリップ近傍版-run_eo_flip--solverspeceoflip)）、
+スワップ近傍では SaSwap ↔ Eo、という 2×2 の対応になる。
+
 ### 5.3 Extremal Optimization (τ-EO)
 
 実装: 実験ワークフローの忠実版は `run_executor.rs` の `run_eo`
@@ -516,6 +533,8 @@ GUI（`bin/gui.rs`）が回す実験のバックボーン。**プリセット条
 
 - `SolverSpec::Sa`（既定）: `cfg.smoothing` に応じて
   `run_sa_none` / `run_sa_kavg` / `run_sa_random_k` / `run_sa_weighted` を呼ぶ。
+- `SolverSpec::SaSwap`: スワップ近傍・厳密バランス版 SA `run_sa_swap` を呼ぶ
+  （[5.2.1 節](#521-スワップ近傍版-run_sa_swap--solverspecsaswap)）。
 - `SolverSpec::Eo { tau }`: 厳密バランスのスワップ版 τ-EO `run_eo` を呼ぶ
   （[5.3 節](#53-extremal-optimization-τ-eo)）。
 - `SolverSpec::EoFlip { tau }`: フリップ近傍版 τ-EO `run_eo_flip` を呼ぶ

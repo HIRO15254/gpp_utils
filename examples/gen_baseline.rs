@@ -28,6 +28,15 @@ struct EoEntry {
     records: Vec<(usize, f64, f64, f64, f64, f64, f64)>,
 }
 
+/// SaSwap の baseline エントリ（temperature 軸 = theta で識別）。
+#[derive(Serialize)]
+struct SaSwapEntry {
+    theta: Option<f64>,
+    seed: u64,
+    final_partition: Vec<bool>,
+    records: Vec<(usize, f64, f64, f64, f64, f64, f64)>,
+}
+
 #[derive(Serialize)]
 struct Baseline {
     graph_spec: GraphSpec,
@@ -38,6 +47,8 @@ struct Baseline {
     eo_entries: Vec<EoEntry>,
     /// EO（flip版）エントリ（加法的拡張）。
     eoflip_entries: Vec<EoEntry>,
+    /// SA（swap版）エントリ（加法的拡張）。
+    saswap_entries: Vec<SaSwapEntry>,
 }
 
 fn main() {
@@ -170,6 +181,43 @@ fn main() {
         })
         .collect();
 
+    // SaSwap baseline: theta ∈ {Some(0.0)=T1, None=greedy} × 20 seed（同じ N=30, log10_iter=3）。
+    let thetas = [Some(0.0_f64), None];
+    let saswap_entries: Vec<SaSwapEntry> = thetas
+        .par_iter()
+        .flat_map(|&theta| {
+            (0..20u64).into_par_iter().map(move |seed| {
+                let mut cfg = RunConfig::new("regression-saswap");
+                cfg.theta = theta;
+                cfg.smoothing = SmoothingSpec::None;
+                cfg.log10_iterations = 3;
+                cfg.solver = SolverSpec::SaSwap;
+                let r = execute(spec, &cfg, prob, seed);
+                let records: Vec<_> = r
+                    .records
+                    .iter()
+                    .map(|sr| {
+                        (
+                            sr.step,
+                            sr.current_smoothed,
+                            sr.current_real,
+                            sr.basin_smoothed_from_smoothed,
+                            sr.basin_real_from_smoothed,
+                            sr.basin_smoothed_from_real,
+                            sr.basin_real_from_real,
+                        )
+                    })
+                    .collect();
+                SaSwapEntry {
+                    theta,
+                    seed,
+                    final_partition: r.final_partition,
+                    records,
+                }
+            })
+        })
+        .collect();
+
     let baseline = Baseline {
         graph_spec: spec,
         log10_iterations: 3,
@@ -177,6 +225,7 @@ fn main() {
         entries,
         eo_entries,
         eoflip_entries,
+        saswap_entries,
     };
 
     let json = serde_json::to_string_pretty(&baseline).expect("serialize");

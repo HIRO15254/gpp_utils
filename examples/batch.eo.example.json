@@ -5,7 +5,8 @@
   "configs": [
     { "name": "eo-swap tau=1.4, 10^5", "theta": null, "log10_iterations": 5, "smoothing": "None", "solver": { "Eo": { "tau": 1.4 } } },
     { "name": "eo-flip tau=1.4, 10^5", "theta": null, "log10_iterations": 5, "smoothing": "None", "solver": { "EoFlip": { "tau": 1.4 } } },
-    { "name": "sa T=1, 10^5 (compare)", "theta": 0.0, "log10_iterations": 5, "smoothing": "None" }
+    { "name": "sa-swap T=1, 10^5 (vs eo-swap)", "theta": 0.0, "log10_iterations": 5, "smoothing": "None", "solver": "SaSwap" },
+    { "name": "sa-flip T=1, 10^5 (compare)", "theta": 0.0, "log10_iterations": 5, "smoothing": "None" }
   ],
   "config_sweep": {
     "log10_iterations": [5],
