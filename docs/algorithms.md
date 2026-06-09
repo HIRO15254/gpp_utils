@@ -384,8 +384,9 @@ $T = 10^\Theta$ なので $\Theta$ を等間隔に振ると温度が対数スケ
   初期解は `balanced_init`。ペナルティ項は一定（偶数 $N$ なら 0）なので実スコア = カット数。
 - **1 手**: ランダムに 1 スワップを提案し、**メトロポリス基準**（温度 $\Theta=\log_{10}T$）で受理。
   $T=0$（`theta=None`）は改善スワップのみ受理する貪欲スワップ降下。
-- `basin_*` は EO スワップ版と同じく **best-so-far $m_{\text{best}}$**（スワップ保存型ベイスン降下が
-  $O(N^2)$ で高コストのため）、`final_partition = S_{\text{best}}$、smoothed == real。
+- `basin_*` は EO スワップ版（`run_eo`）と同じく **スワップ近傍の本物の局所最適**
+  （`hill_climb_swap_fast`、厳密バランスを保つスワップ最急降下、$O(N^2)$/降下ステップ）。
+  `final_partition = S_{\text{best}}$、smoothed == real、$m_{\text{best}}$ は `current_real` の累積最小から。
 
 これにより **同一のスワップ近傍上で EO（ランク選択＋無条件受理）と SA（ランダム＋メトロポリス）を
 直接比較**できる。フリップ近傍では SA ↔ EoFlip（[5.3.1 節](#531-フリップ近傍版-run_eo_flip--solverspeceoflip)）、
@@ -573,16 +574,19 @@ $10^N$ 反復でも記録数は $O(9N)$ に収まる。
 6 トレース。スムージングなし（`None`）の場合はスムージング空間 = 実空間なので
 4 フィールドが同値となり、山登りは 1 回で済む。
 
-**EO のトレース解釈（プレーン EO）**: τ-EO は平滑化を行わないので smoothed = real。
-両版とも `current_smoothed = current_real = その時点の現在解の生スコア`（無条件受理のため
-非単調に揺らぐ EO 本来の軌跡）、`final_partition = S_best`。`basin_*` の意味だけが異なる:
+**EO / SaSwap のトレース解釈（プレーン）**: これらは平滑化を行わないので smoothed = real。
+`current_smoothed = current_real = その時点の現在解の生スコア`（無条件受理／メトロポリスで
+揺らぐ軌跡）、`final_partition = S_best`。`basin_*`（4 フィールド同値）は **その近傍での本物の
+局所最適（ベイスン）**:
 
-- **スワップ版 `run_eo`**: 4 つの `basin_*` = **best-so-far の $m_{\text{best}}$**（単調減少）。
-  バランス保存型のスワップ降下は $O(N^2)$ で高コストのため採らず、`basin_*` を
-  $m_{\text{best}}$ の搬送に流用（べき則検証 $m_{\text{best}} \sim t^{-0.4}$ を既存スキーマで提供）。
-- **フリップ版 `run_eo_flip`**: SA と同じ `hill_climb_real_fast`（単一フリップ山登り）で
-  **本物のベイスン（局所最適）**を算出する。よって SA の `None` ケースと 6 トレースが
-  1対1で比較でき、$m_{\text{best}}$ は記録の `current_real` の累積最小から得る。
+- **フリップ近傍（`Sa` / `run_eo_flip`）**: `hill_climb_real_fast`（単一フリップ最急降下）。
+- **スワップ近傍（`run_sa_swap` / `run_eo`）**: `hill_climb_swap_fast`（厳密バランスを保つ
+  スワップ最急降下、$O(N^2)$/降下ステップ）。
+
+いずれもタイブレーク RNG（`seed ^ TIEBREAK_SALT`）を使い、本体 RNG とは独立なので
+`final_partition` には影響しない。同一近傍のソルバ同士（`Sa`↔`EoFlip`、`SaSwap`↔`Eo`）は
+ベイスン算出が一致するので 6 トレースを 1対1 で比較できる。べき則検証に使う $m_{\text{best}}$ は
+記録の `current_real` の累積最小から得る。
 
 ベイスン計算の山登りも [5.1 節](#51-山登り法-hill-climbing)と同様、同スコア近傍を
 一様ランダムにタイブレークする。タイブレーク用の乱数列は SA 本体（`rng`）とは

@@ -96,7 +96,7 @@ score = カットエッジ数 + ALPHA * (|V1| - |V2|)^2
 
 > 実験ワークフロー（GUI / CLI / batch）は汎用トレイトではなく `run_executor::execute` を使う。近傍（フリップ / スワップ）× 受理規則（メトロポリス / EO ランク）の 2×2:
 > - フリップ近傍: `Sa`（`run_sa_*`、smoothing 対応・実ベイスン）↔ `EoFlip`（`run_eo_flip`）
-> - スワップ近傍・厳密バランス: `SaSwap`（`run_sa_swap`）↔ `Eo`（`run_eo`、スペック忠実、basin=m_best）
+> - スワップ近傍・厳密バランス: `SaSwap`（`run_sa_swap`）↔ `Eo`（`run_eo`、スペック忠実）。ベイスンは `hill_climb_swap_fast`（スワップ最急降下）で算出
 >
 > `ExtremalOptimizationSolver` はバランス・スワップ概念を持たない汎用トレイト版で、ワークフローでは使われない。
 

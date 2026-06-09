@@ -577,17 +577,111 @@ fn balanced_init(n: usize, rng: &mut Mt19937GenRand64) -> Partition {
     p
 }
 
-/// プレーン EO 用のスナップショット。平滑化を行わないので smoothed == real。
-/// `current_*` は現在の生スコア、`basin_*`（4 フィールド）は best-so-far の m_best を表す。
-fn make_eo_snapshot(step: usize, current_real: f64, best_so_far: f64) -> StepRecord {
+/// スワップ近傍での最急降下山登り（厳密バランスを保ったまま、改善スワップが尽きるまで）。
+///
+/// 各ステップで全 (A,B) ペアのうち実スコアを最も下げるスワップ 1 つを選んで適用する
+/// （[`hill_climb_real_fast`] のスワップ版）。同スコアのスワップが複数あるときは `tie_rng` から
+/// reservoir sampling で一様選択する。バランスは不変なので到達点も `|A|=|B|`。
+///
+/// 候補スコアは v1 を一時フリップしてから `delta_apply_cached(v2)` で O(1) 評価する
+/// （隣接ペアの二重計上も整数状態の連鎖で正しく処理される）。1 降下ステップは
+/// O(|A|·|B|) = O(N²)。スコアは厳密バランス下で整数なので、改善スワップは毎回カットを
+/// 1 以上下げ、有限ステップで停止する。
+///
+/// PHASE 2: Kernighan–Lin 風のゲインバケットで各頂点の最良スワップゲインを増分更新すれば、
+/// 1 ステップを O(N·deg) 程度に削減できる。
+fn hill_climb_swap_fast(
+    prob: &GraphPartitionProblem,
+    start: &Partition,
+    start_cuts: &[i32],
+    start_cut: i32,
+    start_t: usize,
+    start_f: usize,
+    tie_rng: &mut Mt19937GenRand64,
+) -> (Partition, Vec<i32>, i32, usize, usize) {
+    let mut current = start.clone();
+    let mut cuts_at = start_cuts.to_vec();
+    let (mut cur_cut, mut cur_t, mut cur_f) = (start_cut, start_t, start_f);
+    let mut cur_score = GraphPartitionProblem::score_from_state(cur_cut, cur_t, cur_f);
+    let n = current.len();
+
+    loop {
+        let mut best: Option<(usize, usize)> = None;
+        let mut best_score = cur_score;
+        let mut tie_count: u64 = 0;
+
+        for v1 in 0..n {
+            if !current[v1] {
+                continue; // v1 は A 集合（true 側）の代表のみ
+            }
+            let (c1, t1, f1, _) =
+                prob.delta_apply_cached(&current, &cuts_at, v1, cur_cut, cur_t, cur_f);
+            prob.flip_vertex(&mut current, &mut cuts_at, v1); // 一時フリップ
+            for v2 in 0..n {
+                if current[v2] || v2 == v1 {
+                    continue; // v2 は B 集合（false 側、ただし v1 自身は除く）
+                }
+                let s = prob.delta_apply_cached(&current, &cuts_at, v2, c1, t1, f1).3;
+                if s < best_score {
+                    best_score = s;
+                    best = Some((v1, v2));
+                    tie_count = 1;
+                } else if best.is_some() && s == best_score {
+                    tie_count += 1;
+                    if tie_rng.gen_range(0..tie_count) == 0 {
+                        best = Some((v1, v2));
+                    }
+                }
+            }
+            prob.flip_vertex(&mut current, &mut cuts_at, v1); // アンフリップ
+        }
+
+        match best {
+            Some((v1, v2)) => {
+                let (c1, t1, f1, _) =
+                    prob.delta_apply_cached(&current, &cuts_at, v1, cur_cut, cur_t, cur_f);
+                prob.flip_vertex(&mut current, &mut cuts_at, v1);
+                let (c2, t2, f2, ns) =
+                    prob.delta_apply_cached(&current, &cuts_at, v2, c1, t1, f1);
+                prob.flip_vertex(&mut current, &mut cuts_at, v2);
+                cur_cut = c2;
+                cur_t = t2;
+                cur_f = f2;
+                cur_score = ns;
+            }
+            None => break,
+        }
+    }
+    (current, cuts_at, cur_cut, cur_t, cur_f)
+}
+
+/// スワップ近傍ソルバ（[`run_eo`] / [`run_sa_swap`]）用のスナップショット。
+///
+/// 平滑化なし（smoothed == real）。`current_*` は現在解の生スコア、`basin_*`（4 フィールド）は
+/// **スワップ近傍の局所最適**（`hill_climb_swap_fast` で算出）。SA フリップ版の
+/// `make_snapshot_fast(no_smoothing=true)` のスワップ版に相当する。
+fn make_swap_snapshot(
+    prob: &GraphPartitionProblem,
+    current: &Partition,
+    cuts_at: &[i32],
+    cur_cut: i32,
+    cur_t: usize,
+    cur_f: usize,
+    step: usize,
+    tie_rng: &mut Mt19937GenRand64,
+) -> StepRecord {
+    let current_real = GraphPartitionProblem::score_from_state(cur_cut, cur_t, cur_f);
+    let (_, _, bc, bt, bf) =
+        hill_climb_swap_fast(prob, current, cuts_at, cur_cut, cur_t, cur_f, tie_rng);
+    let basin = GraphPartitionProblem::score_from_state(bc, bt, bf);
     StepRecord {
         step,
         current_smoothed: current_real,
         current_real,
-        basin_smoothed_from_smoothed: best_so_far,
-        basin_real_from_smoothed: best_so_far,
-        basin_smoothed_from_real: best_so_far,
-        basin_real_from_real: best_so_far,
+        basin_smoothed_from_smoothed: basin,
+        basin_real_from_smoothed: basin,
+        basin_smoothed_from_real: basin,
+        basin_real_from_real: basin,
     }
 }
 
@@ -624,14 +718,19 @@ fn run_eo(
         .map(|v| prob.graph().adjacency_list[v].len())
         .collect();
 
+    // ベイスン算出（スワップ降下）のタイブレーク専用 RNG。本体 rng とは独立なので
+    // final_partition には影響せず、records のベイスン値のみがタイブレークの影響を受ける。
+    let mut tie_rng = Mt19937GenRand64::new(seed ^ TIEBREAK_SALT);
+
     let max_iter = cfg.iterations();
     let snap_steps = logarithmic_steps(max_iter);
     let mut snap_iter = snap_steps.iter().copied().peekable();
     let mut records = Vec::with_capacity(snap_steps.len() + 1);
 
-    // 初期スナップショット (step = 0)。
-    let initial_real = GraphPartitionProblem::score_from_state(cur_cut, cur_t, cur_f);
-    records.push(make_eo_snapshot(0, initial_real, best_score));
+    // 初期スナップショット (step = 0)。ベイスンはスワップ近傍の局所最適。
+    records.push(make_swap_snapshot(
+        prob, &current, &cuts_at, cur_cut, cur_t, cur_f, 0, &mut tie_rng,
+    ));
 
     // スワップには両集合に最低 1 頂点ずつ必要。
     if n < 2 {
@@ -725,7 +824,9 @@ fn run_eo(
 
         if let Some(&want) = snap_iter.peek() {
             if it == want {
-                records.push(make_eo_snapshot(it, real_score, best_score));
+                records.push(make_swap_snapshot(
+                    prob, &current, &cuts_at, cur_cut, cur_t, cur_f, it, &mut tie_rng,
+                ));
                 snap_iter.next();
             }
         }
@@ -905,9 +1006,10 @@ fn run_eo_flip(
 /// 固定温度 SA をスワップ近傍（厳密バランス）で実行する版。
 ///
 /// スワップ版 EO（[`run_eo`]）と **同一の近傍（v1∈A ↔ v2∈B のスワップ）・厳密バランス
-/// `|A|=|B|=N/2`・初期化（`balanced_init`）・ベイスン記録（`basin_*` = m_best）**を共有し、
-/// 違いは「1 手の選び方」だけ: ランダムに 1 スワップを提案し、**メトロポリス基準**で受理する
-/// （温度 `θ = RunConfig::theta`）。`θ = None`（T=0）は改善スワップのみ受理する貪欲降下。
+/// `|A|=|B|=N/2`・初期化（`balanced_init`）・ベイスン算出（`hill_climb_swap_fast` による
+/// スワップ近傍の局所最適）**を共有し、違いは「1 手の選び方」だけ: ランダムに 1 スワップを
+/// 提案し、**メトロポリス基準**で受理する（温度 `θ = RunConfig::theta`）。
+/// `θ = None`（T=0）は改善スワップのみ受理する貪欲降下。
 ///
 /// 厳密バランスなのでペナルティ項は一定（偶数 N なら 0）、実スコア = カット数。
 /// `final_partition` には最良解 `S_best` を返す。`smoothing` は無視する。
@@ -927,14 +1029,18 @@ fn run_sa_swap(
     let mut best = current.clone();
     let mut best_score = GraphPartitionProblem::score_from_state(cur_cut, cur_t, cur_f);
 
+    // ベイスン算出（スワップ降下）のタイブレーク専用 RNG。本体 rng と独立。
+    let mut tie_rng = Mt19937GenRand64::new(seed ^ TIEBREAK_SALT);
+
     let temperature = cfg.temperature();
     let max_iter = cfg.iterations();
     let snap_steps = logarithmic_steps(max_iter);
     let mut snap_iter = snap_steps.iter().copied().peekable();
     let mut records = Vec::with_capacity(snap_steps.len() + 1);
 
-    let initial_real = GraphPartitionProblem::score_from_state(cur_cut, cur_t, cur_f);
-    records.push(make_eo_snapshot(0, initial_real, best_score));
+    records.push(make_swap_snapshot(
+        prob, &current, &cuts_at, cur_cut, cur_t, cur_f, 0, &mut tie_rng,
+    ));
 
     if n < 2 {
         return (best, records);
@@ -1000,8 +1106,9 @@ fn run_sa_swap(
 
         if let Some(&want) = snap_iter.peek() {
             if it == want {
-                let real = GraphPartitionProblem::score_from_state(cur_cut, cur_t, cur_f);
-                records.push(make_eo_snapshot(it, real, best_score));
+                records.push(make_swap_snapshot(
+                    prob, &current, &cuts_at, cur_cut, cur_t, cur_f, it, &mut tie_rng,
+                ));
                 snap_iter.next();
             }
         }
@@ -1199,16 +1306,15 @@ mod tests {
         let (t, f) = get_partition_sizes(&p1);
         assert_eq!((t, f), (15, 15));
 
-        // best（最終 basin）は初期カット（step0 current）以下。
-        let initial = r1[0].current_real;
-        let final_best = r1.last().unwrap().basin_real_from_real;
-        assert!(final_best <= initial + 1e-9);
-
-        // 返した best のカットは、整数状態から再構成した best_score と一致する。
-        let (bt, bf) = get_partition_sizes(&p1);
-        let best_cut = prob.count_cut_edges(&p1);
-        let best_score = GraphPartitionProblem::score_from_state(best_cut, bt, bf);
-        assert!((best_score - final_best).abs() < 1e-9);
+        // 各スナップショットで basin（スワップ近傍の局所最適）は current 以下、smoothed==real。
+        for rec in &r1 {
+            assert!(
+                rec.basin_real_from_real <= rec.current_real + 1e-9,
+                "basin は current 以下のはず: step={}, basin={}, current={}",
+                rec.step, rec.basin_real_from_real, rec.current_real
+            );
+            assert!((rec.current_smoothed - rec.current_real).abs() < 1e-12);
+        }
 
         assert_eq!(r1[0].step, 0);
     }
@@ -1408,9 +1514,14 @@ mod tests {
         let (p2, _r2) = run_sa_swap(&prob, &cfg, 42);
         assert_eq!(p1, p2, "SaSwap は同一シードで決定論的");
         assert_eq!(get_partition_sizes(&p1), (15, 15), "厳密バランス維持");
-        let initial = r1[0].current_real;
-        let final_best = r1.last().unwrap().basin_real_from_real;
-        assert!(final_best <= initial + 1e-9);
+        // 各スナップショットで basin（スワップ近傍の局所最適）は current 以下。
+        for rec in &r1 {
+            assert!(
+                rec.basin_real_from_real <= rec.current_real + 1e-9,
+                "basin は current 以下: step={}, basin={}, current={}",
+                rec.step, rec.basin_real_from_real, rec.current_real
+            );
+        }
     }
 
     /// 貪欲（T=0）は現在解が単調非増加（reject は据え置き、accept は改善のみ）。
@@ -1438,6 +1549,59 @@ mod tests {
         assert!(!r.records.is_empty());
         assert_eq!(get_partition_sizes(&r.final_partition), (10, 10));
         assert_eq!(r.config.id(), "saswap_th+0_iter2");
+    }
+
+    /// hill_climb_swap_fast: バランス保存 ＋ basin ≤ start ＋ 到達点が本当にスワップ局所最適
+    /// （改善スワップが存在しない）であることを検証する。
+    #[test]
+    fn test_hill_climb_swap_fast_is_local_opt() {
+        use crate::graph_spec::{GraphKind, StoredGraph};
+        let spec = GraphSpec { kind: GraphKind::Random, n: 30, d: 4.0, seed: 0 };
+        let prob = StoredGraph::generate(spec).problem();
+
+        for seed in 0..5u64 {
+            let mut rng = Mt19937GenRand64::new(seed);
+            let start = balanced_init(30, &mut rng);
+            let start_cut = prob.count_cut_edges(&start);
+            let (st, sf) = get_partition_sizes(&start);
+            let cuts_at = prob.compute_cuts_at(&start);
+            let mut tie = Mt19937GenRand64::new(seed ^ 0xABCD);
+
+            let (basin, b_cuts, bc, bt, bf) =
+                hill_climb_swap_fast(&prob, &start, &cuts_at, start_cut, st, sf, &mut tie);
+
+            // バランス保存。
+            assert_eq!(get_partition_sizes(&basin), (st, sf));
+            // 整数状態が再計算と一致。
+            assert_eq!(bc, prob.count_cut_edges(&basin));
+            assert_eq!(b_cuts, prob.compute_cuts_at(&basin));
+            // basin ≤ start。
+            let start_score = GraphPartitionProblem::score_from_state(start_cut, st, sf);
+            let basin_score = GraphPartitionProblem::score_from_state(bc, bt, bf);
+            assert!(basin_score <= start_score + 1e-9);
+
+            // 到達点に改善スワップが存在しないことを確認（全 A×B ペアを走査）。
+            let n = basin.len();
+            for v1 in 0..n {
+                if !basin[v1] {
+                    continue;
+                }
+                let mut p = basin.clone();
+                let mut c = b_cuts.clone();
+                let (c1, t1, f1, _) = prob.delta_apply_cached(&p, &c, v1, bc, bt, bf);
+                prob.flip_vertex(&mut p, &mut c, v1);
+                for v2 in 0..n {
+                    if p[v2] || v2 == v1 {
+                        continue;
+                    }
+                    let s = prob.delta_apply_cached(&p, &c, v2, c1, t1, f1).3;
+                    assert!(
+                        s >= basin_score - 1e-9,
+                        "局所最適のはずが改善スワップが存在: seed={seed}, v1={v1}, v2={v2}, s={s}, basin={basin_score}"
+                    );
+                }
+            }
+        }
     }
 
     /// execute() 経由でも EO がディスパッチされ、結果が得られる。
