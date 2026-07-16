@@ -39,6 +39,44 @@ fn fmt_tau(t: f64) -> String {
 /// τ-EO の既定の指数 τ（スペック既定値、実用範囲 1.3〜1.6）。
 pub const DEFAULT_TAU: f64 = 1.4;
 
+/// EoFlip の適応度 q に使う係数 α_eo の既定値（`graph_partition::ALPHA` と同値だが独立に管理する）。
+pub const DEFAULT_EO_FLIP_ALPHA: f64 = 0.05;
+
+/// EoFlip の適応度 q に使う diff の指数 p の既定値（従来の二乗）。
+pub const DEFAULT_EO_FLIP_DIFF_EXP: f64 = 2.0;
+
+fn default_eo_flip_alpha() -> f64 {
+    DEFAULT_EO_FLIP_ALPHA
+}
+
+fn default_eo_flip_diff_exp() -> f64 {
+    DEFAULT_EO_FLIP_DIFF_EXP
+}
+
+/// `EoFlipMulAlpha` の係数 α の既定値。α=1 は λ1 が多数派/少数派とも 1（バイアスなし）
+/// になる中立値。
+pub const DEFAULT_EO_FLIP_MUL_ALPHA: f64 = 1.0;
+
+/// `EoFlipAddBeta` の係数 β の既定値。
+pub const DEFAULT_EO_FLIP_ADD_BETA: f64 = 1.0;
+
+fn default_eo_flip_mul_alpha() -> f64 {
+    DEFAULT_EO_FLIP_MUL_ALPHA
+}
+
+fn default_eo_flip_add_beta() -> f64 {
+    DEFAULT_EO_FLIP_ADD_BETA
+}
+
+/// ハイパーパラメータ値（α_eo / p）を id 文字列用に整形する（`fmt_tau` と同流儀、`.`→`p`）。
+fn fmt_hyper(x: f64) -> String {
+    if x.fract().abs() < 1e-9 {
+        format!("{}", x as i64)
+    } else {
+        format!("{}", x).replace('.', "p")
+    }
+}
+
 /// ソルバー指定。`Sa` は固定温度メトロポリス（既存）、`Eo` は τ-EO（厳密バランスのスワップ）。
 ///
 /// `RunConfig` に `#[serde(default)]` で埋め込まれるため、`solver` フィールドを持たない
@@ -56,7 +94,46 @@ pub enum SolverSpec {
     /// τ-Extremal Optimization（フリップ近傍版）。SA と同一の近傍・目的関数・ベイスン算出を共有し、
     /// バランスはペナルティ項で扱う。適応度は g/deg にバランスペナルティを「悪い辺/良い辺」として
     /// 織り込んだもの。`tau` はべき乗則指数（既定 [`DEFAULT_TAU`]）。
-    EoFlip { tau: f64 },
+    ///
+    /// `alpha_eo`（既定 [`DEFAULT_EO_FLIP_ALPHA`]）と `diff_exp`（p、既定 [`DEFAULT_EO_FLIP_DIFF_EXP`]）は
+    /// 適応度 q = `alpha_eo·(|diff|^p − |diff_after|^p)` の係数と指数。**目的関数 `score` には影響しない**
+    /// （手選択の内部勾配だけを変える）。既定値では従来の `ALPHA·(diff² − diff_after²)` を byte 完全再現する。
+    /// 旧 JSON（`alpha_eo`/`diff_exp` フィールドを持たない）は per-field の serde default で既定値が埋まる。
+    EoFlip {
+        tau: f64,
+        #[serde(default = "default_eo_flip_alpha")]
+        alpha_eo: f64,
+        #[serde(default = "default_eo_flip_diff_exp")]
+        diff_exp: f64,
+    },
+    /// τ-Extremal Optimization（フリップ近傍・乗算 α 版）。適応度 `λ = λ0 · λ1`。
+    ///
+    /// `λ0` はスワップ版 EO と同じ次数正規化適応度 `g/deg`（[`SolverSpec::Eo`] の λ 計算と
+    /// 同一で、バランスペナルティは含まない）。`λ1` は対象頂点が現在多数派集合
+    /// （`|自集合| > |反対集合|`）に属すなら `alpha`、少数派なら `1.0`。両集合が同数
+    /// （`cur_t == cur_f`）のときはどちらの集合も多数派扱いしない（`λ1 = 1.0` 固定）。
+    /// `alpha` の既定値は [`DEFAULT_EO_FLIP_MUL_ALPHA`]（=1、多数派バイアスなしの中立値）。
+    EoFlipMulAlpha {
+        tau: f64,
+        #[serde(default = "default_eo_flip_mul_alpha")]
+        alpha: f64,
+    },
+    /// τ-Extremal Optimization（フリップ近傍・加算 β 版）。適応度 `λ = β·λ0 + λ1`。
+    ///
+    /// `λ0` は [`SolverSpec::EoFlipMulAlpha`] と同じスワップ版 EO 由来の `g/deg`。`λ1` は
+    /// 多数派なら `0.0`、少数派なら `1.0`（均衡時はどちらも多数派扱いしないため `λ1 = 1.0`）。
+    /// `beta` の既定値は [`DEFAULT_EO_FLIP_ADD_BETA`]。
+    EoFlipAddBeta {
+        tau: f64,
+        #[serde(default = "default_eo_flip_add_beta")]
+        beta: f64,
+    },
+    /// τ-Extremal Optimization（フリップ近傍・乗算 γ 版）。適応度 `λ = λ0 · λ1`。
+    ///
+    /// `λ0` は [`SolverSpec::EoFlipMulAlpha`] と同じ。`λ1` は多数派なら
+    /// `γ = (少数派集合の頂点数) / (N/2)`（毎ステップ動的に算出、均衡時は `γ = 1.0`）、
+    /// 少数派なら `1.0`。追加のハイパーパラメータはない。
+    EoFlipMulGamma { tau: f64 },
 }
 
 impl Default for SolverSpec {
@@ -72,6 +149,9 @@ pub enum SolverKind {
     SaSwap,
     Eo,
     EoFlip,
+    EoFlipMulAlpha,
+    EoFlipAddBeta,
+    EoFlipMulGamma,
 }
 
 impl Default for SolverKind {
@@ -156,8 +236,36 @@ impl RunConfig {
             SolverSpec::Eo { tau } => {
                 format!("eo_iter{}_tau{}", self.log10_iterations, fmt_tau(tau))
             }
-            SolverSpec::EoFlip { tau } => {
-                format!("eoflip_iter{}_tau{}", self.log10_iterations, fmt_tau(tau))
+            SolverSpec::EoFlip { tau, alpha_eo, diff_exp } => {
+                // 既定値のときは従来 id を厳密維持し、非既定のときだけ接尾辞（tau→a→p の順）を付ける。
+                let mut s =
+                    format!("eoflip_iter{}_tau{}", self.log10_iterations, fmt_tau(tau));
+                if (alpha_eo - DEFAULT_EO_FLIP_ALPHA).abs() >= 1e-12 {
+                    s.push_str(&format!("_a{}", fmt_hyper(alpha_eo)));
+                }
+                if (diff_exp - DEFAULT_EO_FLIP_DIFF_EXP).abs() >= 1e-12 {
+                    s.push_str(&format!("_p{}", fmt_hyper(diff_exp)));
+                }
+                s
+            }
+            SolverSpec::EoFlipMulAlpha { tau, alpha } => {
+                format!(
+                    "eoflipmulalpha_iter{}_tau{}_a{}",
+                    self.log10_iterations,
+                    fmt_tau(tau),
+                    fmt_hyper(alpha)
+                )
+            }
+            SolverSpec::EoFlipAddBeta { tau, beta } => {
+                format!(
+                    "eoflipaddbeta_iter{}_tau{}_b{}",
+                    self.log10_iterations,
+                    fmt_tau(tau),
+                    fmt_hyper(beta)
+                )
+            }
+            SolverSpec::EoFlipMulGamma { tau } => {
+                format!("eoflipmulgamma_iter{}_tau{}", self.log10_iterations, fmt_tau(tau))
             }
         }
     }
@@ -239,6 +347,22 @@ pub struct ConfigSweep {
     /// τ-EO の指数 τ 候補（`solver_kind` が `Eo` のとき直積軸に使う。空なら [`DEFAULT_TAU`] 1 通り）。
     #[serde(default)]
     pub taus: Vec<f64>,
+    /// EoFlip の適応度係数 α_eo 候補（`solver_kind` が `EoFlip` のとき直積軸に使う。
+    /// 空なら [`DEFAULT_EO_FLIP_ALPHA`] 1 通り。`EoFlip` 以外では無視）。
+    #[serde(default)]
+    pub alpha_eos: Vec<f64>,
+    /// EoFlip の適応度指数 p（diff_exp）候補（`solver_kind` が `EoFlip` のとき直積軸に使う。
+    /// 空なら [`DEFAULT_EO_FLIP_DIFF_EXP`] 1 通り。`EoFlip` 以外では無視）。
+    #[serde(default)]
+    pub diff_exps: Vec<f64>,
+    /// EoFlipMulAlpha の係数 α 候補（`solver_kind` が `EoFlipMulAlpha` のとき直積軸に使う。
+    /// 空なら [`DEFAULT_EO_FLIP_MUL_ALPHA`] 1 通り。それ以外では無視）。
+    #[serde(default)]
+    pub mul_alphas: Vec<f64>,
+    /// EoFlipAddBeta の係数 β 候補（`solver_kind` が `EoFlipAddBeta` のとき直積軸に使う。
+    /// 空なら [`DEFAULT_EO_FLIP_ADD_BETA`] 1 通り。それ以外では無視）。
+    #[serde(default)]
+    pub add_betas: Vec<f64>,
 }
 
 impl ConfigSweep {
@@ -253,6 +377,9 @@ impl ConfigSweep {
             SolverKind::SaSwap => self.expand_sa_swap(),
             SolverKind::Eo => self.expand_eo(false),
             SolverKind::EoFlip => self.expand_eo(true),
+            SolverKind::EoFlipMulAlpha => self.expand_eo_flip_mul_alpha(),
+            SolverKind::EoFlipAddBeta => self.expand_eo_flip_add_beta(),
+            SolverKind::EoFlipMulGamma => self.expand_eo_flip_mul_gamma(),
         }
     }
 
@@ -313,20 +440,110 @@ impl ConfigSweep {
         } else {
             self.taus.clone()
         };
+        // α_eo / p は EoFlip でのみ直積軸になる。非 flip（Eo）や空 Vec は既定 1 通り
+        // （空 taus → [DEFAULT_TAU] と同じ規約）。→ Eo の展開数・既定 EoFlip の展開数は不変。
+        let alpha_eos: Vec<f64> = if !flip || self.alpha_eos.is_empty() {
+            vec![DEFAULT_EO_FLIP_ALPHA]
+        } else {
+            self.alpha_eos.clone()
+        };
+        let diff_exps: Vec<f64> = if !flip || self.diff_exps.is_empty() {
+            vec![DEFAULT_EO_FLIP_DIFF_EXP]
+        } else {
+            self.diff_exps.clone()
+        };
         let mut out = Vec::new();
         for &log10_iterations in &self.log10_iterations {
             for &tau in &taus {
-                let solver = if flip {
-                    SolverSpec::EoFlip { tau }
-                } else {
-                    SolverSpec::Eo { tau }
-                };
+                for &alpha_eo in &alpha_eos {
+                    for &diff_exp in &diff_exps {
+                        let solver = if flip {
+                            SolverSpec::EoFlip { tau, alpha_eo, diff_exp }
+                        } else {
+                            SolverSpec::Eo { tau }
+                        };
+                        let mut cfg = RunConfig {
+                            name: String::new(),
+                            theta: None,
+                            log10_iterations,
+                            smoothing: SmoothingSpec::None,
+                            solver,
+                        };
+                        cfg.name = cfg.id();
+                        out.push(cfg);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// EoFlipMulAlpha: `log10_iterations × taus × mul_alphas` を展開する。
+    fn expand_eo_flip_mul_alpha(&self) -> Vec<RunConfig> {
+        let taus: Vec<f64> = if self.taus.is_empty() { vec![DEFAULT_TAU] } else { self.taus.clone() };
+        let alphas: Vec<f64> = if self.mul_alphas.is_empty() {
+            vec![DEFAULT_EO_FLIP_MUL_ALPHA]
+        } else {
+            self.mul_alphas.clone()
+        };
+        let mut out = Vec::new();
+        for &log10_iterations in &self.log10_iterations {
+            for &tau in &taus {
+                for &alpha in &alphas {
+                    let mut cfg = RunConfig {
+                        name: String::new(),
+                        theta: None,
+                        log10_iterations,
+                        smoothing: SmoothingSpec::None,
+                        solver: SolverSpec::EoFlipMulAlpha { tau, alpha },
+                    };
+                    cfg.name = cfg.id();
+                    out.push(cfg);
+                }
+            }
+        }
+        out
+    }
+
+    /// EoFlipAddBeta: `log10_iterations × taus × add_betas` を展開する。
+    fn expand_eo_flip_add_beta(&self) -> Vec<RunConfig> {
+        let taus: Vec<f64> = if self.taus.is_empty() { vec![DEFAULT_TAU] } else { self.taus.clone() };
+        let betas: Vec<f64> = if self.add_betas.is_empty() {
+            vec![DEFAULT_EO_FLIP_ADD_BETA]
+        } else {
+            self.add_betas.clone()
+        };
+        let mut out = Vec::new();
+        for &log10_iterations in &self.log10_iterations {
+            for &tau in &taus {
+                for &beta in &betas {
+                    let mut cfg = RunConfig {
+                        name: String::new(),
+                        theta: None,
+                        log10_iterations,
+                        smoothing: SmoothingSpec::None,
+                        solver: SolverSpec::EoFlipAddBeta { tau, beta },
+                    };
+                    cfg.name = cfg.id();
+                    out.push(cfg);
+                }
+            }
+        }
+        out
+    }
+
+    /// EoFlipMulGamma: `log10_iterations × taus` を展開する（γ は動的算出のためスイープ軸なし）。
+    fn expand_eo_flip_mul_gamma(&self) -> Vec<RunConfig> {
+        let taus: Vec<f64> = if self.taus.is_empty() { vec![DEFAULT_TAU] } else { self.taus.clone() };
+        let mut out = Vec::new();
+        for &log10_iterations in &self.log10_iterations {
+            for &tau in &taus {
                 let mut cfg = RunConfig {
                     name: String::new(),
                     theta: None,
                     log10_iterations,
                     smoothing: SmoothingSpec::None,
-                    solver,
+                    solver: SolverSpec::EoFlipMulGamma { tau },
                 };
                 cfg.name = cfg.id();
                 out.push(cfg);
@@ -404,7 +621,11 @@ mod tests {
             theta: Some(0.0),
             log10_iterations: 5,
             smoothing: SmoothingSpec::None,
-            solver: SolverSpec::EoFlip { tau: 1.4 },
+            solver: SolverSpec::EoFlip {
+                tau: 1.4,
+                alpha_eo: DEFAULT_EO_FLIP_ALPHA,
+                diff_exp: DEFAULT_EO_FLIP_DIFF_EXP,
+            },
         };
         assert_eq!(c3.id(), "eoflip_iter5_tau1p4");
         // SaSwap は theta を使い smoothing を含めない。
@@ -440,6 +661,124 @@ mod tests {
         let cfg_eo: RunConfig = serde_json::from_str(json_eo).expect("deserialize eo");
         assert_eq!(cfg_eo.solver, SolverSpec::Eo { tau: 1.4 });
         assert_eq!(cfg_eo.id(), "eo_iter5_tau1p4");
+
+        // 旧 EoFlip JSON（alpha_eo/diff_exp なし）は per-field serde default で既定値が埋まり、
+        // id も従来どおり接尾辞なし（既存 data/results と再現性を保つ）。
+        let json_flip_old =
+            r#"{"name":"x","theta":null,"log10_iterations":5,"smoothing":"None","solver":{"EoFlip":{"tau":1.4}}}"#;
+        let cfg_flip_old: RunConfig =
+            serde_json::from_str(json_flip_old).expect("deserialize old eoflip");
+        assert_eq!(
+            cfg_flip_old.solver,
+            SolverSpec::EoFlip {
+                tau: 1.4,
+                alpha_eo: DEFAULT_EO_FLIP_ALPHA,
+                diff_exp: DEFAULT_EO_FLIP_DIFF_EXP,
+            }
+        );
+        assert_eq!(cfg_flip_old.id(), "eoflip_iter5_tau1p4");
+
+        // 明示的な alpha_eo/diff_exp を持つ EoFlip JSON は round-trip できる。
+        let json_flip_full = r#"{"name":"x","theta":null,"log10_iterations":5,"smoothing":"None","solver":{"EoFlip":{"tau":1.4,"alpha_eo":0.1,"diff_exp":0.5}}}"#;
+        let cfg_flip_full: RunConfig =
+            serde_json::from_str(json_flip_full).expect("deserialize full eoflip");
+        assert_eq!(
+            cfg_flip_full.solver,
+            SolverSpec::EoFlip { tau: 1.4, alpha_eo: 0.1, diff_exp: 0.5 }
+        );
+        assert_eq!(cfg_flip_full.id(), "eoflip_iter5_tau1p4_a0p1_p0p5");
+    }
+
+    #[test]
+    fn test_id_format_eoflip_hyper() {
+        let mk = |alpha_eo: f64, diff_exp: f64| RunConfig {
+            name: "a".into(),
+            theta: None,
+            log10_iterations: 5,
+            smoothing: SmoothingSpec::None,
+            solver: SolverSpec::EoFlip { tau: 1.4, alpha_eo, diff_exp },
+        };
+        // 既定 → 接尾辞なし（従来 id を厳密維持）。
+        assert_eq!(
+            mk(DEFAULT_EO_FLIP_ALPHA, DEFAULT_EO_FLIP_DIFF_EXP).id(),
+            "eoflip_iter5_tau1p4"
+        );
+        // 両方非既定 → tau→a→p の順で接尾辞。
+        assert_eq!(mk(0.1, 0.5).id(), "eoflip_iter5_tau1p4_a0p1_p0p5");
+        // p だけ非既定 → _p のみ。
+        assert_eq!(mk(DEFAULT_EO_FLIP_ALPHA, 0.5).id(), "eoflip_iter5_tau1p4_p0p5");
+        // α だけ非既定 → _a のみ。
+        assert_eq!(mk(0.2, DEFAULT_EO_FLIP_DIFF_EXP).id(), "eoflip_iter5_tau1p4_a0p2");
+    }
+
+    #[test]
+    fn test_config_sweep_expand_eoflip_hyper() {
+        // EoFlip の 3 次元スイープ: taus × alpha_eos × diff_exps（× iters=1）。
+        let sweep = ConfigSweep {
+            thetas: vec![],
+            log10_iterations: vec![4],
+            smoothing_kind: SmoothingKind::None,
+            ks: vec![],
+            weights: vec![],
+            solver_kind: SolverKind::EoFlip,
+            taus: vec![1.3, 1.5],
+            alpha_eos: vec![0.05, 0.1],
+            diff_exps: vec![2.0, 0.5],
+            mul_alphas: vec![],
+            add_betas: vec![],
+        };
+        let cfgs = sweep.expand();
+        // 2 taus × 2 alpha_eos × 2 diff_exps = 8。
+        assert_eq!(cfgs.len(), 8);
+        // id はすべて相異（name = id）。
+        let ids: std::collections::HashSet<_> = cfgs.iter().map(|c| c.name.clone()).collect();
+        assert_eq!(ids.len(), 8, "8 config は一意な id を持つ");
+        for c in &cfgs {
+            assert_eq!(c.name, c.id());
+            assert!(matches!(c.solver, SolverSpec::EoFlip { .. }));
+        }
+
+        // 空 α/p Vec なら taus のみの展開数（既定 1 通り）。
+        let sweep_empty = ConfigSweep {
+            thetas: vec![],
+            log10_iterations: vec![4],
+            smoothing_kind: SmoothingKind::None,
+            ks: vec![],
+            weights: vec![],
+            solver_kind: SolverKind::EoFlip,
+            taus: vec![1.3, 1.5],
+            alpha_eos: vec![],
+            diff_exps: vec![],
+            mul_alphas: vec![],
+            add_betas: vec![],
+        };
+        let cfgs_empty = sweep_empty.expand();
+        assert_eq!(cfgs_empty.len(), 2);
+        assert_eq!(
+            cfgs_empty[0].solver,
+            SolverSpec::EoFlip {
+                tau: 1.3,
+                alpha_eo: DEFAULT_EO_FLIP_ALPHA,
+                diff_exp: DEFAULT_EO_FLIP_DIFF_EXP,
+            }
+        );
+        assert_eq!(cfgs_empty[0].id(), "eoflip_iter4_tau1p3");
+
+        // 非 flip（Eo）は α/p 軸を無視する（展開数は taus のみ）。
+        let sweep_eo = ConfigSweep {
+            thetas: vec![],
+            log10_iterations: vec![4],
+            smoothing_kind: SmoothingKind::None,
+            ks: vec![],
+            weights: vec![],
+            solver_kind: SolverKind::Eo,
+            taus: vec![1.3, 1.5],
+            alpha_eos: vec![0.05, 0.1, 0.2],
+            diff_exps: vec![2.0, 0.5],
+            mul_alphas: vec![],
+            add_betas: vec![],
+        };
+        assert_eq!(sweep_eo.expand().len(), 2, "Eo は α/p を無視");
     }
 
     #[test]
@@ -452,6 +791,10 @@ mod tests {
             weights: vec![],
             solver_kind: SolverKind::Sa,
             taus: vec![],
+            alpha_eos: vec![],
+            diff_exps: vec![],
+            mul_alphas: vec![],
+            add_betas: vec![],
         };
         // 2 thetas x 2 iters x 2 Ks = 8
         let cfgs = sweep.expand();
@@ -471,6 +814,10 @@ mod tests {
             weights: vec![0.5],
             solver_kind: SolverKind::Sa,
             taus: vec![],
+            alpha_eos: vec![],
+            diff_exps: vec![],
+            mul_alphas: vec![],
+            add_betas: vec![],
         };
         let none_cfgs = none_sweep.expand();
         assert_eq!(none_cfgs.len(), 1);
@@ -485,6 +832,10 @@ mod tests {
             weights: vec![0.25, 0.5, 1.0],
             solver_kind: SolverKind::Sa,
             taus: vec![],
+            alpha_eos: vec![],
+            diff_exps: vec![],
+            mul_alphas: vec![],
+            add_betas: vec![],
         };
         let w_cfgs = w_sweep.expand();
         assert_eq!(w_cfgs.len(), 3);
@@ -502,6 +853,10 @@ mod tests {
             weights: vec![0.5],
             solver_kind: SolverKind::Eo,
             taus: vec![1.2, 1.4, 1.6],
+            alpha_eos: vec![],
+            diff_exps: vec![],
+            mul_alphas: vec![],
+            add_betas: vec![],
         };
         // 2 iters x 3 taus = 6（thetas/ks は無視される）。
         let cfgs = sweep.expand();
@@ -523,6 +878,10 @@ mod tests {
             weights: vec![],
             solver_kind: SolverKind::Eo,
             taus: vec![],
+            alpha_eos: vec![],
+            diff_exps: vec![],
+            mul_alphas: vec![],
+            add_betas: vec![],
         };
         let d_cfgs = default_sweep.expand();
         assert_eq!(d_cfgs.len(), 1);
@@ -539,6 +898,10 @@ mod tests {
             weights: vec![],
             solver_kind: SolverKind::EoFlip,
             taus: vec![1.3, 1.5],
+            alpha_eos: vec![],
+            diff_exps: vec![],
+            mul_alphas: vec![],
+            add_betas: vec![],
         };
         // 2 iters x 2 taus = 4
         let cfgs = sweep.expand();
@@ -547,7 +910,14 @@ mod tests {
             assert_eq!(c.name, c.id());
             assert!(matches!(c.solver, SolverSpec::EoFlip { .. }));
         }
-        assert_eq!(cfgs[0].solver, SolverSpec::EoFlip { tau: 1.3 });
+        assert_eq!(
+            cfgs[0].solver,
+            SolverSpec::EoFlip {
+                tau: 1.3,
+                alpha_eo: DEFAULT_EO_FLIP_ALPHA,
+                diff_exp: DEFAULT_EO_FLIP_DIFF_EXP,
+            }
+        );
         assert_eq!(cfgs[0].id(), "eoflip_iter4_tau1p3");
     }
 
@@ -561,6 +931,10 @@ mod tests {
             weights: vec![],
             solver_kind: SolverKind::SaSwap,
             taus: vec![],
+            alpha_eos: vec![],
+            diff_exps: vec![],
+            mul_alphas: vec![],
+            add_betas: vec![],
         };
         // 3 thetas x 2 iters = 6（smoothing/ks は無視）。
         let cfgs = sweep.expand();
@@ -571,5 +945,159 @@ mod tests {
             assert_eq!(c.smoothing, SmoothingSpec::None);
         }
         assert_eq!(cfgs[0].id(), "saswap_th-1_iter4");
+    }
+
+    #[test]
+    fn test_id_format_eoflip_mul_alpha() {
+        let c = RunConfig {
+            name: "a".into(),
+            theta: None,
+            log10_iterations: 5,
+            smoothing: SmoothingSpec::None,
+            solver: SolverSpec::EoFlipMulAlpha { tau: 1.4, alpha: 0.3 },
+        };
+        assert_eq!(c.id(), "eoflipmulalpha_iter5_tau1p4_a0p3");
+    }
+
+    #[test]
+    fn test_id_format_eoflip_add_beta() {
+        let c = RunConfig {
+            name: "a".into(),
+            theta: None,
+            log10_iterations: 5,
+            smoothing: SmoothingSpec::None,
+            solver: SolverSpec::EoFlipAddBeta { tau: 1.4, beta: 2.0 },
+        };
+        assert_eq!(c.id(), "eoflipaddbeta_iter5_tau1p4_b2");
+    }
+
+    #[test]
+    fn test_id_format_eoflip_mul_gamma() {
+        let c = RunConfig {
+            name: "a".into(),
+            theta: None,
+            log10_iterations: 5,
+            smoothing: SmoothingSpec::None,
+            solver: SolverSpec::EoFlipMulGamma { tau: 1.4 },
+        };
+        assert_eq!(c.id(), "eoflipmulgamma_iter5_tau1p4");
+    }
+
+    #[test]
+    fn test_config_sweep_expand_eoflip_mul_alpha() {
+        let sweep = ConfigSweep {
+            thetas: vec![],
+            log10_iterations: vec![4, 5],
+            smoothing_kind: SmoothingKind::None,
+            ks: vec![],
+            weights: vec![],
+            solver_kind: SolverKind::EoFlipMulAlpha,
+            taus: vec![1.3, 1.5],
+            alpha_eos: vec![],
+            diff_exps: vec![],
+            mul_alphas: vec![0.2, 0.5],
+            add_betas: vec![],
+        };
+        // 2 iters x 2 taus x 2 alphas = 8
+        let cfgs = sweep.expand();
+        assert_eq!(cfgs.len(), 8);
+        for c in &cfgs {
+            assert_eq!(c.name, c.id());
+            assert!(matches!(c.solver, SolverSpec::EoFlipMulAlpha { .. }));
+        }
+        assert_eq!(cfgs[0].solver, SolverSpec::EoFlipMulAlpha { tau: 1.3, alpha: 0.2 });
+
+        // 空 mul_alphas なら既定 1 通り。
+        let sweep_empty = ConfigSweep {
+            thetas: vec![],
+            log10_iterations: vec![4],
+            smoothing_kind: SmoothingKind::None,
+            ks: vec![],
+            weights: vec![],
+            solver_kind: SolverKind::EoFlipMulAlpha,
+            taus: vec![1.4],
+            alpha_eos: vec![],
+            diff_exps: vec![],
+            mul_alphas: vec![],
+            add_betas: vec![],
+        };
+        let cfgs_empty = sweep_empty.expand();
+        assert_eq!(cfgs_empty.len(), 1);
+        assert_eq!(
+            cfgs_empty[0].solver,
+            SolverSpec::EoFlipMulAlpha { tau: 1.4, alpha: DEFAULT_EO_FLIP_MUL_ALPHA }
+        );
+    }
+
+    #[test]
+    fn test_config_sweep_expand_eoflip_add_beta() {
+        let sweep = ConfigSweep {
+            thetas: vec![],
+            log10_iterations: vec![4],
+            smoothing_kind: SmoothingKind::None,
+            ks: vec![],
+            weights: vec![],
+            solver_kind: SolverKind::EoFlipAddBeta,
+            taus: vec![1.3, 1.5],
+            alpha_eos: vec![],
+            diff_exps: vec![],
+            mul_alphas: vec![],
+            add_betas: vec![0.5, 1.5],
+        };
+        // 1 iter x 2 taus x 2 betas = 4
+        let cfgs = sweep.expand();
+        assert_eq!(cfgs.len(), 4);
+        for c in &cfgs {
+            assert_eq!(c.name, c.id());
+            assert!(matches!(c.solver, SolverSpec::EoFlipAddBeta { .. }));
+        }
+        assert_eq!(cfgs[0].solver, SolverSpec::EoFlipAddBeta { tau: 1.3, beta: 0.5 });
+
+        // 空 add_betas なら既定 1 通り。
+        let sweep_empty = ConfigSweep {
+            thetas: vec![],
+            log10_iterations: vec![4],
+            smoothing_kind: SmoothingKind::None,
+            ks: vec![],
+            weights: vec![],
+            solver_kind: SolverKind::EoFlipAddBeta,
+            taus: vec![1.4],
+            alpha_eos: vec![],
+            diff_exps: vec![],
+            mul_alphas: vec![],
+            add_betas: vec![],
+        };
+        let cfgs_empty = sweep_empty.expand();
+        assert_eq!(cfgs_empty.len(), 1);
+        assert_eq!(
+            cfgs_empty[0].solver,
+            SolverSpec::EoFlipAddBeta { tau: 1.4, beta: DEFAULT_EO_FLIP_ADD_BETA }
+        );
+    }
+
+    #[test]
+    fn test_config_sweep_expand_eoflip_mul_gamma() {
+        let sweep = ConfigSweep {
+            thetas: vec![],
+            log10_iterations: vec![4, 5],
+            smoothing_kind: SmoothingKind::None,
+            ks: vec![],
+            weights: vec![],
+            solver_kind: SolverKind::EoFlipMulGamma,
+            taus: vec![1.3, 1.5],
+            alpha_eos: vec![],
+            diff_exps: vec![],
+            mul_alphas: vec![],
+            add_betas: vec![],
+        };
+        // 2 iters x 2 taus = 4（γ はスイープ軸を持たない）。
+        let cfgs = sweep.expand();
+        assert_eq!(cfgs.len(), 4);
+        for c in &cfgs {
+            assert_eq!(c.name, c.id());
+            assert!(matches!(c.solver, SolverSpec::EoFlipMulGamma { .. }));
+        }
+        assert_eq!(cfgs[0].solver, SolverSpec::EoFlipMulGamma { tau: 1.3 });
+        assert_eq!(cfgs[0].id(), "eoflipmulgamma_iter4_tau1p3");
     }
 }

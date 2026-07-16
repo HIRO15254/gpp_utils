@@ -6,7 +6,9 @@
 //! 実行: `cargo run --release --example gen_baseline > tests/data/regression_baseline.json`
 
 use gpp_utils::graph_spec::{GraphKind, GraphSpec, StoredGraph};
-use gpp_utils::run_config::{RunConfig, SmoothingSpec, SolverSpec};
+use gpp_utils::run_config::{
+    RunConfig, SmoothingSpec, SolverSpec, DEFAULT_EO_FLIP_ALPHA, DEFAULT_EO_FLIP_DIFF_EXP,
+};
 use gpp_utils::run_executor::execute;
 use rayon::prelude::*;
 use serde::Serialize;
@@ -154,7 +156,11 @@ fn main() {
                 cfg.theta = None;
                 cfg.smoothing = SmoothingSpec::None;
                 cfg.log10_iterations = 3;
-                cfg.solver = SolverSpec::EoFlip { tau };
+                cfg.solver = SolverSpec::EoFlip {
+                    tau,
+                    alpha_eo: DEFAULT_EO_FLIP_ALPHA,
+                    diff_exp: DEFAULT_EO_FLIP_DIFF_EXP,
+                };
                 let r = execute(spec, &cfg, prob, seed);
                 let records: Vec<_> = r
                     .records

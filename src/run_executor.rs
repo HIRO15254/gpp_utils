@@ -26,7 +26,7 @@ use rand_mt::Mt19937GenRand64;
 use serde::{Deserialize, Serialize};
 
 use crate::file_utils::{ensure_dir_exists, load_json, save_json};
-use crate::graph_partition::{get_partition_sizes, GraphPartitionProblem, Partition, ALPHA};
+use crate::graph_partition::{get_partition_sizes, GraphPartitionProblem, Partition};
 use crate::graph_spec::GraphSpec;
 use crate::optimization::Problem;
 use crate::run_config::{RunConfig, SmoothingSpec, SolverSpec};
@@ -745,16 +745,8 @@ fn run_eo(
         // --- 適応度 λ を全頂点について計算（cuts_at から O(N)）---
         // PHASE 2: 毎ステップの全ソートは O(N log N)。順序統計木/ヒープで λ を保持し、
         // スワップで変化する v1,v2 とその隣接頂点の λ のみ局所更新すれば O(deg log N) にできる。
-        let lambdas: Vec<f64> = (0..n)
-            .map(|v| {
-                let deg = degrees[v];
-                if deg == 0 {
-                    1.0
-                } else {
-                    (deg as f64 - cuts_at[v] as f64) / deg as f64
-                }
-            })
-            .collect();
+        let lambdas: Vec<f64> =
+            (0..n).map(|v| swap_fitness(degrees[v], cuts_at[v])).collect();
 
         // λ 昇順ランク（order[0] = 最悪 = ランク 1）。
         let mut order: Vec<usize> = (0..n).collect();
@@ -835,6 +827,17 @@ fn run_eo(
     (best, records)
 }
 
+/// スワップ版 EO の次数正規化適応度 `λ0 = g/deg = (deg - cuts)/deg`（孤立頂点は 1.0）。
+/// `run_eo` の λ 計算そのものであり、フリップ近傍版の新適応度（`eo_flip_lambda_mul_alpha` 等）
+/// でも「λ0 はスワップ版 EO の適応度と同じ」を表す共通部品として使う。
+fn swap_fitness(deg: usize, cuts: i32) -> f64 {
+    if deg == 0 {
+        1.0
+    } else {
+        (deg as f64 - cuts as f64) / deg as f64
+    }
+}
+
 /// べき乗則 CDF から `u ~ U(0,1)` を二分探索してランク（0-indexed）を引く。
 fn draw_rank(cdf: &[f64], rng: &mut Mt19937GenRand64, n: usize) -> usize {
     let u: f64 = rng.r#gen::<f64>();
@@ -851,7 +854,7 @@ fn draw_rank(cdf: &[f64], rng: &mut Mt19937GenRand64, n: usize) -> usize {
 /// flip近傍版 EO の適応度 λ_eff を計算する。
 ///
 /// バランスペナルティを「悪い辺 / 良い辺」として g/deg に織り込む対称版:
-/// - `improvement = α(diff² − diff'²)`（>0: flip でペナルティ減 / <0: 増）、`q = |improvement|`
+/// - `improvement = alpha_eo·(|diff|^p − |diff_after|^p)`（>0: flip でペナルティ減 / <0: 増）、`q = |improvement|`
 /// - `improvement > 0`（多数派側）: `q` を全辺(deg)と悪い辺(b)に足す → `λ_eff = g/(deg+q)`（小さく＝選ばれやすく）
 /// - `improvement < 0`（少数派側）: `q` を全辺(deg)と良い辺(g)に足す → `λ_eff = (g+q)/(deg+q)`（大きく＝守られる）
 /// - `improvement = 0`: 変化なし → `λ_eff = g/deg`
@@ -859,12 +862,16 @@ fn draw_rank(cdf: &[f64], rng: &mut Mt19937GenRand64, n: usize) -> usize {
 ///
 /// `deg = 0` かつ多数派側（q>0）なら `λ_eff = 0/(0+q) = 0` となり、カット0コストの
 /// 自由な是正フリップとして最優先で選ばれる。
-fn eo_flip_lambda(deg: usize, cuts: i32, diff_after: i64, diff: i64) -> f64 {
+///
+/// `alpha_eo`（係数）と `p`（diff の指数）は手選択の内部勾配だけを調整するハイパーパラメータで、
+/// 目的関数 `score = cut + ALPHA·diff²` には影響しない。`p` は分数を取りうるため `|diff|` に対して
+/// 適用する（`diff`/`diff_after` は符号付き）。既定 `alpha_eo = ALPHA(=0.05)`・`p = 2.0` では
+/// `|diff|² = diff²` となり従来の `ALPHA·(diff² − diff_after²)` を byte 完全再現する。
+fn eo_flip_lambda(deg: usize, cuts: i32, diff_after: i64, diff: i64, alpha_eo: f64, p: f64) -> f64 {
     let deg_f = deg as f64;
     let g = deg_f - cuts as f64;
-    let d = diff as f64;
-    let da = diff_after as f64;
-    let improvement = ALPHA * (d * d - da * da);
+    let improvement =
+        alpha_eo * ((diff.abs() as f64).powf(p) - (diff_after.abs() as f64).powf(p));
     let q = improvement.abs();
     let deg_eff = deg_f + q;
     if deg_eff == 0.0 {
@@ -878,13 +885,64 @@ fn eo_flip_lambda(deg: usize, cuts: i32, diff_after: i64, diff: i64) -> f64 {
     }
 }
 
+/// 頂点が現在「多数派集合」（自集合のほうが反対集合より頂点数が多い）に属すかどうか。
+/// 均衡時（`t == f`）はどちらの集合も多数派としない（`false` を返す）。
+fn is_majority_side(in_true: bool, t: usize, f: usize) -> bool {
+    if in_true {
+        t > f
+    } else {
+        f > t
+    }
+}
+
+/// フリップ近傍版 EO の適応度（乗算 α 版）: `λ = λ0 · λ1`。
+///
+/// `λ0` はスワップ版 EO と同じ [`swap_fitness`]。`λ1` は対象頂点が多数派なら `alpha`、
+/// 少数派なら `1.0`（`is_majority` は [`is_majority_side`] で判定）。
+fn eo_flip_lambda_mul_alpha(deg: usize, cuts: i32, is_majority: bool, alpha: f64) -> f64 {
+    let lambda1 = if is_majority { alpha } else { 1.0 };
+    swap_fitness(deg, cuts) * lambda1
+}
+
+/// フリップ近傍版 EO の適応度（加算 β 版）: `λ = β·λ0 + λ1`。
+///
+/// `λ0` は [`eo_flip_lambda_mul_alpha`] と同じ。`λ1` は多数派なら `0.0`、少数派なら `1.0`。
+fn eo_flip_lambda_add_beta(deg: usize, cuts: i32, is_majority: bool, beta: f64) -> f64 {
+    let lambda1 = if is_majority { 0.0 } else { 1.0 };
+    beta * swap_fitness(deg, cuts) + lambda1
+}
+
+/// フリップ近傍版 EO の適応度（乗算 γ 版）: `λ = λ0 · λ1`。
+///
+/// `λ0` は [`eo_flip_lambda_mul_alpha`] と同じ。`λ1` は多数派なら `gamma`
+/// （= 少数派集合の頂点数 / (N/2)、呼び出し側が毎ステップ算出して渡す）、少数派なら `1.0`。
+fn eo_flip_lambda_mul_gamma(deg: usize, cuts: i32, is_majority: bool, gamma: f64) -> f64 {
+    let lambda1 = if is_majority { gamma } else { 1.0 };
+    swap_fitness(deg, cuts) * lambda1
+}
+
+/// [`run_eo_flip`] の適応度計算方式。外部インターフェースは `RunConfig` の
+/// `SolverSpec::EoFlip` / `EoFlipMulAlpha` / `EoFlipAddBeta` / `EoFlipMulGamma` の各 variant で、
+/// `execute()` がこの内部列挙に変換して `run_eo_flip` に渡す（シリアライズはしない）。
+enum EoFlipFitness {
+    /// 既定（従来）方式: [`eo_flip_lambda`]。
+    Legacy { alpha_eo: f64, diff_exp: f64 },
+    /// [`eo_flip_lambda_mul_alpha`]。
+    MulAlpha { alpha: f64 },
+    /// [`eo_flip_lambda_add_beta`]。
+    AddBeta { beta: f64 },
+    /// [`eo_flip_lambda_mul_gamma`]。
+    MulGamma,
+}
+
 /// フリップ近傍版 τ-EO の高速パス。
 ///
 /// SA（`run_sa_*`）と **同一の近傍（単一フリップ）・目的関数（cut + α·diff²）・初期化
 /// （`random_solution`）・ベイスン算出（`make_snapshot_fast` + `hill_climb_real_fast`）**を共有し、
 /// 違いは「内側の1手の選び方」だけ:
-/// 全頂点を [`eo_flip_lambda`] で計算した λ_eff の昇順にランク付けし、べき乗則 `P(k)∝k^{-τ}`
-/// で1頂点を引いて **無条件にフリップ**する（受理判定なし）。最良解 `best` を別途保存して返す。
+/// 全頂点を `fitness`（[`EoFlipFitness`]）で計算した適応度の昇順にランク付けし、
+/// べき乗則 `P(k)∝k^{-τ}` で1頂点を引いて **無条件にフリップ**する（受理判定なし）。
+/// 最良解 `best` を別途保存して返す。
 ///
 /// バランスはペナルティ項で扱う（厳密制約ではない）ため、スワップ版 `run_eo` と異なり
 /// 解は厳密 N/2 にはならない。これにより SA と StepRecord が1対1で比較できる。
@@ -893,6 +951,7 @@ fn run_eo_flip(
     cfg: &RunConfig,
     seed: u64,
     tau: f64,
+    fitness: EoFlipFitness,
 ) -> (Partition, Vec<StepRecord>) {
     let mut rng = Mt19937GenRand64::new(seed);
     // ベイスン山登りのタイブレーク専用 RNG（SA と同一の派生）。
@@ -936,15 +995,39 @@ fn run_eo_flip(
     for it in 1..=max_iter {
         let diff = cur_t as i64 - cur_f as i64;
 
-        // 各頂点の適応度 λ_eff（O(N)）。
-        // PHASE 2: 毎ステップ全ソートは O(N log N)。順序統計木で λ_eff を保持し、
+        // 各頂点の適応度（O(N)）。
+        // PHASE 2: 毎ステップ全ソートは O(N log N)。順序統計木で適応度を保持し、
         // フリップで変化する頂点と隣接頂点だけ局所更新すれば落とせる。
-        let lambdas: Vec<f64> = (0..n)
-            .map(|i| {
-                let diff_after = if current[i] { diff - 2 } else { diff + 2 };
-                eo_flip_lambda(degrees[i], cuts_at[i], diff_after, diff)
-            })
-            .collect();
+        let lambdas: Vec<f64> = match fitness {
+            EoFlipFitness::Legacy { alpha_eo, diff_exp } => (0..n)
+                .map(|i| {
+                    let diff_after = if current[i] { diff - 2 } else { diff + 2 };
+                    eo_flip_lambda(degrees[i], cuts_at[i], diff_after, diff, alpha_eo, diff_exp)
+                })
+                .collect(),
+            EoFlipFitness::MulAlpha { alpha } => (0..n)
+                .map(|i| {
+                    let is_majority = is_majority_side(current[i], cur_t, cur_f);
+                    eo_flip_lambda_mul_alpha(degrees[i], cuts_at[i], is_majority, alpha)
+                })
+                .collect(),
+            EoFlipFitness::AddBeta { beta } => (0..n)
+                .map(|i| {
+                    let is_majority = is_majority_side(current[i], cur_t, cur_f);
+                    eo_flip_lambda_add_beta(degrees[i], cuts_at[i], is_majority, beta)
+                })
+                .collect(),
+            EoFlipFitness::MulGamma => {
+                let minority = cur_t.min(cur_f) as f64;
+                let gamma = minority / (n as f64 / 2.0);
+                (0..n)
+                    .map(|i| {
+                        let is_majority = is_majority_side(current[i], cur_t, cur_f);
+                        eo_flip_lambda_mul_gamma(degrees[i], cuts_at[i], is_majority, gamma)
+                    })
+                    .collect()
+            }
+        };
 
         let mut order: Vec<usize> = (0..n).collect();
         order.sort_by(|&a, &b| lambdas[a].partial_cmp(&lambdas[b]).unwrap());
@@ -1132,7 +1215,18 @@ pub fn execute(
     let sm_seed = seed.wrapping_add(0xDEAD_BEEF);
     let (final_p, records) = match cfg.solver {
         SolverSpec::Eo { tau } => run_eo(prob, cfg, seed, tau),
-        SolverSpec::EoFlip { tau } => run_eo_flip(prob, cfg, seed, tau),
+        SolverSpec::EoFlip { tau, alpha_eo, diff_exp } => {
+            run_eo_flip(prob, cfg, seed, tau, EoFlipFitness::Legacy { alpha_eo, diff_exp })
+        }
+        SolverSpec::EoFlipMulAlpha { tau, alpha } => {
+            run_eo_flip(prob, cfg, seed, tau, EoFlipFitness::MulAlpha { alpha })
+        }
+        SolverSpec::EoFlipAddBeta { tau, beta } => {
+            run_eo_flip(prob, cfg, seed, tau, EoFlipFitness::AddBeta { beta })
+        }
+        SolverSpec::EoFlipMulGamma { tau } => {
+            run_eo_flip(prob, cfg, seed, tau, EoFlipFitness::MulGamma)
+        }
         SolverSpec::SaSwap => run_sa_swap(prob, cfg, seed),
         SolverSpec::Sa => match cfg.smoothing {
             SmoothingSpec::None => run_sa_none(prob, cfg, seed),
@@ -1232,6 +1326,7 @@ impl ResultStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::run_config::{DEFAULT_EO_FLIP_ALPHA, DEFAULT_EO_FLIP_DIFF_EXP};
 
     #[test]
     fn test_log_steps_small() {
@@ -1401,24 +1496,105 @@ mod tests {
         cfg.theta = None;
         cfg.smoothing = SmoothingSpec::None;
         cfg.log10_iterations = log10_iterations;
-        cfg.solver = SolverSpec::EoFlip { tau };
+        cfg.solver = SolverSpec::EoFlip {
+            tau,
+            alpha_eo: DEFAULT_EO_FLIP_ALPHA,
+            diff_exp: DEFAULT_EO_FLIP_DIFF_EXP,
+        };
         cfg
     }
 
-    /// eo_flip_lambda の方向性（多数派は λ_eff 低下、少数派は上昇）と balance時の挙動。
+    /// eo_flip_lambda の方向性（多数派は λ_eff 低下、少数派は上昇）と balance時の挙動（既定 α/p）。
     #[test]
     fn test_eo_flip_lambda_direction() {
+        let (a0, p0) = (DEFAULT_EO_FLIP_ALPHA, DEFAULT_EO_FLIP_DIFF_EXP);
         // diff=10（true集合が多数派）, deg=4, cuts=1 (g=3)
         // 多数派(true): diff_after=8 → improvement>0 → g/(deg+q)
-        let maj = eo_flip_lambda(4, 1, 8, 10);
+        let maj = eo_flip_lambda(4, 1, 8, 10, a0, p0);
         // 少数派(false): diff_after=12 → improvement<0 → (g+q)/(deg+q)
-        let min = eo_flip_lambda(4, 1, 12, 10);
+        let min = eo_flip_lambda(4, 1, 12, 10, a0, p0);
         assert!(maj < min, "多数派の λ_eff は少数派より小さい（選ばれやすい）: maj={maj}, min={min}");
 
         // balance時 (diff=0): どちらも diff_after=±2 → improvement<0、同じ q=4α
-        let a = eo_flip_lambda(4, 1, 2, 0);
-        let b = eo_flip_lambda(4, 1, -2, 0);
+        let a = eo_flip_lambda(4, 1, 2, 0, a0, p0);
+        let b = eo_flip_lambda(4, 1, -2, 0, a0, p0);
         assert!((a - b).abs() < 1e-12, "balance時は左右対称");
+    }
+
+    /// 分数指数 p=0.5・カスタム α_eo の経路が有限で、多数派<少数派の向きと負 diff の abs 対称性を保つ。
+    #[test]
+    fn test_eo_flip_lambda_fractional_exp() {
+        let (a, p) = (0.1_f64, 0.5_f64);
+        // diff=10, deg=4, cuts=1 (g=3)
+        let maj = eo_flip_lambda(4, 1, 8, 10, a, p); // 多数派: improvement>0
+        let min = eo_flip_lambda(4, 1, 12, 10, a, p); // 少数派: improvement<0
+        assert!(maj.is_finite() && min.is_finite(), "分数指数でも有限");
+        assert!(maj < min, "分数指数でも多数派 λ_eff < 少数派: maj={maj}, min={min}");
+
+        // balance時 (diff=0) の左右対称（|±2|^p が等しい）。
+        let l = eo_flip_lambda(4, 1, 2, 0, a, p);
+        let r = eo_flip_lambda(4, 1, -2, 0, a, p);
+        assert!(l.is_finite() && (l - r).abs() < 1e-12, "負 diff も abs で対称: l={l}, r={r}");
+    }
+
+    #[test]
+    fn test_is_majority_side() {
+        // t > f: true 集合が多数派。
+        assert!(is_majority_side(true, 5, 3));
+        assert!(!is_majority_side(false, 5, 3));
+        // f > t: false 集合が多数派。
+        assert!(!is_majority_side(true, 3, 5));
+        assert!(is_majority_side(false, 3, 5));
+        // 均衡時: どちらも多数派ではない。
+        assert!(!is_majority_side(true, 4, 4));
+        assert!(!is_majority_side(false, 4, 4));
+    }
+
+    /// eo_flip_lambda_mul_alpha: 多数派は λ0*alpha、少数派は λ0*1、alpha<1 なら多数派が
+    /// 選ばれやすくなる（λ が小さいほど選ばれやすい）方向を確認する。
+    #[test]
+    fn test_eo_flip_lambda_mul_alpha_direction() {
+        // deg=4, cuts=1 → λ0 = 3/4 = 0.75
+        let maj = eo_flip_lambda_mul_alpha(4, 1, true, 0.5);
+        let min = eo_flip_lambda_mul_alpha(4, 1, false, 0.5);
+        assert!((maj - 0.375).abs() < 1e-12);
+        assert!((min - 0.75).abs() < 1e-12);
+        assert!(maj < min, "alpha<1 では多数派の λ が少数派より小さい: maj={maj}, min={min}");
+
+        // alpha=1（既定）なら多数派/少数派とも λ0 と一致（バイアスなし）。
+        let neutral_maj = eo_flip_lambda_mul_alpha(4, 1, true, 1.0);
+        let neutral_min = eo_flip_lambda_mul_alpha(4, 1, false, 1.0);
+        assert!((neutral_maj - neutral_min).abs() < 1e-12);
+        assert!((neutral_maj - 0.75).abs() < 1e-12);
+    }
+
+    /// eo_flip_lambda_add_beta: 多数派は β*λ0 + 0、少数派は β*λ0 + 1 で、
+    /// 少数派の適応度が常に多数派以上になる（保護される）方向を確認する。
+    #[test]
+    fn test_eo_flip_lambda_add_beta_direction() {
+        // deg=4, cuts=1 → λ0 = 0.75
+        let maj = eo_flip_lambda_add_beta(4, 1, true, 1.0);
+        let min = eo_flip_lambda_add_beta(4, 1, false, 1.0);
+        assert!((maj - 0.75).abs() < 1e-12);
+        assert!((min - 1.75).abs() < 1e-12);
+        assert!(maj < min, "多数派の λ は少数派より小さい（選ばれやすい）: maj={maj}, min={min}");
+    }
+
+    /// eo_flip_lambda_mul_gamma: 均衡時は γ=1 となり多数派/少数派の λ1 が一致する
+    /// （多数派側バイアスなしに退化）。不均衡時は γ<1 で多数派が選ばれやすくなる。
+    #[test]
+    fn test_eo_flip_lambda_mul_gamma_direction() {
+        // deg=4, cuts=1 → λ0 = 0.75。不均衡（gamma=0.5）では多数派 < 少数派。
+        let maj = eo_flip_lambda_mul_gamma(4, 1, true, 0.5);
+        let min = eo_flip_lambda_mul_gamma(4, 1, false, 0.5);
+        assert!((maj - 0.375).abs() < 1e-12);
+        assert!((min - 0.75).abs() < 1e-12);
+        assert!(maj < min, "gamma<1 では多数派の λ が少数派より小さい: maj={maj}, min={min}");
+
+        // 均衡（gamma=1）では差がない。
+        let bal_maj = eo_flip_lambda_mul_gamma(4, 1, true, 1.0);
+        let bal_min = eo_flip_lambda_mul_gamma(4, 1, false, 1.0);
+        assert!((bal_maj - bal_min).abs() < 1e-12);
     }
 
     /// flip版: 決定論 ＋ スナップショット ＋ ベイスンが現在解以下（局所最適）。
@@ -1429,8 +1605,12 @@ mod tests {
         let prob = StoredGraph::generate(spec).problem();
         let cfg = eoflip_cfg(4, 1.4);
 
-        let (p1, r1) = run_eo_flip(&prob, &cfg, 42, 1.4);
-        let (p2, _r2) = run_eo_flip(&prob, &cfg, 42, 1.4);
+        let legacy_fitness = || EoFlipFitness::Legacy {
+            alpha_eo: DEFAULT_EO_FLIP_ALPHA,
+            diff_exp: DEFAULT_EO_FLIP_DIFF_EXP,
+        };
+        let (p1, r1) = run_eo_flip(&prob, &cfg, 42, 1.4, legacy_fitness());
+        let (p2, _r2) = run_eo_flip(&prob, &cfg, 42, 1.4, legacy_fitness());
         assert_eq!(p1, p2, "flip版も決定論的");
         assert_eq!(r1[0].step, 0);
         assert!(!r1.is_empty());
@@ -1455,7 +1635,16 @@ mod tests {
         let spec = GraphSpec { kind: GraphKind::Random, n: 60, d: 4.0, seed: 3 };
         let prob = StoredGraph::generate(spec).problem();
         let cfg = eoflip_cfg(4, 1.4);
-        let (best, _r) = run_eo_flip(&prob, &cfg, 7, 1.4);
+        let (best, _r) = run_eo_flip(
+            &prob,
+            &cfg,
+            7,
+            1.4,
+            EoFlipFitness::Legacy {
+                alpha_eo: DEFAULT_EO_FLIP_ALPHA,
+                diff_exp: DEFAULT_EO_FLIP_DIFF_EXP,
+            },
+        );
         let (t, f) = get_partition_sizes(&best);
         // 完全片側 (0/60) には陥らない。ペナルティ α=0.05 下では概ね均衡近傍。
         let imbalance = (t as i64 - f as i64).abs();
@@ -1469,8 +1658,26 @@ mod tests {
         use crate::graph_spec::{GraphKind, StoredGraph};
         let spec = GraphSpec { kind: GraphKind::Random, n: 60, d: 4.0, seed: 1 };
         let prob = StoredGraph::generate(spec).problem();
-        let (_p1, r_lo) = run_eo_flip(&prob, &eoflip_cfg(3, 1.05), 99, 1.05);
-        let (_p2, r_hi) = run_eo_flip(&prob, &eoflip_cfg(3, 1.9), 99, 1.9);
+        let (_p1, r_lo) = run_eo_flip(
+            &prob,
+            &eoflip_cfg(3, 1.05),
+            99,
+            1.05,
+            EoFlipFitness::Legacy {
+                alpha_eo: DEFAULT_EO_FLIP_ALPHA,
+                diff_exp: DEFAULT_EO_FLIP_DIFF_EXP,
+            },
+        );
+        let (_p2, r_hi) = run_eo_flip(
+            &prob,
+            &eoflip_cfg(3, 1.9),
+            99,
+            1.9,
+            EoFlipFitness::Legacy {
+                alpha_eo: DEFAULT_EO_FLIP_ALPHA,
+                diff_exp: DEFAULT_EO_FLIP_DIFF_EXP,
+            },
+        );
         let lo: Vec<f64> = r_lo.iter().map(|r| r.current_real).collect();
         let hi: Vec<f64> = r_hi.iter().map(|r| r.current_real).collect();
         assert_ne!(lo, hi);
@@ -1486,6 +1693,50 @@ mod tests {
         let r = execute(spec, &cfg, &prob, 42);
         assert!(!r.records.is_empty());
         assert_eq!(r.config.id(), "eoflip_iter2_tau1p4");
+    }
+
+    /// execute() 経由で新 3 適応度（MulAlpha/AddBeta/MulGamma）も動作し、決定論的で
+    /// バランスが完全崩壊しないこと。
+    #[test]
+    fn test_execute_dispatches_eo_flip_new_variants() {
+        use crate::graph_spec::{GraphKind, StoredGraph};
+        let spec = GraphSpec { kind: GraphKind::Random, n: 40, d: 4.0, seed: 0 };
+        let prob = StoredGraph::generate(spec).problem();
+
+        let mut cfg_mul_alpha = RunConfig::new("eoflip-mul-alpha");
+        cfg_mul_alpha.theta = None;
+        cfg_mul_alpha.smoothing = SmoothingSpec::None;
+        cfg_mul_alpha.log10_iterations = 3;
+        cfg_mul_alpha.solver = SolverSpec::EoFlipMulAlpha { tau: 1.4, alpha: 0.3 };
+
+        let mut cfg_add_beta = RunConfig::new("eoflip-add-beta");
+        cfg_add_beta.theta = None;
+        cfg_add_beta.smoothing = SmoothingSpec::None;
+        cfg_add_beta.log10_iterations = 3;
+        cfg_add_beta.solver = SolverSpec::EoFlipAddBeta { tau: 1.4, beta: 1.0 };
+
+        let mut cfg_mul_gamma = RunConfig::new("eoflip-mul-gamma");
+        cfg_mul_gamma.theta = None;
+        cfg_mul_gamma.smoothing = SmoothingSpec::None;
+        cfg_mul_gamma.log10_iterations = 3;
+        cfg_mul_gamma.solver = SolverSpec::EoFlipMulGamma { tau: 1.4 };
+
+        for cfg in [&cfg_mul_alpha, &cfg_add_beta, &cfg_mul_gamma] {
+            let r1 = execute(spec, cfg, &prob, 42);
+            let r2 = execute(spec, cfg, &prob, 42);
+            assert!(!r1.records.is_empty(), "records が空: id={}", cfg.id());
+            assert_eq!(
+                r1.final_partition, r2.final_partition,
+                "同一シードで決定論的: id={}",
+                cfg.id()
+            );
+            let (t, f) = get_partition_sizes(&r1.final_partition);
+            assert!(t > 0 && f > 0, "片側集合が空になってはいけない: id={}", cfg.id());
+        }
+
+        assert_eq!(cfg_mul_alpha.id(), "eoflipmulalpha_iter3_tau1p4_a0p3");
+        assert_eq!(cfg_add_beta.id(), "eoflipaddbeta_iter3_tau1p4_b1");
+        assert_eq!(cfg_mul_gamma.id(), "eoflipmulgamma_iter3_tau1p4");
     }
 
     // ------------------------------------------------------------------

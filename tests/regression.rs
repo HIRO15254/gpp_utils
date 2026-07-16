@@ -11,7 +11,9 @@
 //! - `records` 内の f64 値は 1e-12 許容誤差で比較
 
 use gpp_utils::graph_spec::{GraphSpec, StoredGraph};
-use gpp_utils::run_config::{RunConfig, SmoothingSpec, SolverSpec};
+use gpp_utils::run_config::{
+    RunConfig, SmoothingSpec, SolverSpec, DEFAULT_EO_FLIP_ALPHA, DEFAULT_EO_FLIP_DIFF_EXP,
+};
 use gpp_utils::run_executor::execute;
 use serde::Deserialize;
 
@@ -227,7 +229,11 @@ fn regression_eoflip_final_partition_bitwise_match() {
         cfg.theta = None;
         cfg.smoothing = SmoothingSpec::None;
         cfg.log10_iterations = baseline.log10_iterations;
-        cfg.solver = SolverSpec::EoFlip { tau: entry.tau };
+        cfg.solver = SolverSpec::EoFlip {
+            tau: entry.tau,
+            alpha_eo: DEFAULT_EO_FLIP_ALPHA,
+            diff_exp: DEFAULT_EO_FLIP_DIFF_EXP,
+        };
 
         let result = execute(baseline.graph_spec, &cfg, &prob, entry.seed);
 

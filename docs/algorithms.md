@@ -481,6 +481,56 @@ $$
 用途: スワップ版は論文に忠実な厳密バランス比較用、フリップ版は **SA との直接比較
 （同一ベイスン枠組み）** 用。`τ` の役割は両者共通。
 
+#### 5.3.2 フリップ近傍版の適応度バリエーション（`SolverSpec::EoFlipMulAlpha` / `EoFlipAddBeta` / `EoFlipMulGamma`）
+
+[5.3.1 節](#531-フリップ近傍版-run_eo_flip--solverspeceoflip)の $\lambda^{\text{eff}}$（`alpha_eo`/`diff_exp`
+によるペナルティ内挿版）とは別に、**「λ0 × 多数派/少数派インジケータ λ1」** という単純な形の
+適応度を 3 通り用意している。近傍・目的関数・初期化・ベイスン算出は 5.3.1 節と完全に共有し、
+違いは適応度の式のみ（`run_executor.rs` の `run_eo_flip` が内部 `EoFlipFitness` 列挙で分岐する）。
+
+**共通部品 $\lambda_0$**: スワップ版 EO（5.3 節）と同じ次数正規化適応度
+
+$$
+\lambda_0(i) = \frac{g_i}{\deg_i} = \frac{\deg_i - b_i}{\deg_i} \in [0, 1]
+$$
+
+（`swap_fitness`、孤立頂点は $1.0$）。バランスペナルティは含まない。
+
+**共通部品「多数派/少数派」**: 頂点 $i$ が現在属す集合が、反対集合より頂点数が多ければ
+**多数派**、少なければ**少数派**とする。両集合が同数（$t = f$）のときは、どちらの集合も
+多数派とは扱わない（`is_majority_side`）。
+
+1. **乗算 α 版**（`EoFlipMulAlpha { tau, alpha }`）:
+   $$
+   \lambda_1(i) = \begin{cases} \alpha & (\text{多数派}) \\ 1 & (\text{少数派}) \end{cases}
+   \qquad \lambda(i) = \lambda_0(i) \cdot \lambda_1(i)
+   $$
+   `alpha` の既定値は 1（多数派バイアスなしの中立値、$\lambda = \lambda_0$ に退化）。
+   $\alpha < 1$ で多数派側の適応度が下がり選ばれやすくなる（不均衡是正方向）。
+
+2. **加算 β 版**（`EoFlipAddBeta { tau, beta }`）:
+   $$
+   \lambda_1(i) = \begin{cases} 0 & (\text{多数派}) \\ 1 & (\text{少数派}) \end{cases}
+   \qquad \lambda(i) = \beta \cdot \lambda_0(i) + \lambda_1(i)
+   $$
+   少数派は常に $\lambda \ge 1 >$ 多数派の $\lambda \le \beta$（$\beta \le 1$ のとき）となり、
+   少数派頂点が優先的に保護される。`beta` の既定値は 1。
+
+3. **乗算 γ 版**（`EoFlipMulGamma { tau }`、追加ハイパーパラメータなし）:
+   $$
+   \gamma = \frac{|\text{少数派集合}|}{N/2} \in (0, 1]
+   \qquad
+   \lambda_1(i) = \begin{cases} \gamma & (\text{多数派}) \\ 1 & (\text{少数派}) \end{cases}
+   \qquad \lambda(i) = \lambda_0(i) \cdot \lambda_1(i)
+   $$
+   $\gamma$ は毎ステップ現在の集合サイズから動的に算出する。均衡時（$t=f$）は $\gamma=1$ と
+   なり、多数派/少数派の区別なく $\lambda=\lambda_0$ に退化する（乗算 α 版の $\alpha=1$ と同じ
+   退化先）。不均衡が大きいほど $\gamma$ が小さくなり、多数派側の是正圧力が強まる。
+
+いずれも選択・受理・ベイスン算出は 5.3.1 節と同一（$\lambda$ 昇順ランクをべき乗則で引き、
+無条件フリップ）。`id()` はそれぞれ `eoflipmulalpha_iter{N}_tau{τ}_a{α}` /
+`eoflipaddbeta_iter{N}_tau{τ}_b{β}` / `eoflipmulgamma_iter{N}_tau{τ}` の形式。
+
 ### 5.4 Simulated Quantum Annealing (SQA)
 
 実装: `solvers/simulated_quantum_annealing.rs`
@@ -538,8 +588,11 @@ GUI（`bin/gui.rs`）が回す実験のバックボーン。**プリセット条
   （[5.2.1 節](#521-スワップ近傍版-run_sa_swap--solverspecsaswap)）。
 - `SolverSpec::Eo { tau }`: 厳密バランスのスワップ版 τ-EO `run_eo` を呼ぶ
   （[5.3 節](#53-extremal-optimization-τ-eo)）。
-- `SolverSpec::EoFlip { tau }`: フリップ近傍版 τ-EO `run_eo_flip` を呼ぶ
-  （[5.3.1 節](#531-フリップ近傍版-run_eo_flip--solverspeceoflip)）。SA と同一のベイスン算出を共有する。
+- `SolverSpec::EoFlip { tau, .. }` / `EoFlipMulAlpha { tau, .. }` / `EoFlipAddBeta { tau, .. }` /
+  `EoFlipMulGamma { tau }`: いずれもフリップ近傍版 τ-EO `run_eo_flip` を呼ぶが、内部の適応度
+  計算方式（`EoFlipFitness` 列挙）だけが異なる（[5.3.1 節](#531-フリップ近傍版-run_eo_flip--solverspeceoflip) /
+  [5.3.2 節](#532-フリップ近傍版の適応度バリエーション-solverspeceoflipmulalpha--eoflipaddbeta--eoflipmulgamma)）。
+  SA と同一のベイスン算出を共有する。
 
 ここで使う SA は [5.2 節](#52-焼きなまし法-simulated-annealing)の汎用ソルバーとは
 **別実装**で、`GraphPartitionProblem` に特化して差分評価で高速化したもの。

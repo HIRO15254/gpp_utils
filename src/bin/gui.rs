@@ -21,7 +21,9 @@ use gpp_utils::graph_spec::{
     EXPECTED_DEGREES, GraphKind, GraphLibrary, GraphSpec, NODE_COUNTS, StoredGraph,
 };
 use gpp_utils::run_config::{
-    ConfigSweep, RunConfig, SmoothingKind, SmoothingSpec, SolverKind, SolverSpec, DEFAULT_TAU,
+    ConfigSweep, RunConfig, SmoothingKind, SmoothingSpec, SolverKind, SolverSpec,
+    DEFAULT_EO_FLIP_ADD_BETA, DEFAULT_EO_FLIP_ALPHA, DEFAULT_EO_FLIP_DIFF_EXP,
+    DEFAULT_EO_FLIP_MUL_ALPHA, DEFAULT_TAU,
 };
 use gpp_utils::run_executor::{RunResult, ResultStore, StepRecord};
 
@@ -621,6 +623,10 @@ impl App {
                     weights,
                     solver_kind: SolverKind::Sa,
                     taus: vec![],
+                    alpha_eos: vec![],
+                    diff_exps: vec![],
+                    mul_alphas: vec![],
+                    add_betas: vec![],
                 }
             }
             SolverKind::SaSwap => {
@@ -644,9 +650,17 @@ impl App {
                     weights: vec![],
                     solver_kind: SolverKind::SaSwap,
                     taus: vec![],
+                    alpha_eos: vec![],
+                    diff_exps: vec![],
+                    mul_alphas: vec![],
+                    add_betas: vec![],
                 }
             }
-            SolverKind::Eo | SolverKind::EoFlip => {
+            SolverKind::Eo
+            | SolverKind::EoFlip
+            | SolverKind::EoFlipMulAlpha
+            | SolverKind::EoFlipAddBeta
+            | SolverKind::EoFlipMulGamma => {
                 let taus = parse_num_list::<f64>(&self.sweep_taus);
                 if taus.is_empty() {
                     self.status = "Sweep: specify at least one tau value for EO.".into();
@@ -660,6 +674,10 @@ impl App {
                     weights: vec![],
                     solver_kind: self.sweep_solver,
                     taus,
+                    alpha_eos: vec![],
+                    diff_exps: vec![],
+                    mul_alphas: vec![],
+                    add_betas: vec![],
                 }
             }
         };
@@ -1171,8 +1189,14 @@ impl App {
                     .small()
                     .weak(),
                 );
-                let sweep_is_eo =
-                    matches!(self.sweep_solver, SolverKind::Eo | SolverKind::EoFlip);
+                let sweep_is_eo = matches!(
+                    self.sweep_solver,
+                    SolverKind::Eo
+                        | SolverKind::EoFlip
+                        | SolverKind::EoFlipMulAlpha
+                        | SolverKind::EoFlipAddBeta
+                        | SolverKind::EoFlipMulGamma
+                );
                 // smoothing 軸はプレーン SA（フリップ近傍）のみ。SaSwap は theta のみ。
                 let sweep_show_smoothing = matches!(self.sweep_solver, SolverKind::Sa);
                 egui::Grid::new("sweep_grid")
@@ -1186,6 +1210,9 @@ impl App {
                                 SolverKind::SaSwap => "SA swap",
                                 SolverKind::Eo => "EO swap (tau)",
                                 SolverKind::EoFlip => "EO flip (tau)",
+                                SolverKind::EoFlipMulAlpha => "EO flip mul-alpha (tau)",
+                                SolverKind::EoFlipAddBeta => "EO flip add-beta (tau)",
+                                SolverKind::EoFlipMulGamma => "EO flip mul-gamma (tau)",
                             })
                             .show_ui(ui, |ui| {
                                 ui.selectable_value(
@@ -1207,6 +1234,21 @@ impl App {
                                     &mut self.sweep_solver,
                                     SolverKind::EoFlip,
                                     "EO flip (tau)",
+                                );
+                                ui.selectable_value(
+                                    &mut self.sweep_solver,
+                                    SolverKind::EoFlipMulAlpha,
+                                    "EO flip mul-alpha (tau)",
+                                );
+                                ui.selectable_value(
+                                    &mut self.sweep_solver,
+                                    SolverKind::EoFlipAddBeta,
+                                    "EO flip add-beta (tau)",
+                                );
+                                ui.selectable_value(
+                                    &mut self.sweep_solver,
+                                    SolverKind::EoFlipMulGamma,
+                                    "EO flip mul-gamma (tau)",
                                 );
                             });
                         ui.end_row();
@@ -1358,7 +1400,16 @@ impl App {
                                 SolverSpec::Sa => "SA (flip)".to_string(),
                                 SolverSpec::SaSwap => "SA swap".to_string(),
                                 SolverSpec::Eo { tau } => format!("EO swap (tau={:.2})", tau),
-                                SolverSpec::EoFlip { tau } => format!("EO flip (tau={:.2})", tau),
+                                SolverSpec::EoFlip { tau, .. } => format!("EO flip (tau={:.2})", tau),
+                                SolverSpec::EoFlipMulAlpha { tau, alpha } => {
+                                    format!("EO flip mul-alpha (tau={:.2}, alpha={:.2})", tau, alpha)
+                                }
+                                SolverSpec::EoFlipAddBeta { tau, beta } => {
+                                    format!("EO flip add-beta (tau={:.2}, beta={:.2})", tau, beta)
+                                }
+                                SolverSpec::EoFlipMulGamma { tau } => {
+                                    format!("EO flip mul-gamma (tau={:.2})", tau)
+                                }
                             };
                             egui::ComboBox::from_id_salt(format!("solver_{}", idx))
                                 .selected_text(sel_text)
@@ -1399,13 +1450,67 @@ impl App {
                                         .clicked()
                                         && !matches!(cfg.solver, SolverSpec::EoFlip { .. })
                                     {
-                                        cfg.solver = SolverSpec::EoFlip { tau: DEFAULT_TAU };
+                                        cfg.solver = SolverSpec::EoFlip {
+                                            tau: DEFAULT_TAU,
+                                            alpha_eo: DEFAULT_EO_FLIP_ALPHA,
+                                            diff_exp: DEFAULT_EO_FLIP_DIFF_EXP,
+                                        };
+                                    }
+                                    if ui
+                                        .selectable_label(
+                                            matches!(cfg.solver, SolverSpec::EoFlipMulAlpha { .. }),
+                                            "EO flip mul-alpha (lambda0 * alpha on majority)",
+                                        )
+                                        .clicked()
+                                        && !matches!(cfg.solver, SolverSpec::EoFlipMulAlpha { .. })
+                                    {
+                                        cfg.solver = SolverSpec::EoFlipMulAlpha {
+                                            tau: DEFAULT_TAU,
+                                            alpha: DEFAULT_EO_FLIP_MUL_ALPHA,
+                                        };
+                                    }
+                                    if ui
+                                        .selectable_label(
+                                            matches!(cfg.solver, SolverSpec::EoFlipAddBeta { .. }),
+                                            "EO flip add-beta (beta*lambda0 + indicator)",
+                                        )
+                                        .clicked()
+                                        && !matches!(cfg.solver, SolverSpec::EoFlipAddBeta { .. })
+                                    {
+                                        cfg.solver = SolverSpec::EoFlipAddBeta {
+                                            tau: DEFAULT_TAU,
+                                            beta: DEFAULT_EO_FLIP_ADD_BETA,
+                                        };
+                                    }
+                                    if ui
+                                        .selectable_label(
+                                            matches!(cfg.solver, SolverSpec::EoFlipMulGamma { .. }),
+                                            "EO flip mul-gamma (lambda0 * dynamic minority ratio)",
+                                        )
+                                        .clicked()
+                                        && !matches!(cfg.solver, SolverSpec::EoFlipMulGamma { .. })
+                                    {
+                                        cfg.solver = SolverSpec::EoFlipMulGamma { tau: DEFAULT_TAU };
                                     }
                                 });
-                            if let SolverSpec::Eo { tau } | SolverSpec::EoFlip { tau } =
-                                &mut cfg.solver
+                            if let SolverSpec::Eo { tau }
+                            | SolverSpec::EoFlip { tau, .. }
+                            | SolverSpec::EoFlipMulAlpha { tau, .. }
+                            | SolverSpec::EoFlipAddBeta { tau, .. }
+                            | SolverSpec::EoFlipMulGamma { tau } = &mut cfg.solver
                             {
                                 ui.add(egui::Slider::new(tau, 1.0..=2.0).text("tau"));
+                            }
+                            match &mut cfg.solver {
+                                SolverSpec::EoFlipMulAlpha { alpha, .. } => {
+                                    ui.add(
+                                        egui::DragValue::new(alpha).speed(0.01).prefix("alpha="),
+                                    );
+                                }
+                                SolverSpec::EoFlipAddBeta { beta, .. } => {
+                                    ui.add(egui::DragValue::new(beta).speed(0.01).prefix("beta="));
+                                }
+                                _ => {}
                             }
                         });
 
