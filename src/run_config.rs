@@ -160,19 +160,6 @@ pub enum EoFlipFitnessSpec {
 }
 
 impl EoFlipFitnessSpec {
-    /// トレース出力・分析で使う一意なラベル（例: `legacy_a0p064_p2` / `mulalpha_a0p1` /
-    /// `addbeta_b1` / `mulgamma`）。
-    pub fn label(&self) -> String {
-        match self {
-            Self::Legacy { alpha_eo, diff_exp } => {
-                format!("legacy_a{}_p{}", fmt_hyper(*alpha_eo), fmt_hyper(*diff_exp))
-            }
-            Self::MulAlpha { alpha } => format!("mulalpha_a{}", fmt_hyper(*alpha)),
-            Self::AddBeta { beta } => format!("addbeta_b{}", fmt_hyper(*beta)),
-            Self::MulGamma => "mulgamma".into(),
-        }
-    }
-
     /// `SolverSpec` から適応度部分を抜き出す（EoFlip 系でなければ `None`）。
     pub fn from_solver(solver: &SolverSpec) -> Option<Self> {
         match *solver {

@@ -470,7 +470,6 @@ impl App {
             config_sweep: None,
             seed_start: self.start_seed,
             seed_count: self.num_seeds,
-            flip_trace: None,
         };
         let graph_dir = self.library.base_dir.clone();
         let store_dir = self.store.base_dir.clone();
@@ -569,7 +568,6 @@ impl App {
             config_sweep: None,
             seed_start: self.start_seed,
             seed_count: self.num_seeds,
-            flip_trace: None,
         };
         let path = Path::new(BATCH_FILE);
         if let Some(parent) = path.parent() {

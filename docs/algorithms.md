@@ -570,26 +570,6 @@ $$
 id サフィックス `_tierand` は削除済み。旧 JSON に残る `eo_tie_break` フィールドは
 未知フィールドとして無視される）。
 
-#### 5.3.4 フリップ選択トレース（`BatchSpec::flip_trace`）
-
-EoFlip 系ソルバー限定の計装。バッチ定義に `flip_trace: { probes: [...] }` を
-指定すると、各ジョブが結果 JSON に加えて `seed_<seed>_trace.json` を保存する
-（`ResultStore::save_trace`）。トレースは乱数を消費しないため、**有無にかかわらず
-軌道・records はバイト一致**する。中身は 2 種類:
-
-1. **ディケード別カウンタ**（`FlipDecadeStats`、毎ステップ O(1)〜O(N)）:
-   抽選ランク分布・選択頂点の多数派/少数派・Δcut/Δ|diff| の符号内訳・
-   lag-1/2 再フリップ率・λ の tie 幅ヒストグラム・頂点別フリップ回数など。
-2. **シャドープローブ**（`FlipProbeStats`、対数刻みステップのみ）: 軌道を
-   変えずに `probes` の各適応度（[`EoFlipFitnessSpec`]）で同一状態の λ を計算し、
-   実際の選択との一致（同じ抽選 k で同じ頂点か）・bottom-8/32 Jaccard・
-   Kendall τ_b を記録する。順位付けの規約（昇順・安定ソート）は本体と共通の
-   `compute_eo_flip_lambdas` を使うため一致が保証される。
-
-既存結果ディレクトリに対して実行するとスキップ判定と干渉するため、トレース実験は
-`cli --out` で別ストア（例: `data/results_flip_trace`）を指定するのが前提。
-利用例は `experiments_iter8/make_flip_selection_trace.py` を参照。
-
 ### 5.4 Simulated Quantum Annealing (SQA)
 
 実装: `solvers/simulated_quantum_annealing.rs`
