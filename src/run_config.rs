@@ -144,8 +144,7 @@ impl Default for SolverSpec {
 
 /// EoFlip 系ソルバーの適応度計算方式（τ を含まない）。
 ///
-/// フリップ選択トレース（`BatchSpec::flip_trace`）のシャドープローブ指定と、
-/// `run_eo_flip` 内部のディスパッチの両方に使う。τ はランク抽選側のパラメータで
+/// `run_eo_flip` 内部のディスパッチに使う。τ はランク抽選側のパラメータで
 /// 順位付けには関与しないため、ここには含めない。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum EoFlipFitnessSpec {

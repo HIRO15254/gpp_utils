@@ -457,7 +457,8 @@ $O(N \log N)$/反復。フェーズ2では順序統計木/ヒープで $\lambda$
   初期解は `random_solution`（SA と同じ）。バランスは厳密制約ではなくペナルティ項で扱う。
 - **適応度**: $g/\deg$ にバランスペナルティを「悪い辺 / 良い辺」として織り込む対称版。
   頂点 $i$ をフリップしたときの符号付き不均衡 $\text{diff}=t-f$ の変化を $\text{diff}'$ とし、
-  $\text{improvement}_i = \alpha(\text{diff}^2 - \text{diff}'^2)$、$q=|\text{improvement}_i|$ とすると:
+  $\text{improvement}_i = \alpha_{\text{eo}}\bigl(|\text{diff}|^p - |\text{diff}'|^p\bigr)$、
+  $q=|\text{improvement}_i|$ とすると:
 
 $$
 \lambda^{\text{eff}}_i =
@@ -472,6 +473,14 @@ $$
   上がって守られる。$\lambda^{\text{eff}}\in[0,1]$ を保ち暴走しない。孤立頂点は $\deg_i=0$ で
   多数派側なら $\lambda^{\text{eff}}=0/(0+q)=0$（カット0コストの自由な是正フリップとして最優先）、
   $q=0$ なら $1.0$。
+- **ハイパーパラメータ $\alpha_{\text{eo}}$ / $p$**（`SolverSpec::EoFlip { tau, alpha_eo, diff_exp }`）:
+  係数 $\alpha_{\text{eo}}$（既定 `DEFAULT_EO_FLIP_ALPHA` = 0.05、目的関数の `ALPHA` と同値だが
+  独立に管理）と diff の指数 $p$（`diff_exp`、既定 `DEFAULT_EO_FLIP_DIFF_EXP` = 2.0）は
+  **手選択の内部勾配だけを変えるチューニングノブ**であり、目的関数 `score` には一切影響しない。
+  既定値では $|\text{diff}|^2 = \text{diff}^2$ となり従来の $\alpha(\text{diff}^2-\text{diff}'^2)$ を
+  byte 完全再現する。`id()` は既定値なら従来どおり `eoflip_iter{N}_tau{τ}`、非既定のときだけ
+  `_a{α}` / `_p{p}` を（tau→a→p の順で）付ける。旧 JSON（両フィールドなし）は per-field の
+  serde default で既定値が埋まる（後方互換）。
 - **選択・受理**: スワップ版と同じく $\lambda^{\text{eff}}$ 昇順ランクをべき乗則 $P(k)\propto k^{-\tau}$ で
   引き、選ばれた頂点を**無条件にフリップ**。最良解 $S_{\text{best}}$ を別途保存して返す。
 - **ベイスン**: `make_snapshot_fast`（`no_smoothing=true`）＋ `hill_climb_real_fast` ＋
@@ -487,7 +496,9 @@ $$
 [5.3.1 節](#531-フリップ近傍版-run_eo_flip--solverspeceoflip)の $\lambda^{\text{eff}}$（`alpha_eo`/`diff_exp`
 によるペナルティ内挿版）とは別に、**「λ0 × 多数派/少数派インジケータ λ1」** という単純な形の
 適応度を 3 通り用意している。近傍・目的関数・初期化・ベイスン算出は 5.3.1 節と完全に共有し、
-違いは適応度の式のみ（`run_executor.rs` の `run_eo_flip` が内部 `EoFlipFitness` 列挙で分岐する）。
+違いは適応度の式のみ（`run_config.rs` の `EoFlipFitnessSpec` 列挙 = `Legacy` / `MulAlpha` /
+`AddBeta` / `MulGamma` を `run_executor.rs` の `run_eo_flip` が受け取って分岐する。
+`Legacy` が 5.3.1 節の $\lambda^{\text{eff}}$ に対応する）。
 
 **共通部品 $\lambda_0$**: スワップ版 EO（5.3 節）と同じ次数正規化適応度
 
@@ -616,8 +627,9 @@ $\pm 2 J_\perp$ 寄与する。受理は温度 $T$ のメトロポリス基準
 
 実装: `run_executor.rs`、設定は `graph_spec.rs` / `run_config.rs`
 
-GUI（`bin/gui.rs`）が回す実験のバックボーン。**プリセット条件で大量の探索を
-実行し、対数刻みでスナップショットを取ってファイルにキャッシュする**。
+GUI（`bin/gui.rs`）とヘッドレス CLI（`bin/cli.rs`、共通ランナーは `batch.rs`）が回す
+実験のバックボーン。**プリセット条件で大量の探索を実行し、対数刻みで
+スナップショットを取ってファイルにキャッシュする**。
 
 `execute()` は `RunConfig::solver`（`SolverSpec`）でソルバーを分岐する:
 
@@ -627,9 +639,10 @@ GUI（`bin/gui.rs`）が回す実験のバックボーン。**プリセット条
   （[5.2.1 節](#521-スワップ近傍版-run_sa_swap--solverspecsaswap)）。
 - `SolverSpec::Eo { tau }`: 厳密バランスのスワップ版 τ-EO `run_eo` を呼ぶ
   （[5.3 節](#53-extremal-optimization-τ-eo)）。
-- `SolverSpec::EoFlip { tau, .. }` / `EoFlipMulAlpha { tau, .. }` / `EoFlipAddBeta { tau, .. }` /
-  `EoFlipMulGamma { tau }`: いずれもフリップ近傍版 τ-EO `run_eo_flip` を呼ぶが、内部の適応度
-  計算方式（`EoFlipFitness` 列挙）だけが異なる（[5.3.1 節](#531-フリップ近傍版-run_eo_flip--solverspeceoflip) /
+- `SolverSpec::EoFlip { tau, alpha_eo, diff_exp }` / `EoFlipMulAlpha { tau, alpha }` /
+  `EoFlipAddBeta { tau, beta }` / `EoFlipMulGamma { tau }`: いずれもフリップ近傍版 τ-EO
+  `run_eo_flip` を呼ぶが、適応度計算方式（`EoFlipFitnessSpec` 列挙、
+  `EoFlipFitnessSpec::from_solver` で抽出）だけが異なる（[5.3.1 節](#531-フリップ近傍版-run_eo_flip--solverspeceoflip) /
   [5.3.2 節](#532-フリップ近傍版の適応度バリエーション-solverspeceoflipmulalpha--eoflipaddbeta--eoflipmulgamma)）。
   SA と同一のベイスン算出を共有する。
 
@@ -710,9 +723,11 @@ else:       flip_vertex(idx) で unflip     # 対合性を利用して原状復�
 これらは [4 節](#4-スムージング戦略)の各戦略を整数状態上で再実装したもので、
 **RNG 消費順・浮動小数点演算順を元実装と一致させる**ことでビット完全一致を保つ。
 
-並列化: GUI は `(graph, config, seed)` の三つ組ジョブを rayon で並列実行し、
-キャッシュ済みの三つ組はスキップする。シードごとに独立な乱数列なので
-並列実行しても結果は逐次実行とバイト単位で一致する。
+並列化: GUI とヘッドレス CLI（`bin/cli.rs`）は共通のバッチランナー `batch.rs`
+（`run_batch`）を通じて `(graph, config, seed)` の三つ組ジョブを rayon で並列実行し、
+キャッシュ済みの三つ組はスキップする。実行する設定は明示列挙（`BatchSpec::configs`）と
+`ConfigSweep`（温度 / 反復数 / 平滑化 / τ / α_eo / p / α / β の直積展開、`run_config.rs`）の
+連結。シードごとに独立な乱数列なので並列実行しても結果は逐次実行とバイト単位で一致する。
 
 ---
 
@@ -771,6 +786,8 @@ $n$ = 頂点数、$m$ = 辺数、$\bar d = 2m/n$ = 平均次数、$K$ = スム�
 | `solvers/` | 4 ソルバー（5 節） |
 | `experiment.rs` | ベイスン評価 `BasinEvaluator`（汎用 `Smoothing` 経由の山登り） |
 | `graph_spec.rs` | グラフ生成（3 節）と永続化 |
-| `run_config.rs` | SA 実行条件（温度 $\Theta$、反復数、スムージング種別） |
-| `run_executor.rs` | 実験ワークフロー・specialized SA（6 節） |
+| `run_config.rs` | 実行条件（温度 $\Theta$、反復数、スムージング、`SolverSpec` 7 種、`ConfigSweep`） |
+| `run_executor.rs` | 実験ワークフロー・specialized SA / EO（6 節） |
+| `batch.rs` | GUI / CLI 共通のバッチ実行ランナー（rayon 並列・キャッシュスキップ） |
 | `bin/gui.rs` | 実験 GUI |
+| `bin/cli.rs` | ヘッドレスなバッチ実行 CLI（GUI と同一実行パス・同一出力レイアウト） |
