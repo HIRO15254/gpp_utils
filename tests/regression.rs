@@ -234,7 +234,6 @@ fn regression_eoflip_final_partition_bitwise_match() {
             alpha_eo: DEFAULT_EO_FLIP_ALPHA,
             diff_exp: DEFAULT_EO_FLIP_DIFF_EXP,
         };
-
         let result = execute(baseline.graph_spec, &cfg, &prob, entry.seed);
 
         assert_eq!(

@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::graph_partition::GraphPartitionProblem;
 use crate::graph_spec::{GraphLibrary, GraphSpec};
-use crate::run_config::{ConfigSweep, RunConfig};
-use crate::run_executor::{ResultStore, execute};
+use crate::run_config::{ConfigSweep, EoFlipFitnessSpec, RunConfig};
+use crate::run_executor::{FlipTraceSpec, ResultStore, execute_traced};
 
 /// バッチ実行の指定。CLI ではこれを JSON ファイルとして受け取る。
 ///
@@ -35,6 +35,11 @@ pub struct BatchSpec {
     pub seed_start: u64,
     /// シード本数（`seed_start, seed_start+1, ...` を `seed_count` 個実行）。
     pub seed_count: usize,
+    /// フリップ選択トレース指定（任意）。指定すると EoFlip 系ソルバーのジョブで
+    /// `seed_<seed>_trace.json` を追加保存する。既存の結果 JSON・軌道には影響しない。
+    /// 既存結果とのスキップ衝突を避けたい場合は `--out` で別ディレクトリを指定すること。
+    #[serde(default)]
+    pub flip_trace: Option<FlipTraceSpec>,
 }
 
 impl BatchSpec {
@@ -166,7 +171,17 @@ pub fn run_batch<F>(
                 if cancel.load(Ordering::Relaxed) {
                     return;
                 }
-                if skip_existing && store.exists(&job.graph_spec, &job.config, job.seed) {
+                // EoFlip 系ソルバーかつトレース指定ありのジョブだけトレースを取る。
+                let trace_spec = spec
+                    .flip_trace
+                    .as_ref()
+                    .filter(|_| EoFlipFitnessSpec::from_solver(&job.config.solver).is_some());
+                // スキップ条件: 結果があり、かつ（トレース不要 or トレースも既存）。
+                if skip_existing
+                    && store.exists(&job.graph_spec, &job.config, job.seed)
+                    && (trace_spec.is_none()
+                        || store.trace_exists(&job.graph_spec, &job.config, job.seed))
+                {
                     on_event(BatchEvent::Skipped {
                         graph: job.graph_spec.id(),
                         config: job.config.id(),
@@ -175,10 +190,16 @@ pub fn run_batch<F>(
                     return;
                 }
                 let t0 = std::time::Instant::now();
-                let result = execute(job.graph_spec, &job.config, &job.problem, job.seed);
+                let (result, trace) =
+                    execute_traced(job.graph_spec, &job.config, &job.problem, job.seed, trace_spec);
                 let elapsed_s = t0.elapsed().as_secs_f64();
                 if let Err(e) = store.save(&result) {
                     on_event(BatchEvent::SaveError { message: e });
+                }
+                if let Some(tr) = &trace {
+                    if let Err(e) = store.save_trace(&job.graph_spec, &job.config, tr) {
+                        on_event(BatchEvent::SaveError { message: e });
+                    }
                 }
                 on_event(BatchEvent::Done {
                     graph: job.graph_spec.id(),
@@ -199,4 +220,65 @@ pub fn run_batch<F>(
     }
 
     on_event(BatchEvent::Finished);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `flip_trace` フィールドを持たない既存バッチ JSON は None として読める（後方互換）。
+    #[test]
+    fn test_batch_spec_flip_trace_backward_compat() {
+        let json = r#"{
+            "graphs": [{"kind": "Random", "n": 20, "d": 3.0, "seed": 0}],
+            "configs": [],
+            "seed_start": 0,
+            "seed_count": 1
+        }"#;
+        let spec: BatchSpec = serde_json::from_str(json).expect("deserialize");
+        assert!(spec.flip_trace.is_none());
+
+        // flip_trace 付きの JSON も読める。
+        let json_tr = r#"{
+            "graphs": [{"kind": "Random", "n": 20, "d": 3.0, "seed": 0}],
+            "configs": [],
+            "seed_start": 0,
+            "seed_count": 1,
+            "flip_trace": {"probes": [
+                {"Legacy": {"alpha_eo": 0.064, "diff_exp": 2.0}},
+                {"MulAlpha": {"alpha": 0.1}},
+                "MulGamma"
+            ]}
+        }"#;
+        let spec_tr: BatchSpec = serde_json::from_str(json_tr).expect("deserialize with trace");
+        let ft = spec_tr.flip_trace.expect("flip_trace present");
+        assert_eq!(ft.probes.len(), 3);
+        assert_eq!(ft.probes[2], EoFlipFitnessSpec::MulGamma);
+    }
+
+    /// 旧バッチ JSON に残る `eo_tie_break` は未知フィールドとして無視され、
+    /// 展開後の id にも影響しない（tie 規則が 1 本化されたため）。
+    #[test]
+    fn test_legacy_eo_tie_break_field_is_ignored() {
+        let json = r#"{
+            "graphs": [{"kind": "Random", "n": 20, "d": 3.0, "seed": 0}],
+            "config_sweep": {
+                "log10_iterations": [4],
+                "solver_kind": "EoFlipMulGamma",
+                "taus": [1.4]
+            },
+            "seed_start": 0,
+            "seed_count": 1,
+            "eo_tie_break": "CompetitionRandom"
+        }"#;
+        let spec: BatchSpec = serde_json::from_str(json).expect("deserialize");
+        let cfgs = spec.effective_configs();
+        assert_eq!(cfgs.len(), 1);
+        assert_eq!(cfgs[0].id(), "eoflipmulgamma_iter4_tau1p4");
+
+        // 旧 "Index" 指定でも同じ id になる。
+        let json_idx = json.replace("CompetitionRandom", "Index");
+        let spec_idx: BatchSpec = serde_json::from_str(&json_idx).expect("deserialize");
+        assert_eq!(spec_idx.effective_configs()[0].id(), "eoflipmulgamma_iter4_tau1p4");
+    }
 }

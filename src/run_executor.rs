@@ -29,7 +29,7 @@ use crate::file_utils::{ensure_dir_exists, load_json, save_json};
 use crate::graph_partition::{get_partition_sizes, GraphPartitionProblem, Partition};
 use crate::graph_spec::GraphSpec;
 use crate::optimization::Problem;
-use crate::run_config::{RunConfig, SmoothingSpec, SolverSpec};
+use crate::run_config::{EoFlipFitnessSpec, RunConfig, SmoothingSpec, SolverSpec};
 
 /// ベイスン山登りのタイブレーク用 RNG シードを、SA 本体のシードから派生させる際の塩。
 /// SA・スムージングの乱数列と独立にすることで `final_partition` への影響を避ける。
@@ -547,7 +547,7 @@ fn run_sa_weighted(
 ///
 /// `cdf[k-1] = (Σ_{j=1}^{k} j^{-τ}) / (Σ_{j=1}^{n} j^{-τ})`。
 /// `u ~ U(0,1)` を二分探索することでランク k を引ける。
-fn build_power_law_cdf(n: usize, tau: f64) -> Vec<f64> {
+pub(crate) fn build_power_law_cdf(n: usize, tau: f64) -> Vec<f64> {
     let mut cdf = Vec::with_capacity(n);
     let mut cumulative = 0.0;
     for k in 1..=n {
@@ -752,16 +752,14 @@ fn run_eo(
         let mut order: Vec<usize> = (0..n).collect();
         order.sort_by(|&a, &b| lambdas[a].partial_cmp(&lambdas[b]).unwrap());
 
-        // --- 統一ランクから v1 を引く ---
-        let k1 = draw_rank(&cdf, &mut rng, n);
-        let v1 = order[k1];
+        // --- 統一ランクから v1 を引く（同率群は平均化規則で等確率）---
+        let (v1, _k1) = select_eo_rank(&lambdas, &order, &cdf, rng.r#gen::<f64>());
         let set1 = current[v1];
 
         // --- 反対集合から v2 を引く（再抽選上限 → 一様ランダムフォールバック）---
         let mut v2 = None;
         for _ in 0..MAX_RESELECT {
-            let k2 = draw_rank(&cdf, &mut rng, n);
-            let cand = order[k2];
+            let (cand, _k2) = select_eo_rank(&lambdas, &order, &cdf, rng.r#gen::<f64>());
             if current[cand] != set1 {
                 v2 = Some(cand);
                 break;
@@ -838,13 +836,61 @@ fn swap_fitness(deg: usize, cuts: i32) -> f64 {
     }
 }
 
-/// べき乗則 CDF から `u ~ U(0,1)` を二分探索してランク（0-indexed）を引く。
-fn draw_rank(cdf: &[f64], rng: &mut Mt19937GenRand64, n: usize) -> usize {
-    let u: f64 = rng.r#gen::<f64>();
-    match cdf.binary_search_by(|probe| probe.partial_cmp(&u).unwrap()) {
-        Ok(pos) => pos,
-        Err(pos) => pos.min(n - 1),
+/// τ-EO の頂点抽選（**同率群の重みを平均化する最終規則**）。
+///
+/// `order` は λ 昇順（先頭 = 最悪 = 順位 1）に並べた頂点列、`cum` は
+/// [`build_power_law_cdf`] の出力（`cum[k] = Σ_{j≤k} (j+1)^{-τ}` を正規化したもの、
+/// `cum[n-1] = 1`）、`u ∈ [0,1)` は一様乱数。乱数消費は 1 draw のみ。
+///
+/// # 規則
+///
+/// λ が bit 等値の頂点は「同率群」を成す。位置 `[s, e)` を占める同率群について:
+///
+/// ```text
+/// 群の合計重み = Σ_{k=s}^{e-1} w_k        （w_k = (k+1)^{-τ} / Z）
+/// 各メンバーの重み = (Σ_{k=s}^{e-1} w_k) / (e - s)
+/// ```
+///
+/// つまり **同率群が受け取る選択頻度の合計は、その群が同率でなかった場合の合計に等しく、
+/// 群内の各頂点は等頻度**になる。例えば λ が 1-2-2-2-5 位の並びなら、2〜4 位ぶんの
+/// 重み `w₂+w₃+w₄` を同率の 3 頂点で等分する。
+///
+/// 同率が無ければ各群のサイズが 1 なので、素の `P(k) ∝ k^{-τ}` 抽選と厳密に一致する。
+///
+/// 戻り値は `(選択頂点, その昇順位置 0-indexed)`。
+pub(crate) fn select_eo_rank(
+    lambdas: &[f64],
+    order: &[usize],
+    cum: &[f64],
+    u: f64,
+) -> (usize, usize) {
+    let n = order.len();
+    debug_assert!(n > 0);
+    let mut s = 0usize;
+    while s < n {
+        // 同値 λ の極大ブロック [s, e) を切り出す。
+        let mut e = s + 1;
+        while e < n && lambdas[order[e]] == lambdas[order[s]] {
+            e += 1;
+        }
+        let lo = if s == 0 { 0.0 } else { cum[s - 1] };
+        let hi = cum[e - 1];
+        // 最終ブロックは丸め誤差で u ≥ cum[n-1] になっても受け止める。
+        if u < hi || e == n {
+            let m = e - s;
+            let per = (hi - lo) / m as f64;
+            let off = if per > 0.0 {
+                (((u - lo).max(0.0) / per) as usize).min(m - 1)
+            } else {
+                0
+            };
+            let pos = s + off;
+            return (order[pos], pos);
+        }
+        s = e;
     }
+    // ブロック走査は必ず最終ブロックで return するので到達しない。
+    unreachable!("select_eo_rank: ブロック走査が範囲を抜けた (n={}, u={})", n, u)
 }
 
 // ============================================================================
@@ -921,18 +967,404 @@ fn eo_flip_lambda_mul_gamma(deg: usize, cuts: i32, is_majority: bool, gamma: f64
     swap_fitness(deg, cuts) * lambda1
 }
 
-/// [`run_eo_flip`] の適応度計算方式。外部インターフェースは `RunConfig` の
-/// `SolverSpec::EoFlip` / `EoFlipMulAlpha` / `EoFlipAddBeta` / `EoFlipMulGamma` の各 variant で、
-/// `execute()` がこの内部列挙に変換して `run_eo_flip` に渡す（シリアライズはしない）。
-enum EoFlipFitness {
-    /// 既定（従来）方式: [`eo_flip_lambda`]。
-    Legacy { alpha_eo: f64, diff_exp: f64 },
-    /// [`eo_flip_lambda_mul_alpha`]。
-    MulAlpha { alpha: f64 },
-    /// [`eo_flip_lambda_add_beta`]。
-    AddBeta { beta: f64 },
-    /// [`eo_flip_lambda_mul_gamma`]。
-    MulGamma,
+/// 全頂点の EoFlip 適応度 λ を `out` に書き込む（長さは呼び出し側で `n` に揃える）。
+///
+/// [`run_eo_flip`] の本体ループと、フリップ選択トレースのシャドープローブ評価の
+/// 双方が同じ実装を使う（順位付けの定義が一致することを保証する）。
+fn compute_eo_flip_lambdas(
+    fitness: &EoFlipFitnessSpec,
+    current: &Partition,
+    cuts_at: &[i32],
+    degrees: &[usize],
+    cur_t: usize,
+    cur_f: usize,
+    out: &mut [f64],
+) {
+    let n = current.len();
+    let diff = cur_t as i64 - cur_f as i64;
+    match *fitness {
+        EoFlipFitnessSpec::Legacy { alpha_eo, diff_exp } => {
+            for i in 0..n {
+                let diff_after = if current[i] { diff - 2 } else { diff + 2 };
+                out[i] =
+                    eo_flip_lambda(degrees[i], cuts_at[i], diff_after, diff, alpha_eo, diff_exp);
+            }
+        }
+        EoFlipFitnessSpec::MulAlpha { alpha } => {
+            for i in 0..n {
+                let is_majority = is_majority_side(current[i], cur_t, cur_f);
+                out[i] = eo_flip_lambda_mul_alpha(degrees[i], cuts_at[i], is_majority, alpha);
+            }
+        }
+        EoFlipFitnessSpec::AddBeta { beta } => {
+            for i in 0..n {
+                let is_majority = is_majority_side(current[i], cur_t, cur_f);
+                out[i] = eo_flip_lambda_add_beta(degrees[i], cuts_at[i], is_majority, beta);
+            }
+        }
+        EoFlipFitnessSpec::MulGamma => {
+            let minority = cur_t.min(cur_f) as f64;
+            let gamma = minority / (n as f64 / 2.0);
+            for i in 0..n {
+                let is_majority = is_majority_side(current[i], cur_t, cur_f);
+                out[i] = eo_flip_lambda_mul_gamma(degrees[i], cuts_at[i], is_majority, gamma);
+            }
+        }
+    }
+}
+
+// ============================================================================
+// フリップ選択トレース（EoFlip 系専用の計装）
+// ============================================================================
+
+/// フリップ選択トレースの指定（バッチ単位）。
+///
+/// `probes` は「同一状態に対して順位付けを比較する」シャドープローブの適応度設定。
+/// 各スナップショットステップで軌道を変えずに全プローブの λ を計算し、実際の
+/// 選択との一致率・bottom-m Jaccard・Kendall τ_b を記録する（乱数は消費しない）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FlipTraceSpec {
+    #[serde(default)]
+    pub probes: Vec<EoFlipFitnessSpec>,
+}
+
+/// 10 進ディケード（step ∈ [10^d, 10^{d+1}-1]）ごとの選択挙動カウンタ。
+///
+/// すべて「そのディケード内で実行されたステップ」に関する集計で、
+/// `steps = maj+min+bal = dcut_neg+dcut_zero+dcut_pos = ddiff_dec+ddiff_eq+ddiff_inc`。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FlipDecadeStats {
+    /// このディケードで実行したステップ数。
+    pub steps: u64,
+    /// 選択頂点が多数派集合に属していた回数（[`is_majority_side`] 準拠）。
+    pub maj: u64,
+    /// 選択頂点が少数派集合に属していた回数（均衡時を除く）。
+    pub min: u64,
+    /// 均衡状態（t == f、多数派なし）で選択した回数。
+    pub bal: u64,
+    /// フリップでカットが減った / 不変 / 増えた回数。
+    pub dcut_neg: u64,
+    pub dcut_zero: u64,
+    pub dcut_pos: u64,
+    /// フリップで |diff| が減った / 不変 / 増えた回数（|diff| 不変は |±1|→|∓1| 型のみ）。
+    pub ddiff_dec: u64,
+    pub ddiff_eq: u64,
+    pub ddiff_inc: u64,
+    /// 直前（lag-1）/ 2 手前（lag-2）と同一頂点を再フリップした回数（振動検出）。
+    pub lag1: u64,
+    pub lag2: u64,
+    /// 選択頂点と λ が完全一致（bit 等値）する頂点数 w の log2 ビン別ヒストグラム
+    /// （bin = ⌈log2(w)⌉: w=1→0, 2→1, 3-4→2, 5-8→3, …。長さ 16 固定）。
+    pub tie_hist: Vec<u64>,
+    /// 選択頂点の属性和（平均は steps で割る）: 次数・カット辺数・λ0 = g/deg。
+    pub deg_sum: u64,
+    pub cuts_sum: i64,
+    pub lambda0_sum: f64,
+    /// Δcut の総和（平均カット押し上げ/押し下げ）。
+    pub dcut_sum: i64,
+    /// フリップ前 |diff| の総和（バランス軌道）。
+    pub absdiff_sum: u64,
+}
+
+/// tie 幅ヒストグラムのビン数（w ≤ 2^15 = 32768 頂点まで対応）。
+const TIE_HIST_BINS: usize = 16;
+
+/// シャドープローブ 1 設定の全イベント。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlipProbeStats {
+    /// [`EoFlipFitnessSpec::label`]。
+    pub label: String,
+    pub events: Vec<FlipProbeEvent>,
+}
+
+/// スナップショットステップ 1 回分のプローブ測定。
+///
+/// いずれも「実際に走っている適応度」の順位・選択との比較:
+/// - `agree`: 同じ抽選ランク k のもとでプローブも同じ頂点を選んだか
+/// - `jaccard8` / `jaccard32`: 昇順 bottom-8 / bottom-32 集合の Jaccard 係数
+/// - `kendall_b`: λ ベクトル間の Kendall τ_b（tie 補正つき、O(N²) 計算）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlipProbeEvent {
+    pub step: usize,
+    pub agree: bool,
+    pub jaccard8: f64,
+    pub jaccard32: f64,
+    pub kendall_b: f64,
+}
+
+/// フリップ選択トレースの出力（`seed_<seed>_trace.json`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlipSelectionTrace {
+    pub graph_id: String,
+    pub config_id: String,
+    pub seed: u64,
+    /// 頂点数。
+    pub n: usize,
+    pub max_iter: usize,
+    /// この run 自身の適応度ラベル（[`EoFlipFitnessSpec::label`]）。
+    pub fitness_label: String,
+    pub tau: f64,
+    /// ディケード別カウンタ（index d = step ∈ [10^d, 10^{d+1}-1]）。
+    pub decades: Vec<FlipDecadeStats>,
+    /// 抽選ランク k の全期間ヒストグラム（長さ n）。
+    pub rank_hist: Vec<u64>,
+    /// 頂点別フリップ回数の全期間ヒストグラム（長さ n）。集中度指標は分析側で算出。
+    pub flip_counts: Vec<u64>,
+    pub probes: Vec<FlipProbeStats>,
+}
+
+/// Kendall τ_b（tie 補正つき）。O(N²) の全ペア走査。
+///
+/// 分母 0（少なくとも一方が全 tie）のときは 0.0 を返す。
+fn kendall_tau_b(x: &[f64], y: &[f64]) -> f64 {
+    debug_assert_eq!(x.len(), y.len());
+    let n = x.len();
+    let (mut conc, mut disc, mut tie_x, mut tie_y) = (0u64, 0u64, 0u64, 0u64);
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let dx = x[i] - x[j];
+            let dy = y[i] - y[j];
+            let sx = if dx > 0.0 { 1 } else if dx < 0.0 { -1 } else { 0 };
+            let sy = if dy > 0.0 { 1 } else if dy < 0.0 { -1 } else { 0 };
+            match (sx, sy) {
+                (0, 0) => {}
+                (0, _) => tie_x += 1,
+                (_, 0) => tie_y += 1,
+                _ if sx == sy => conc += 1,
+                _ => disc += 1,
+            }
+        }
+    }
+    let denom = (((conc + disc + tie_x) as f64) * ((conc + disc + tie_y) as f64)).sqrt();
+    if denom == 0.0 {
+        0.0
+    } else {
+        (conc as f64 - disc as f64) / denom
+    }
+}
+
+/// 昇順 bottom-m 集合同士の Jaccard 係数（m は n でクリップ）。
+fn bottom_m_jaccard(order_a: &[usize], order_b: &[usize], m: usize) -> f64 {
+    let n = order_a.len();
+    let m = m.min(n);
+    if m == 0 {
+        return 1.0;
+    }
+    let set_a: std::collections::HashSet<usize> = order_a[..m].iter().copied().collect();
+    let inter = order_b[..m].iter().filter(|v| set_a.contains(v)).count();
+    // |A∪B| = 2m - |A∩B|
+    inter as f64 / (2 * m - inter) as f64
+}
+
+/// 値を小数 6 桁へ丸める（トレース JSON の肥大化防止）。
+fn round6(x: f64) -> f64 {
+    (x * 1e6).round() / 1e6
+}
+
+/// [`run_eo_flip`] 内で選択挙動を集計する内部コレクタ。
+///
+/// 乱数を一切消費しないため、トレースの有無で軌道は変わらない。
+struct FlipTraceCollector<'a> {
+    spec: &'a FlipTraceSpec,
+    decades: Vec<FlipDecadeStats>,
+    /// 現在のディケード index と次のディケード開始ステップ。
+    decade_idx: usize,
+    next_decade_start: usize,
+    rank_hist: Vec<u64>,
+    flip_counts: Vec<u64>,
+    prev1: Option<usize>,
+    prev2: Option<usize>,
+    /// プローブ測定を行うステップ（`logarithmic_steps` と同一）。
+    probe_steps: std::iter::Peekable<std::vec::IntoIter<usize>>,
+    probe_events: Vec<Vec<FlipProbeEvent>>,
+    /// プローブ用の再利用バッファ。
+    probe_lambdas: Vec<f64>,
+    probe_order: Vec<usize>,
+}
+
+impl<'a> FlipTraceCollector<'a> {
+    fn new(spec: &'a FlipTraceSpec, n: usize, max_iter: usize) -> Self {
+        let n_decades = {
+            // ディケード数 = ⌊log10(max_iter)⌋ + 1（max_iter=10^6 なら d=0..6 の 7 個）。
+            let mut d = 1;
+            let mut thr = 10usize;
+            while thr <= max_iter {
+                d += 1;
+                thr = match thr.checked_mul(10) {
+                    Some(t) => t,
+                    None => break,
+                };
+            }
+            d
+        };
+        let mut decades = Vec::with_capacity(n_decades);
+        for _ in 0..n_decades {
+            decades.push(FlipDecadeStats { tie_hist: vec![0; TIE_HIST_BINS], ..Default::default() });
+        }
+        Self {
+            spec,
+            decades,
+            decade_idx: 0,
+            next_decade_start: 10,
+            rank_hist: vec![0; n],
+            flip_counts: vec![0; n],
+            prev1: None,
+            prev2: None,
+            probe_steps: logarithmic_steps(max_iter).into_iter().peekable(),
+            probe_events: vec![Vec::new(); spec.probes.len()],
+            probe_lambdas: vec![0.0; n],
+            probe_order: (0..n).collect(),
+        }
+    }
+
+    /// 1 ステップ分のカウンタ更新（フリップ適用前の状態 + delta 計算結果を受け取る）。
+    #[allow(clippy::too_many_arguments)]
+    fn record_step(
+        &mut self,
+        it: usize,
+        k: usize,
+        idx: usize,
+        lambdas: &[f64],
+        current: &Partition,
+        cuts_at: &[i32],
+        degrees: &[usize],
+        cur_cut: i32,
+        cur_t: usize,
+        cur_f: usize,
+        new_cut: i32,
+        new_t: usize,
+        new_f: usize,
+    ) {
+        while it >= self.next_decade_start {
+            self.decade_idx += 1;
+            self.next_decade_start = self.next_decade_start.saturating_mul(10);
+        }
+        let d = &mut self.decades[self.decade_idx];
+        d.steps += 1;
+
+        if cur_t == cur_f {
+            d.bal += 1;
+        } else if is_majority_side(current[idx], cur_t, cur_f) {
+            d.maj += 1;
+        } else {
+            d.min += 1;
+        }
+
+        let dcut = new_cut - cur_cut;
+        match dcut.cmp(&0) {
+            std::cmp::Ordering::Less => d.dcut_neg += 1,
+            std::cmp::Ordering::Equal => d.dcut_zero += 1,
+            std::cmp::Ordering::Greater => d.dcut_pos += 1,
+        }
+        d.dcut_sum += dcut as i64;
+
+        let absdiff_before = (cur_t as i64 - cur_f as i64).unsigned_abs();
+        let absdiff_after = (new_t as i64 - new_f as i64).unsigned_abs();
+        match absdiff_after.cmp(&absdiff_before) {
+            std::cmp::Ordering::Less => d.ddiff_dec += 1,
+            std::cmp::Ordering::Equal => d.ddiff_eq += 1,
+            std::cmp::Ordering::Greater => d.ddiff_inc += 1,
+        }
+        d.absdiff_sum += absdiff_before;
+
+        if self.prev1 == Some(idx) {
+            d.lag1 += 1;
+        }
+        if self.prev2 == Some(idx) {
+            d.lag2 += 1;
+        }
+        self.prev2 = self.prev1;
+        self.prev1 = Some(idx);
+
+        d.deg_sum += degrees[idx] as u64;
+        d.cuts_sum += cuts_at[idx] as i64;
+        d.lambda0_sum += swap_fitness(degrees[idx], cuts_at[idx]);
+
+        // tie 幅（選択頂点の λ と bit 等値の頂点数、自分含む ≥1）。
+        let sel_lambda = lambdas[idx];
+        let w = lambdas.iter().filter(|&&l| l == sel_lambda).count() as u64;
+        let bin = (u64::BITS - (w - 1).leading_zeros()) as usize;
+        d.tie_hist[bin.min(TIE_HIST_BINS - 1)] += 1;
+
+        self.rank_hist[k] += 1;
+        self.flip_counts[idx] += 1;
+    }
+
+    /// スナップショットステップならシャドープローブを評価する（フリップ適用前に呼ぶ）。
+    ///
+    /// `agree` は「本体と同じ乱数 `u` のもとでプローブも同じ頂点を選んだか」
+    /// （プローブ側の λ 順序に対して同じ [`select_eo_rank`] を適用する）。
+    #[allow(clippy::too_many_arguments)]
+    fn maybe_probe(
+        &mut self,
+        it: usize,
+        idx: usize,
+        lambdas: &[f64],
+        order: &[usize],
+        current: &Partition,
+        cuts_at: &[i32],
+        degrees: &[usize],
+        cur_t: usize,
+        cur_f: usize,
+        cdf: &[f64],
+        u: f64,
+    ) {
+        match self.probe_steps.peek() {
+            Some(&want) if it == want => {
+                self.probe_steps.next();
+            }
+            _ => return,
+        }
+        for (pi, probe) in self.spec.probes.iter().enumerate() {
+            compute_eo_flip_lambdas(
+                probe,
+                current,
+                cuts_at,
+                degrees,
+                cur_t,
+                cur_f,
+                &mut self.probe_lambdas,
+            );
+            // 本体と同一の順位付け規約（昇順・安定ソート）。
+            for (i, o) in self.probe_order.iter_mut().enumerate() {
+                *o = i;
+            }
+            let pl = &self.probe_lambdas;
+            self.probe_order
+                .sort_by(|&a, &b| pl[a].partial_cmp(&pl[b]).unwrap());
+            let (sel_p, _) = select_eo_rank(&self.probe_lambdas, &self.probe_order, cdf, u);
+            self.probe_events[pi].push(FlipProbeEvent {
+                step: it,
+                agree: sel_p == idx,
+                jaccard8: round6(bottom_m_jaccard(order, &self.probe_order, 8)),
+                jaccard32: round6(bottom_m_jaccard(order, &self.probe_order, 32)),
+                kendall_b: round6(kendall_tau_b(&self.probe_lambdas, lambdas)),
+            });
+        }
+    }
+
+    /// 集計結果を出力形式へ変換する（graph/config/seed は呼び出し側で埋める）。
+    fn finish(self, n: usize, max_iter: usize, fitness_label: String, tau: f64) -> FlipSelectionTrace {
+        FlipSelectionTrace {
+            graph_id: String::new(),
+            config_id: String::new(),
+            seed: 0,
+            n,
+            max_iter,
+            fitness_label,
+            tau,
+            decades: self.decades,
+            rank_hist: self.rank_hist,
+            flip_counts: self.flip_counts,
+            probes: self
+                .spec
+                .probes
+                .iter()
+                .zip(self.probe_events)
+                .map(|(p, events)| FlipProbeStats { label: p.label(), events })
+                .collect(),
+        }
+    }
 }
 
 /// フリップ近傍版 τ-EO の高速パス。
@@ -940,19 +1372,23 @@ enum EoFlipFitness {
 /// SA（`run_sa_*`）と **同一の近傍（単一フリップ）・目的関数（cut + α·diff²）・初期化
 /// （`random_solution`）・ベイスン算出（`make_snapshot_fast` + `hill_climb_real_fast`）**を共有し、
 /// 違いは「内側の1手の選び方」だけ:
-/// 全頂点を `fitness`（[`EoFlipFitness`]）で計算した適応度の昇順にランク付けし、
+/// 全頂点を `fitness`（[`EoFlipFitnessSpec`]）で計算した適応度の昇順にランク付けし、
 /// べき乗則 `P(k)∝k^{-τ}` で1頂点を引いて **無条件にフリップ**する（受理判定なし）。
 /// 最良解 `best` を別途保存して返す。
 ///
 /// バランスはペナルティ項で扱う（厳密制約ではない）ため、スワップ版 `run_eo` と異なり
 /// 解は厳密 N/2 にはならない。これにより SA と StepRecord が1対1で比較できる。
+///
+/// `trace_spec` を渡すと選択挙動を集計した [`FlipSelectionTrace`] を追加で返す。
+/// トレースは乱数を消費しないため、有無にかかわらず軌道・records はバイト一致する。
 fn run_eo_flip(
     prob: &GraphPartitionProblem,
     cfg: &RunConfig,
     seed: u64,
     tau: f64,
-    fitness: EoFlipFitness,
-) -> (Partition, Vec<StepRecord>) {
+    fitness: EoFlipFitnessSpec,
+    trace_spec: Option<&FlipTraceSpec>,
+) -> (Partition, Vec<StepRecord>, Option<FlipSelectionTrace>) {
     let mut rng = Mt19937GenRand64::new(seed);
     // ベイスン山登りのタイブレーク専用 RNG（SA と同一の派生）。
     let mut tie_rng = Mt19937GenRand64::new(seed ^ TIEBREAK_SALT);
@@ -987,57 +1423,45 @@ fn run_eo_flip(
     ));
 
     if n == 0 {
-        return (best, records);
+        return (best, records, None);
     }
 
     let cdf = build_power_law_cdf(n, tau);
 
-    for it in 1..=max_iter {
-        let diff = cur_t as i64 - cur_f as i64;
+    let mut tracer = trace_spec.map(|ts| FlipTraceCollector::new(ts, n, max_iter));
+    let mut lambdas = vec![0.0f64; n];
+    let mut order: Vec<usize> = (0..n).collect();
 
+    for it in 1..=max_iter {
         // 各頂点の適応度（O(N)）。
         // PHASE 2: 毎ステップ全ソートは O(N log N)。順序統計木で適応度を保持し、
         // フリップで変化する頂点と隣接頂点だけ局所更新すれば落とせる。
-        let lambdas: Vec<f64> = match fitness {
-            EoFlipFitness::Legacy { alpha_eo, diff_exp } => (0..n)
-                .map(|i| {
-                    let diff_after = if current[i] { diff - 2 } else { diff + 2 };
-                    eo_flip_lambda(degrees[i], cuts_at[i], diff_after, diff, alpha_eo, diff_exp)
-                })
-                .collect(),
-            EoFlipFitness::MulAlpha { alpha } => (0..n)
-                .map(|i| {
-                    let is_majority = is_majority_side(current[i], cur_t, cur_f);
-                    eo_flip_lambda_mul_alpha(degrees[i], cuts_at[i], is_majority, alpha)
-                })
-                .collect(),
-            EoFlipFitness::AddBeta { beta } => (0..n)
-                .map(|i| {
-                    let is_majority = is_majority_side(current[i], cur_t, cur_f);
-                    eo_flip_lambda_add_beta(degrees[i], cuts_at[i], is_majority, beta)
-                })
-                .collect(),
-            EoFlipFitness::MulGamma => {
-                let minority = cur_t.min(cur_f) as f64;
-                let gamma = minority / (n as f64 / 2.0);
-                (0..n)
-                    .map(|i| {
-                        let is_majority = is_majority_side(current[i], cur_t, cur_f);
-                        eo_flip_lambda_mul_gamma(degrees[i], cuts_at[i], is_majority, gamma)
-                    })
-                    .collect()
-            }
-        };
+        compute_eo_flip_lambdas(&fitness, &current, &cuts_at, &degrees, cur_t, cur_f, &mut lambdas);
 
-        let mut order: Vec<usize> = (0..n).collect();
+        for (i, o) in order.iter_mut().enumerate() {
+            *o = i;
+        }
         order.sort_by(|&a, &b| lambdas[a].partial_cmp(&lambdas[b]).unwrap());
 
-        let k = draw_rank(&cdf, &mut rng, n);
-        let idx = order[k];
+        // ランク抽選（乱数消費は 1 draw/step）。k は rank_hist 用の昇順位置。
+        let u: f64 = rng.r#gen::<f64>();
+        let (idx, k) = select_eo_rank(&lambdas, &order, &cdf, u);
 
         // 無条件フリップ（受理判定なし）。
         let (nc, nt, nf, _) =
             prob.delta_apply_cached(&current, &cuts_at, idx, cur_cut, cur_t, cur_f);
+
+        // トレース（フリップ適用前の状態で記録。乱数は消費しない）。
+        if let Some(tr) = tracer.as_mut() {
+            tr.record_step(
+                it, k, idx, &lambdas, &current, &cuts_at, &degrees, cur_cut, cur_t, cur_f, nc,
+                nt, nf,
+            );
+            tr.maybe_probe(
+                it, idx, &lambdas, &order, &current, &cuts_at, &degrees, cur_t, cur_f, &cdf, u,
+            );
+        }
+
         prob.flip_vertex(&mut current, &mut cuts_at, idx);
         cur_cut = nc;
         cur_t = nt;
@@ -1079,7 +1503,8 @@ fn run_eo_flip(
         }
     }
 
-    (best, records)
+    let trace = tracer.map(|tr| tr.finish(n, max_iter, fitness.label(), tau));
+    (best, records, trace)
 }
 
 // ============================================================================
@@ -1211,39 +1636,64 @@ pub fn execute(
     prob: &GraphPartitionProblem,
     seed: u64,
 ) -> RunResult {
+    execute_traced(spec, cfg, prob, seed, None).0
+}
+
+/// [`execute`] のトレース対応版。`trace` を渡し、かつソルバーが EoFlip 系のときだけ
+/// [`FlipSelectionTrace`] を追加で返す（それ以外は `None`）。
+/// トレースは乱数を消費しないため `RunResult` は [`execute`] とバイト一致する。
+pub fn execute_traced(
+    spec: GraphSpec,
+    cfg: &RunConfig,
+    prob: &GraphPartitionProblem,
+    seed: u64,
+    trace: Option<&FlipTraceSpec>,
+) -> (RunResult, Option<FlipSelectionTrace>) {
     let t0 = std::time::Instant::now();
     let sm_seed = seed.wrapping_add(0xDEAD_BEEF);
-    let (final_p, records) = match cfg.solver {
-        SolverSpec::Eo { tau } => run_eo(prob, cfg, seed, tau),
-        SolverSpec::EoFlip { tau, alpha_eo, diff_exp } => {
-            run_eo_flip(prob, cfg, seed, tau, EoFlipFitness::Legacy { alpha_eo, diff_exp })
+    let (final_p, records, flip_trace) = match cfg.solver {
+        SolverSpec::Eo { tau } => {
+            let (p, r) = run_eo(prob, cfg, seed, tau);
+            (p, r, None)
         }
-        SolverSpec::EoFlipMulAlpha { tau, alpha } => {
-            run_eo_flip(prob, cfg, seed, tau, EoFlipFitness::MulAlpha { alpha })
+        SolverSpec::EoFlip { tau, .. }
+        | SolverSpec::EoFlipMulAlpha { tau, .. }
+        | SolverSpec::EoFlipAddBeta { tau, .. }
+        | SolverSpec::EoFlipMulGamma { tau } => {
+            let fitness = EoFlipFitnessSpec::from_solver(&cfg.solver)
+                .expect("EoFlip 系 solver は必ず fitness を持つ");
+            run_eo_flip(prob, cfg, seed, tau, fitness, trace)
         }
-        SolverSpec::EoFlipAddBeta { tau, beta } => {
-            run_eo_flip(prob, cfg, seed, tau, EoFlipFitness::AddBeta { beta })
+        SolverSpec::SaSwap => {
+            let (p, r) = run_sa_swap(prob, cfg, seed);
+            (p, r, None)
         }
-        SolverSpec::EoFlipMulGamma { tau } => {
-            run_eo_flip(prob, cfg, seed, tau, EoFlipFitness::MulGamma)
+        SolverSpec::Sa => {
+            let (p, r) = match cfg.smoothing {
+                SmoothingSpec::None => run_sa_none(prob, cfg, seed),
+                SmoothingSpec::KAverage(k) => run_sa_kavg(prob, k, cfg, seed),
+                SmoothingSpec::RandomKAverage(k) => run_sa_random_k(prob, k, sm_seed, cfg, seed),
+                SmoothingSpec::WeightedAverage(w) => run_sa_weighted(prob, w, cfg, seed),
+            };
+            (p, r, None)
         }
-        SolverSpec::SaSwap => run_sa_swap(prob, cfg, seed),
-        SolverSpec::Sa => match cfg.smoothing {
-            SmoothingSpec::None => run_sa_none(prob, cfg, seed),
-            SmoothingSpec::KAverage(k) => run_sa_kavg(prob, k, cfg, seed),
-            SmoothingSpec::RandomKAverage(k) => run_sa_random_k(prob, k, sm_seed, cfg, seed),
-            SmoothingSpec::WeightedAverage(w) => run_sa_weighted(prob, w, cfg, seed),
-        },
     };
     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    RunResult {
+    let result = RunResult {
         graph_spec: spec,
         config: cfg.clone(),
         seed,
         final_partition: final_p,
         records,
         elapsed_ms,
-    }
+    };
+    let flip_trace = flip_trace.map(|mut tr| {
+        tr.graph_id = spec.id();
+        tr.config_id = cfg.id();
+        tr.seed = seed;
+        tr
+    });
+    (result, flip_trace)
 }
 
 /// 結果ストアの管理。
@@ -1280,6 +1730,32 @@ impl ResultStore {
             ensure_dir_exists(parent).map_err(|e| format!("create dir: {}", e))?;
         }
         save_json(result, &p).map_err(|e| format!("save: {}", e))
+    }
+
+    /// フリップ選択トレースのパス（`base/<graph_id>/<config_id>/seed_<seed>_trace.json`）。
+    pub fn trace_path_for(&self, spec: &GraphSpec, cfg: &RunConfig, seed: u64) -> PathBuf {
+        self.base_dir
+            .join(spec.id())
+            .join(cfg.id())
+            .join(format!("seed_{}_trace.json", seed))
+    }
+
+    pub fn trace_exists(&self, spec: &GraphSpec, cfg: &RunConfig, seed: u64) -> bool {
+        self.trace_path_for(spec, cfg, seed).exists()
+    }
+
+    /// フリップ選択トレースを `seed_<seed>_trace.json` として保存する。
+    pub fn save_trace(
+        &self,
+        spec: &GraphSpec,
+        cfg: &RunConfig,
+        trace: &FlipSelectionTrace,
+    ) -> Result<(), String> {
+        let p = self.trace_path_for(spec, cfg, trace.seed);
+        if let Some(parent) = p.parent() {
+            ensure_dir_exists(parent).map_err(|e| format!("create dir: {}", e))?;
+        }
+        save_json(trace, &p).map_err(|e| format!("save trace: {}", e))
     }
 
     /// gnuplot で扱いやすい TSV を出力する。
@@ -1605,12 +2081,12 @@ mod tests {
         let prob = StoredGraph::generate(spec).problem();
         let cfg = eoflip_cfg(4, 1.4);
 
-        let legacy_fitness = || EoFlipFitness::Legacy {
+        let legacy_fitness = || EoFlipFitnessSpec::Legacy {
             alpha_eo: DEFAULT_EO_FLIP_ALPHA,
             diff_exp: DEFAULT_EO_FLIP_DIFF_EXP,
         };
-        let (p1, r1) = run_eo_flip(&prob, &cfg, 42, 1.4, legacy_fitness());
-        let (p2, _r2) = run_eo_flip(&prob, &cfg, 42, 1.4, legacy_fitness());
+        let (p1, r1, _) = run_eo_flip(&prob, &cfg, 42, 1.4, legacy_fitness(), None);
+        let (p2, _r2, _) = run_eo_flip(&prob, &cfg, 42, 1.4, legacy_fitness(), None);
         assert_eq!(p1, p2, "flip版も決定論的");
         assert_eq!(r1[0].step, 0);
         assert!(!r1.is_empty());
@@ -1635,15 +2111,16 @@ mod tests {
         let spec = GraphSpec { kind: GraphKind::Random, n: 60, d: 4.0, seed: 3 };
         let prob = StoredGraph::generate(spec).problem();
         let cfg = eoflip_cfg(4, 1.4);
-        let (best, _r) = run_eo_flip(
+        let (best, _r, _) = run_eo_flip(
             &prob,
             &cfg,
             7,
             1.4,
-            EoFlipFitness::Legacy {
+            EoFlipFitnessSpec::Legacy {
                 alpha_eo: DEFAULT_EO_FLIP_ALPHA,
                 diff_exp: DEFAULT_EO_FLIP_DIFF_EXP,
             },
+            None,
         );
         let (t, f) = get_partition_sizes(&best);
         // 完全片側 (0/60) には陥らない。ペナルティ α=0.05 下では概ね均衡近傍。
@@ -1658,25 +2135,27 @@ mod tests {
         use crate::graph_spec::{GraphKind, StoredGraph};
         let spec = GraphSpec { kind: GraphKind::Random, n: 60, d: 4.0, seed: 1 };
         let prob = StoredGraph::generate(spec).problem();
-        let (_p1, r_lo) = run_eo_flip(
+        let (_p1, r_lo, _) = run_eo_flip(
             &prob,
             &eoflip_cfg(3, 1.05),
             99,
             1.05,
-            EoFlipFitness::Legacy {
+            EoFlipFitnessSpec::Legacy {
                 alpha_eo: DEFAULT_EO_FLIP_ALPHA,
                 diff_exp: DEFAULT_EO_FLIP_DIFF_EXP,
             },
+            None,
         );
-        let (_p2, r_hi) = run_eo_flip(
+        let (_p2, r_hi, _) = run_eo_flip(
             &prob,
             &eoflip_cfg(3, 1.9),
             99,
             1.9,
-            EoFlipFitness::Legacy {
+            EoFlipFitnessSpec::Legacy {
                 alpha_eo: DEFAULT_EO_FLIP_ALPHA,
                 diff_exp: DEFAULT_EO_FLIP_DIFF_EXP,
             },
+            None,
         );
         let lo: Vec<f64> = r_lo.iter().map(|r| r.current_real).collect();
         let hi: Vec<f64> = r_hi.iter().map(|r| r.current_real).collect();
@@ -1872,5 +2351,323 @@ mod tests {
         assert_eq!(r.records[0].step, 0);
         assert_eq!(get_partition_sizes(&r.final_partition), (10, 10));
         assert_eq!(r.config.id(), "eo_iter2_tau1p4");
+    }
+
+    // ------------------------------------------------------------------
+    // フリップ選択トレース
+    // ------------------------------------------------------------------
+
+    /// kendall_tau_b: 完全一致 → 1、完全逆順 → -1、tie 込みの手計算例と一致。
+    #[test]
+    fn test_kendall_tau_b_basics() {
+        let x = [1.0, 2.0, 3.0, 4.0];
+        let y_same = [10.0, 20.0, 30.0, 40.0];
+        let y_rev = [4.0, 3.0, 2.0, 1.0];
+        assert!((kendall_tau_b(&x, &y_same) - 1.0).abs() < 1e-12);
+        assert!((kendall_tau_b(&x, &y_rev) + 1.0).abs() < 1e-12);
+
+        // tie 例: x = [1,2,2,3], y = [1,3,2,4]。
+        // 全 6 ペア中 x-tie は (2,3) の 1 ペア（y は 3≠2 なので tie_x）。
+        // 残り 5 ペアはすべて concordant → τ_b = 5 / sqrt(6*5) ≈ 0.9129。
+        let xt = [1.0, 2.0, 2.0, 3.0];
+        let yt = [1.0, 3.0, 2.0, 4.0];
+        let expect = 5.0 / (6.0f64 * 5.0).sqrt();
+        assert!((kendall_tau_b(&xt, &yt) - expect).abs() < 1e-12);
+
+        // 片方が全 tie → 分母 0 → 0.0。
+        let flat = [7.0, 7.0, 7.0, 7.0];
+        assert_eq!(kendall_tau_b(&x, &flat), 0.0);
+    }
+
+    /// bottom_m_jaccard: 同一 order → 1、素集合 → 0。
+    #[test]
+    fn test_bottom_m_jaccard() {
+        let a = [0usize, 1, 2, 3, 4, 5, 6, 7];
+        let b = [4usize, 5, 6, 7, 0, 1, 2, 3];
+        assert!((bottom_m_jaccard(&a, &a, 4) - 1.0).abs() < 1e-12);
+        assert_eq!(bottom_m_jaccard(&a, &b, 4), 0.0);
+        // m=8 は全体 → 集合として同一 → 1。
+        assert!((bottom_m_jaccard(&a, &b, 8) - 1.0).abs() < 1e-12);
+    }
+
+    /// EoFlipFitnessSpec::label と from_solver の対応。
+    #[test]
+    fn test_eo_flip_fitness_spec_label() {
+        assert_eq!(
+            EoFlipFitnessSpec::Legacy { alpha_eo: 0.064, diff_exp: 2.0 }.label(),
+            "legacy_a0p064_p2"
+        );
+        assert_eq!(EoFlipFitnessSpec::MulAlpha { alpha: 0.1 }.label(), "mulalpha_a0p1");
+        assert_eq!(EoFlipFitnessSpec::AddBeta { beta: 1.0 }.label(), "addbeta_b1");
+        assert_eq!(EoFlipFitnessSpec::MulGamma.label(), "mulgamma");
+        assert_eq!(
+            EoFlipFitnessSpec::from_solver(&SolverSpec::EoFlipMulGamma { tau: 1.2 }),
+            Some(EoFlipFitnessSpec::MulGamma)
+        );
+        assert_eq!(EoFlipFitnessSpec::from_solver(&SolverSpec::Sa), None);
+    }
+
+    /// トレース: 軌道不変（トレース有無で records / best が一致）＋ カウンタ保存則
+    /// ＋ 自己プローブは完全一致（agree 全 true, jaccard=1, τ_b=1）。
+    #[test]
+    fn test_eo_flip_trace_invariants() {
+        use crate::graph_spec::{GraphKind, StoredGraph};
+        let gspec = GraphSpec { kind: GraphKind::Random, n: 40, d: 4.0, seed: 2 };
+        let prob = StoredGraph::generate(gspec).problem();
+        let cfg = eoflip_cfg(3, 1.4);
+        let fitness = EoFlipFitnessSpec::Legacy {
+            alpha_eo: DEFAULT_EO_FLIP_ALPHA,
+            diff_exp: DEFAULT_EO_FLIP_DIFF_EXP,
+        };
+        let trace_spec = FlipTraceSpec {
+            probes: vec![
+                fitness, // 自己プローブ
+                EoFlipFitnessSpec::MulAlpha { alpha: 0.1 },
+                EoFlipFitnessSpec::AddBeta { beta: 1.0 },
+                EoFlipFitnessSpec::MulGamma,
+            ],
+        };
+
+        let (p_plain, r_plain, t_plain) = run_eo_flip(&prob, &cfg, 42, 1.4, fitness, None);
+        let (p_tr, r_tr, t_tr) =
+            run_eo_flip(&prob, &cfg, 42, 1.4, fitness, Some(&trace_spec));
+        assert!(t_plain.is_none());
+        let trace = t_tr.expect("トレース指定ありなら Some");
+
+        // 軌道不変。
+        assert_eq!(p_plain, p_tr, "トレース有無で best が変わってはいけない");
+        assert_eq!(r_plain.len(), r_tr.len());
+        for (a, b) in r_plain.iter().zip(&r_tr) {
+            assert_eq!(a.step, b.step);
+            assert_eq!(a.current_real.to_bits(), b.current_real.to_bits());
+            assert_eq!(a.basin_real_from_real.to_bits(), b.basin_real_from_real.to_bits());
+        }
+
+        // カウンタ保存則: 各分類の合計 = 総ステップ数。
+        let max_iter = cfg.iterations() as u64;
+        let steps: u64 = trace.decades.iter().map(|d| d.steps).sum();
+        assert_eq!(steps, max_iter);
+        let majminbal: u64 = trace.decades.iter().map(|d| d.maj + d.min + d.bal).sum();
+        assert_eq!(majminbal, max_iter);
+        let dcut: u64 =
+            trace.decades.iter().map(|d| d.dcut_neg + d.dcut_zero + d.dcut_pos).sum();
+        assert_eq!(dcut, max_iter);
+        let ddiff: u64 =
+            trace.decades.iter().map(|d| d.ddiff_dec + d.ddiff_eq + d.ddiff_inc).sum();
+        assert_eq!(ddiff, max_iter);
+        let ties: u64 = trace.decades.iter().map(|d| d.tie_hist.iter().sum::<u64>()).sum();
+        assert_eq!(ties, max_iter);
+        assert_eq!(trace.rank_hist.iter().sum::<u64>(), max_iter);
+        assert_eq!(trace.flip_counts.iter().sum::<u64>(), max_iter);
+        // ディケード数 = log10(1000)+1 = 4、最後のディケードは step=1000 の 1 個だけ。
+        assert_eq!(trace.decades.len(), 4);
+        assert_eq!(trace.decades[3].steps, 1);
+
+        // フリップは毎ステップ diff を ±2 変えるので ddiff_eq は |±1|→|∓1| 型のみ。
+        // n=40（偶数）では diff は常に偶数 → ddiff_eq = 0。
+        let ddiff_eq: u64 = trace.decades.iter().map(|d| d.ddiff_eq).sum();
+        assert_eq!(ddiff_eq, 0, "偶数 n では |diff| 不変はあり得ない");
+
+        // 自己プローブ（probes[0]）は完全一致。
+        let self_probe = &trace.probes[0];
+        assert_eq!(self_probe.label, fitness.label());
+        assert!(!self_probe.events.is_empty());
+        for ev in &self_probe.events {
+            assert!(ev.agree, "自己プローブは同じ頂点を選ぶはず (step={})", ev.step);
+            assert!((ev.jaccard8 - 1.0).abs() < 1e-9);
+            assert!((ev.jaccard32 - 1.0).abs() < 1e-9);
+            assert!((ev.kendall_b - 1.0).abs() < 1e-9, "τ_b=1 のはず: {}", ev.kendall_b);
+        }
+        // プローブイベント数 = logarithmic_steps の個数。
+        assert_eq!(self_probe.events.len(), logarithmic_steps(cfg.iterations()).len());
+
+        // 異なる適応度のプローブは（一般に）順位が変わる → どれかで agree=false がある。
+        let any_disagree = trace.probes[1..]
+            .iter()
+            .any(|p| p.events.iter().any(|e| !e.agree));
+        assert!(any_disagree, "異なる適応度で選択が一度も変わらないのは不自然");
+    }
+
+    /// execute_traced: EoFlip 系のみトレースを返し、graph/config/seed が埋まる。
+    /// 非 EoFlip 系（Eo）はトレース指定があっても None。
+    #[test]
+    fn test_execute_traced_dispatch() {
+        use crate::graph_spec::{GraphKind, StoredGraph};
+        let gspec = GraphSpec { kind: GraphKind::Random, n: 20, d: 3.0, seed: 0 };
+        let prob = StoredGraph::generate(gspec).problem();
+        let ts = FlipTraceSpec { probes: vec![EoFlipFitnessSpec::MulGamma] };
+
+        let cfg = eoflip_cfg(2, 1.4);
+        let (r, tr) = execute_traced(gspec, &cfg, &prob, 42, Some(&ts));
+        let tr = tr.expect("EoFlip はトレースを返す");
+        assert_eq!(tr.graph_id, gspec.id());
+        assert_eq!(tr.config_id, cfg.id());
+        assert_eq!(tr.seed, 42);
+        assert_eq!(tr.n, 20);
+        assert_eq!(tr.max_iter, 100);
+        assert_eq!(tr.tau, 1.4);
+        // execute() と結果一致（トレースは軌道に影響しない）。
+        let r_plain = execute(gspec, &cfg, &prob, 42);
+        assert_eq!(r.final_partition, r_plain.final_partition);
+
+        let cfg_eo = eo_cfg(2, 1.4);
+        let (_r2, tr2) = execute_traced(gspec, &cfg_eo, &prob, 42, Some(&ts));
+        assert!(tr2.is_none(), "スワップ版 Eo はトレース対象外");
+    }
+
+    /// 同率が無いときは素の `P(k) ∝ k^{-τ}` 抽選（CDF 二分探索）と厳密一致する。
+    #[test]
+    fn test_select_eo_rank_no_ties_matches_plain_power_law() {
+        let tau = 1.4;
+        let n = 12;
+        let cdf = build_power_law_cdf(n, tau);
+        // 全て相異なる λ。order は昇順（ここでは頂点番号と一致させる）。
+        let lambdas: Vec<f64> = (0..n).map(|i| i as f64 * 0.5).collect();
+        let order: Vec<usize> = (0..n).collect();
+
+        let m = 20_000;
+        for i in 0..m {
+            let u = (i as f64 + 0.5) / m as f64;
+            let (v, pos) = select_eo_rank(&lambdas, &order, &cdf, u);
+            let want = match cdf.binary_search_by(|p| p.partial_cmp(&u).unwrap()) {
+                Ok(k) => k,
+                Err(k) => k.min(n - 1),
+            };
+            assert_eq!(pos, want, "u={u} で位置が旧 draw_rank と不一致");
+            assert_eq!(v, order[pos]);
+        }
+    }
+
+    /// 最終規則の核心（ユーザー指定の 1-2-2-2-5 例）:
+    /// 同率群の合計頻度は「同率でなかった場合の合計」に等しく、群内は等頻度。
+    #[test]
+    fn test_select_eo_rank_tie_group_averaging() {
+        let tau = 1.4;
+        let n = 5;
+        let cdf = build_power_law_cdf(n, tau);
+        // 頂点 1,2,3 が同率 → 昇順位置 1,2,3（= 順位 2,3,4）を占める。
+        let lambdas = [0.1, 0.5, 0.5, 0.5, 0.9];
+        let order = vec![0usize, 1, 2, 3, 4];
+
+        let w = |k: usize| (k as f64).powf(-tau);
+        let z = (1..=n).map(w).sum::<f64>();
+        let group = (w(2) + w(3) + w(4)) / z;
+        let expect = [w(1) / z, group / 3.0, group / 3.0, group / 3.0, w(5) / z];
+
+        let m = 200_000;
+        let mut counts = [0u64; 5];
+        for i in 0..m {
+            let u = (i as f64 + 0.5) / m as f64;
+            let (v, _) = select_eo_rank(&lambdas, &order, &cdf, u);
+            counts[v] += 1;
+        }
+        for v in 0..n {
+            let got = counts[v] as f64 / m as f64;
+            assert!(
+                (got - expect[v]).abs() < 1e-4,
+                "P(v={v}) = {got} が解析値 {} と不一致",
+                expect[v]
+            );
+        }
+        // 群の合計は「同率でなかった場合の 2〜4 位ぶんの合計」に一致。
+        let group_got = (counts[1] + counts[2] + counts[3]) as f64 / m as f64;
+        assert!((group_got - group).abs() < 1e-4, "群合計 {group_got} ≠ {group}");
+        // 群内は等分（格子 u では ±1 カウント以内）。
+        assert!(counts[1].abs_diff(counts[2]) <= 1, "群内は等頻度のはず: {counts:?}");
+        assert!(counts[2].abs_diff(counts[3]) <= 1, "群内は等頻度のはず: {counts:?}");
+    }
+
+    /// 任意の同率構成で「全体の合計 = 1」かつ「各群の合計 = 素の CDF 差分」。
+    #[test]
+    fn test_select_eo_rank_group_totals_preserved() {
+        let tau = 1.1;
+        // 群サイズ [2, 1, 3, 1] → n = 7、群境界の位置は 0,2,3,6。
+        let sizes = [2usize, 1, 3, 1];
+        let n: usize = sizes.iter().sum();
+        let cdf = build_power_law_cdf(n, tau);
+        let mut lambdas = Vec::with_capacity(n);
+        for (gi, &sz) in sizes.iter().enumerate() {
+            for _ in 0..sz {
+                lambdas.push(gi as f64);
+            }
+        }
+        let order: Vec<usize> = (0..n).collect();
+
+        let m = 200_000;
+        let mut counts = vec![0u64; n];
+        for i in 0..m {
+            let u = (i as f64 + 0.5) / m as f64;
+            let (v, pos) = select_eo_rank(&lambdas, &order, &cdf, u);
+            assert_eq!(v, order[pos]);
+            counts[v] += 1;
+        }
+        assert_eq!(counts.iter().sum::<u64>(), m as u64, "全体で 1 になるはず");
+
+        let mut s = 0usize;
+        for &sz in &sizes {
+            let e = s + sz;
+            let lo = if s == 0 { 0.0 } else { cdf[s - 1] };
+            let want = cdf[e - 1] - lo;
+            let got = counts[s..e].iter().sum::<u64>() as f64 / m as f64;
+            assert!(
+                (got - want).abs() < 1e-4,
+                "群 [{s},{e}) の合計 {got} が同率なし時の {want} と不一致"
+            );
+            // 群内は等分。
+            for v in s..e {
+                assert!(counts[v].abs_diff(counts[s]) <= 1, "群内は等頻度: {counts:?}");
+            }
+            s = e;
+        }
+    }
+
+    /// tie が大量に出る設定（AddBeta β=0）でも決定論的で、トレース保存則・
+    /// 自己プローブ一致が維持される。
+    #[test]
+    fn test_eo_flip_tie_heavy_runs() {
+        use crate::graph_spec::{GraphKind, StoredGraph};
+        let gspec = GraphSpec { kind: GraphKind::Random, n: 40, d: 4.0, seed: 2 };
+        let prob = StoredGraph::generate(gspec).problem();
+        let mut cfg = eoflip_cfg(3, 1.4);
+        cfg.solver = SolverSpec::EoFlipAddBeta { tau: 1.4, beta: 0.0 }; // 全ステップ大量 tie
+        let fitness = EoFlipFitnessSpec::AddBeta { beta: 0.0 };
+        let ts = FlipTraceSpec { probes: vec![fitness] };
+
+        let (p1, r1, t1) = run_eo_flip(&prob, &cfg, 42, 1.4, fitness, Some(&ts));
+        let (p2, r2, _) = run_eo_flip(&prob, &cfg, 42, 1.4, fitness, None);
+        assert_eq!(p1, p2, "決定論的（トレース有無でも不変）");
+        assert_eq!(r1.len(), r2.len());
+
+        let tr = t1.expect("trace");
+        let max_iter = cfg.iterations() as u64;
+        assert_eq!(tr.decades.iter().map(|d| d.steps).sum::<u64>(), max_iter);
+        assert_eq!(tr.rank_hist.iter().sum::<u64>(), max_iter);
+        // 自己プローブは同じ u で同じ頂点を選ぶ。
+        for ev in &tr.probes[0].events {
+            assert!(ev.agree, "自己プローブは同じ u で同じ頂点を選ぶ (step={})", ev.step);
+        }
+    }
+
+    /// FlipSelectionTrace の serde round-trip。
+    #[test]
+    fn test_flip_trace_serde_roundtrip() {
+        use crate::graph_spec::{GraphKind, StoredGraph};
+        let gspec = GraphSpec { kind: GraphKind::Random, n: 20, d: 3.0, seed: 1 };
+        let prob = StoredGraph::generate(gspec).problem();
+        let cfg = eoflip_cfg(2, 1.4);
+        let ts = FlipTraceSpec {
+            probes: vec![
+                EoFlipFitnessSpec::Legacy { alpha_eo: 0.064, diff_exp: 2.0 },
+                EoFlipFitnessSpec::MulGamma,
+            ],
+        };
+        let (_r, tr) = execute_traced(gspec, &cfg, &prob, 7, Some(&ts));
+        let tr = tr.unwrap();
+        let json = serde_json::to_string(&tr).unwrap();
+        let back: FlipSelectionTrace = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.config_id, tr.config_id);
+        assert_eq!(back.rank_hist, tr.rank_hist);
+        assert_eq!(back.probes.len(), 2);
+        assert_eq!(back.probes[0].label, "legacy_a0p064_p2");
     }
 }

@@ -1,7 +1,8 @@
 //! τ-Extremal Optimization ソルバー（汎用 `Solver` トレイト版）。
 //!
 //! 各近傍のスムージングスコアを「適応度」として使用し、
-//! べき乗則確率で低適応度の構成要素を選択・変更する。
+//! べき乗則確率で低適応度の構成要素を選択・変更する。同率適応度の扱いは
+//! ワークフロー版と同じ [`crate::run_executor::select_eo_rank`]（平均化規則）を共有する。
 //!
 //! # 注意: これは簡易・汎用版である
 //!
@@ -13,6 +14,7 @@
 //! 忠実版 τ-EO を実行する。本ファイルは比較・教育用の汎用実装として残している。
 
 use crate::optimization::{Problem, Smoothing, Solver, SolverStats};
+use crate::run_executor::{build_power_law_cdf, select_eo_rank};
 use rand::Rng;
 use rand_mt::Mt19937GenRand64;
 
@@ -111,14 +113,9 @@ impl Solver for ExtremalOptimizationSolver {
             let mut indices: Vec<usize> = (0..n).collect();
             indices.sort_by(|&a, &b| fitness[a].partial_cmp(&fitness[b]).unwrap());
 
-            // べき乗則でランクを選択
+            // べき乗則でランクを選択（同率群は `select_eo_rank` の平均化規則で等確率）。
             let u: f64 = rng.r#gen::<f64>();
-            let rank = match cdf.binary_search_by(|probe| probe.partial_cmp(&u).unwrap()) {
-                Ok(pos) => pos,
-                Err(pos) => pos.min(n - 1),
-            };
-
-            let component_id = indices[rank];
+            let (component_id, _rank) = select_eo_rank(&fitness, &indices, &cdf, u);
             current = neighbours[component_id].clone();
             current_smoothed = smoothing.score(problem, &current);
 
@@ -160,21 +157,6 @@ impl Solver for ExtremalOptimizationSolver {
 
         (best, stats)
     }
-}
-
-/// べき乗則 P(k) ∝ k^{-τ} の累積分布関数を構築する（1-indexed ランク）。
-fn build_power_law_cdf(n: usize, tau: f64) -> Vec<f64> {
-    let mut cdf = Vec::with_capacity(n);
-    let mut cumulative = 0.0;
-    for k in 1..=n {
-        cumulative += (k as f64).powf(-tau);
-        cdf.push(cumulative);
-    }
-    let z = cumulative;
-    for val in &mut cdf {
-        *val /= z;
-    }
-    cdf
 }
 
 #[cfg(test)]

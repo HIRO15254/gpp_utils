@@ -142,6 +142,51 @@ impl Default for SolverSpec {
     }
 }
 
+/// EoFlip 系ソルバーの適応度計算方式（τ を含まない）。
+///
+/// フリップ選択トレース（`BatchSpec::flip_trace`）のシャドープローブ指定と、
+/// `run_eo_flip` 内部のディスパッチの両方に使う。τ はランク抽選側のパラメータで
+/// 順位付けには関与しないため、ここには含めない。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum EoFlipFitnessSpec {
+    /// 従来（ペナルティ織り込み）方式。`alpha_eo`・`diff_exp` は [`SolverSpec::EoFlip`] と同じ。
+    Legacy { alpha_eo: f64, diff_exp: f64 },
+    /// 乗算 α 版（[`SolverSpec::EoFlipMulAlpha`]）。
+    MulAlpha { alpha: f64 },
+    /// 加算 β 版（[`SolverSpec::EoFlipAddBeta`]）。
+    AddBeta { beta: f64 },
+    /// 乗算 γ 版（[`SolverSpec::EoFlipMulGamma`]、γ は毎ステップ動的算出）。
+    MulGamma,
+}
+
+impl EoFlipFitnessSpec {
+    /// トレース出力・分析で使う一意なラベル（例: `legacy_a0p064_p2` / `mulalpha_a0p1` /
+    /// `addbeta_b1` / `mulgamma`）。
+    pub fn label(&self) -> String {
+        match self {
+            Self::Legacy { alpha_eo, diff_exp } => {
+                format!("legacy_a{}_p{}", fmt_hyper(*alpha_eo), fmt_hyper(*diff_exp))
+            }
+            Self::MulAlpha { alpha } => format!("mulalpha_a{}", fmt_hyper(*alpha)),
+            Self::AddBeta { beta } => format!("addbeta_b{}", fmt_hyper(*beta)),
+            Self::MulGamma => "mulgamma".into(),
+        }
+    }
+
+    /// `SolverSpec` から適応度部分を抜き出す（EoFlip 系でなければ `None`）。
+    pub fn from_solver(solver: &SolverSpec) -> Option<Self> {
+        match *solver {
+            SolverSpec::EoFlip { alpha_eo, diff_exp, .. } => {
+                Some(Self::Legacy { alpha_eo, diff_exp })
+            }
+            SolverSpec::EoFlipMulAlpha { alpha, .. } => Some(Self::MulAlpha { alpha }),
+            SolverSpec::EoFlipAddBeta { beta, .. } => Some(Self::AddBeta { beta }),
+            SolverSpec::EoFlipMulGamma { .. } => Some(Self::MulGamma),
+            SolverSpec::Sa | SolverSpec::SaSwap | SolverSpec::Eo { .. } => None,
+        }
+    }
+}
+
 /// ソルバーの種別（パラメータを持たない）。sweep で「種別 × 複数 τ」を表すのに使う。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SolverKind {
@@ -1073,6 +1118,27 @@ mod tests {
             cfgs_empty[0].solver,
             SolverSpec::EoFlipAddBeta { tau: 1.4, beta: DEFAULT_EO_FLIP_ADD_BETA }
         );
+    }
+
+    #[test]
+    fn test_eo_id_has_no_tie_suffix() {
+        // tie 規則が 1 本化されたので id にモード接尾辞は付かない。
+        let mut c = RunConfig::new("a");
+        c.theta = None;
+        c.log10_iterations = 6;
+        c.solver = SolverSpec::EoFlipMulGamma { tau: 1.4 };
+        assert_eq!(c.id(), "eoflipmulgamma_iter6_tau1p4");
+
+        let sa = RunConfig::new("a");
+        assert_eq!(sa.id(), "th+0_iter4_none");
+        let mut eo = RunConfig::new("a");
+        eo.solver = SolverSpec::Eo { tau: 1.4 };
+        assert_eq!(eo.id(), "eo_iter4_tau1p4");
+
+        // 旧 JSON に残る `eo_tie_break` は未知フィールドとして無視される（後方互換）。
+        let json = r#"{"name":"x","theta":null,"log10_iterations":5,"smoothing":"None","solver":{"EoFlip":{"tau":1.4}},"eo_tie_break":"CompetitionRandom"}"#;
+        let cfg: RunConfig = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(cfg.id(), "eoflip_iter5_tau1p4");
     }
 
     #[test]
