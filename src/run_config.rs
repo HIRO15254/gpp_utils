@@ -142,6 +142,20 @@ impl Default for SolverSpec {
     }
 }
 
+impl SolverSpec {
+    /// EO 系ソルバーのべき乗則指数 τ（EO 系でなければ `None`）。
+    pub fn tau(&self) -> Option<f64> {
+        match *self {
+            SolverSpec::Eo { tau }
+            | SolverSpec::EoFlip { tau, .. }
+            | SolverSpec::EoFlipMulAlpha { tau, .. }
+            | SolverSpec::EoFlipAddBeta { tau, .. }
+            | SolverSpec::EoFlipMulGamma { tau } => Some(tau),
+            SolverSpec::Sa | SolverSpec::SaSwap => None,
+        }
+    }
+}
+
 /// EoFlip 系ソルバーの適応度計算方式（τ を含まない）。
 ///
 /// `run_eo_flip` 内部のディスパッチに使う。τ はランク抽選側のパラメータで
@@ -159,6 +173,22 @@ pub enum EoFlipFitnessSpec {
 }
 
 impl EoFlipFitnessSpec {
+    /// 解析用の正準ラベル。例: `legacy_a0p064_p2` / `mulalpha_a0p1` / `addbeta_b0` / `mulgamma`。
+    ///
+    /// `RunConfig::id()` とは**異なる**（id は Legacy の既定値 α_eo/p を省略する）。
+    /// 解析側は必ず保存された config から本ラベルを導出し、ディレクトリ名の正規表現には
+    /// 依存しないこと。
+    pub fn label(&self) -> String {
+        match *self {
+            Self::Legacy { alpha_eo, diff_exp } => {
+                format!("legacy_a{}_p{}", fmt_hyper(alpha_eo), fmt_hyper(diff_exp))
+            }
+            Self::MulAlpha { alpha } => format!("mulalpha_a{}", fmt_hyper(alpha)),
+            Self::AddBeta { beta } => format!("addbeta_b{}", fmt_hyper(beta)),
+            Self::MulGamma => "mulgamma".to_string(),
+        }
+    }
+
     /// `SolverSpec` から適応度部分を抜き出す（EoFlip 系でなければ `None`）。
     pub fn from_solver(solver: &SolverSpec) -> Option<Self> {
         match *solver {

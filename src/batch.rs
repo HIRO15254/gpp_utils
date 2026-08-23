@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::graph_partition::GraphPartitionProblem;
 use crate::graph_spec::{GraphLibrary, GraphSpec};
 use crate::run_config::{ConfigSweep, RunConfig};
-use crate::run_executor::{ResultStore, execute};
+use crate::run_executor::{ResultStore, execute_with_states};
 
 /// バッチ実行の指定。CLI ではこれを JSON ファイルとして受け取る。
 ///
@@ -35,6 +35,10 @@ pub struct BatchSpec {
     pub seed_start: u64,
     /// シード本数（`seed_start, seed_start+1, ...` を `seed_count` 個実行）。
     pub seed_count: usize,
+    /// EoFlip 系ランで分割スナップショットを `seed_X_states.json` に保存する（既定 false）。
+    /// 非 EoFlip ソルバーには影響しない。true のとき skip 判定は states ファイルの存在も要求する。
+    #[serde(default)]
+    pub save_states: bool,
 }
 
 impl BatchSpec {
@@ -166,7 +170,16 @@ pub fn run_batch<F>(
                 if cancel.load(Ordering::Relaxed) {
                     return;
                 }
-                if skip_existing && store.exists(&job.graph_spec, &job.config, job.seed) {
+                // save_states 時は EoFlip 系にだけ states ファイルの存在も要求する
+                // （非 EoFlip は states を作らないので結果のみで skip 可能）。
+                let wants_states = spec.save_states
+                    && crate::run_config::EoFlipFitnessSpec::from_solver(&job.config.solver)
+                        .is_some();
+                if skip_existing
+                    && store.exists(&job.graph_spec, &job.config, job.seed)
+                    && (!wants_states
+                        || store.states_exist(&job.graph_spec, &job.config, job.seed))
+                {
                     on_event(BatchEvent::Skipped {
                         graph: job.graph_spec.id(),
                         config: job.config.id(),
@@ -175,10 +188,21 @@ pub fn run_batch<F>(
                     return;
                 }
                 let t0 = std::time::Instant::now();
-                let result = execute(job.graph_spec, &job.config, &job.problem, job.seed);
+                let (result, states) = execute_with_states(
+                    job.graph_spec,
+                    &job.config,
+                    &job.problem,
+                    job.seed,
+                    spec.save_states,
+                );
                 let elapsed_s = t0.elapsed().as_secs_f64();
                 if let Err(e) = store.save(&result) {
                     on_event(BatchEvent::SaveError { message: e });
+                }
+                if let Some(st) = states {
+                    if let Err(e) = store.save_states(&st) {
+                        on_event(BatchEvent::SaveError { message: e });
+                    }
                 }
                 on_event(BatchEvent::Done {
                     graph: job.graph_spec.id(),
@@ -221,6 +245,19 @@ mod tests {
         }"#;
         let spec: BatchSpec = serde_json::from_str(json).expect("deserialize");
         assert_eq!(spec.effective_configs().len(), 0);
+    }
+
+    /// `save_states` を持たない既存バッチ JSON は false として読み込まれる（後方互換）。
+    #[test]
+    fn test_save_states_defaults_false() {
+        let json = r#"{
+            "graphs": [{"kind": "Random", "n": 20, "d": 3.0, "seed": 0}],
+            "configs": [],
+            "seed_start": 0,
+            "seed_count": 1
+        }"#;
+        let spec: BatchSpec = serde_json::from_str(json).expect("deserialize");
+        assert!(!spec.save_states);
     }
 
     /// 旧バッチ JSON に残る `eo_tie_break` は未知フィールドとして無視され、

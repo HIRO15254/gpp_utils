@@ -42,12 +42,17 @@ struct Args {
     /// 既存結果も上書き再計算する（既定は既存結果をスキップ）。
     #[arg(long)]
     overwrite: bool,
+
+    /// EoFlip 系ランで分割スナップショット（seed_X_states.json）も保存する
+    /// （バッチ定義の save_states と OR）。
+    #[arg(long)]
+    save_states: bool,
 }
 
 fn main() -> ExitCode {
     let args = Args::parse();
 
-    let spec: BatchSpec = match load_json(&args.batch) {
+    let mut spec: BatchSpec = match load_json(&args.batch) {
         Ok(s) => s,
         Err(e) => {
             eprintln!(
@@ -58,6 +63,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    spec.save_states |= args.save_states;
 
     let total = spec.total_jobs();
     if total == 0 {

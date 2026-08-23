@@ -4,3 +4,8 @@
 
 # 生成物（グラフライブラリ・実験結果）はリポジトリに含めない
 /data/
+
+# 実験ツールの生成物（make_batches.py / calibrate.py で再生成できる）
+/experiments_sa_eo/batches/
+/experiments_sa_eo/logs/
+/experiments_sa_eo/calibrate.json

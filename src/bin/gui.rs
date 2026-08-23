@@ -470,6 +470,7 @@ impl App {
             config_sweep: None,
             seed_start: self.start_seed,
             seed_count: self.num_seeds,
+            save_states: false,
         };
         let graph_dir = self.library.base_dir.clone();
         let store_dir = self.store.base_dir.clone();
@@ -568,6 +569,7 @@ impl App {
             config_sweep: None,
             seed_start: self.start_seed,
             seed_count: self.num_seeds,
+            save_states: false,
         };
         let path = Path::new(BATCH_FILE);
         if let Some(parent) = path.parent() {
@@ -2206,17 +2208,21 @@ fn average_by_config(results: &[&RunResult]) -> Vec<AveragedSeries> {
             continue;
         }
 
-        // step → (sum of 6 fields, count)
-        let mut by_step: BTreeMap<usize, ([f64; 6], usize)> = BTreeMap::new();
+        // step → (sum of 10 fields, count)。集合サイズ差も平均して四捨五入で戻す。
+        let mut by_step: BTreeMap<usize, ([f64; 10], usize)> = BTreeMap::new();
         for r in &group {
             for rec in &r.records {
-                let entry = by_step.entry(rec.step).or_insert(([0.0; 6], 0));
+                let entry = by_step.entry(rec.step).or_insert(([0.0; 10], 0));
                 entry.0[0] += rec.current_smoothed;
                 entry.0[1] += rec.current_real;
                 entry.0[2] += rec.basin_smoothed_from_smoothed;
                 entry.0[3] += rec.basin_real_from_smoothed;
                 entry.0[4] += rec.basin_smoothed_from_real;
                 entry.0[5] += rec.basin_real_from_real;
+                entry.0[6] += rec.best_real;
+                entry.0[7] += rec.basin_real_from_best;
+                entry.0[8] += rec.basin_diff_from_real as f64;
+                entry.0[9] += rec.basin_diff_from_best as f64;
                 entry.1 += 1;
             }
         }
@@ -2232,6 +2238,10 @@ fn average_by_config(results: &[&RunResult]) -> Vec<AveragedSeries> {
                     basin_real_from_smoothed: sum[3] / nf,
                     basin_smoothed_from_real: sum[4] / nf,
                     basin_real_from_real: sum[5] / nf,
+                    best_real: sum[6] / nf,
+                    basin_real_from_best: sum[7] / nf,
+                    basin_diff_from_real: (sum[8] / nf).round() as i64,
+                    basin_diff_from_best: (sum[9] / nf).round() as i64,
                 }
             })
             .collect();

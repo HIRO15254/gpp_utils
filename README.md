@@ -238,6 +238,7 @@ cargo run --release --bin cli -- --batch <定義>.json [オプション]
 | `--graphs <DIR>` | `data/graphs` | グラフのロード／生成キャッシュ先 |
 | `--threads <N>` | 論理コア数 | 並列ワーカ数 |
 | `--overwrite` | （オフ） | 既存結果も上書き再計算する（既定は既存をスキップ） |
+| `--save-states` | （オフ） | EoFlip 系ランで分割スナップショット（`seed_X_states.json`）も保存する（バッチ定義の `save_states` と OR） |
 
 #### バッチ定義 JSON の書式
 
@@ -278,6 +279,24 @@ cargo run --release --bin cli -- --batch <定義>.json [オプション]
 | `config_sweep` | オブジェクト（任意） | 総当たり展開する指定（下記） |
 | `seed_start` | 整数 | 実行シードの開始値 |
 | `seed_count` | 整数 | シード本数（`seed_start, seed_start+1, …` を `seed_count` 個） |
+| `save_states` | 真偽値（任意、既定 `false`） | EoFlip 系ランで対数刻み時点の分割ビット列を `seed_X_states.json` に保存する（オフラインプローブ用。軌道・結果には影響しない） |
+
+### probe（`cargo run --bin probe`）
+
+`--save-states` で収穫した状態スナップショットに対し、複数の EoFlip 適応度定義の
+λ をオフラインで再計算し、設定ペアごとの順位・選択分布距離（Kendall τ_b、
+選択確率分布の JSD / 全変動距離、bottom-m Jaccard）を step 帯（init/early/mid/late）
+別に集約して CSV に出力する。選択確率は `select_eo_rank` の同率群平均化規則の
+閉形式で厳密に計算される。
+
+```
+cargo run --release --bin probe -- --store <収穫ストア> [--out data/rankdiv_probe]
+  [--specs <JSON>] [--taus 0.8,1.4] [--jaccard-ms 8,32] [--seeds 0,1]
+  [--random-anchor] [--dump-steps 0,100 --dump-src mulgamma]
+```
+
+出力は `pairs_<条件>.csv` / `specs_<条件>.csv` / `vertices.csv`（`--dump-steps` 時）/
+`manifest.json`。解析は `experiments_iter8/analyze_fitness_ranking.py` を参照。
 
 `smoothing`（`SmoothingSpec`）の JSON 表記:
 

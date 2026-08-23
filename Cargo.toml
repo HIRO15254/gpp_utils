@@ -23,6 +23,11 @@ path = "src/bin/gui.rs"
 name = "cli"
 path = "src/bin/cli.rs"
 
+# 収穫済み状態スナップショットへのオフライン順位プローブ。
+[[bin]]
+name = "probe"
+path = "src/bin/probe.rs"
+
 # 実験・ベンチは release で実行する前提の最適化設定。
 # lto + 単一 codegen-unit でクレート横断のインライン化を効かせる。
 [profile.release]
