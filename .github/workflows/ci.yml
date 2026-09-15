@@ -14,8 +14,4 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --all-targets
-      - run: cargo test --release --locked --lib solvers::engine::exact_tests
-      - run: cargo build --release --bin gpp
+      - run: python scripts/check.py

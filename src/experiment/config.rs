@@ -226,6 +226,10 @@ fn default_smoothing() -> Vec<SmoothingSweep> {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
+/// Unvalidated TOML/JSON input, including sweep axes.
+/// Use [`crate::compile_experiment`] before executing or persisting it. Adding a
+/// field requires reviewing normalization, semantic IDs, defaults, and the
+/// versioning/checklist rules in `docs/extending.md`.
 pub struct ExperimentSpec {
     pub schema_version: u32,
     #[serde(default)]

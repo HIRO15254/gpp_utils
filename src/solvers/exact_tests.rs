@@ -5,7 +5,7 @@ use crate::experiment::config::{
 use rand::Rng;
 use std::sync::Arc;
 
-// Executable oracle: byte-for-byte production engine at commit 51577f9.
+// Executable oracle: production engine at 51577f9, with Graph getter adapters.
 mod reference {
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -78,9 +78,9 @@ fn condition_for(
     Condition {
         graph: GraphSpec {
             kind: GraphKind::Random,
-            node_count: graph.node_count,
-            expected_degree: if graph.node_count > 1 {
-                2.0 * graph.edges.len() as f64 / graph.node_count as f64
+            node_count: graph.node_count(),
+            expected_degree: if graph.node_count() > 1 {
+                2.0 * graph.edges().len() as f64 / graph.node_count() as f64
             } else {
                 0.0
             },
@@ -129,7 +129,7 @@ impl crate::fitness::FitnessFactory for FrozenDefaultFactory {
 
 impl crate::fitness::VertexFitness for FrozenDefaultFitness {
     fn values(&self, graph: &Graph, state: &PartitionState) -> crate::error::Result<Vec<f64>> {
-        Ok((0..graph.node_count)
+        Ok((0..graph.node_count())
             .map(|vertex| {
                 let degree = graph.degree(vertex);
                 if degree == 0 {
@@ -312,7 +312,7 @@ fn optimized_default_fitness_matches_original_neighbor_scan_bits() {
         let partition = (0..8).map(|v| bits & (1 << v) != 0).collect();
         let state = PartitionState::new(&g, partition).unwrap();
         let actual = fitness.values(&g, &state).unwrap();
-        let expected: Vec<_> = (0..g.node_count)
+        let expected: Vec<_> = (0..g.node_count())
             .map(|v| {
                 let degree = g.degree(v);
                 if degree == 0 {

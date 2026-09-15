@@ -14,3 +14,8 @@ does not change the reference algorithm or the pre-existing output fields.
 
 Keep this fixture frozen. Changes to the production engine must be reconciled
 by changing the adapters/assertions in `../exact_tests.rs`, not this file.
+
+The 0.2 Rust API encapsulates `Graph` fields. The only topology-access adapter
+inside these fixtures replaces `graph.node_count` with `graph.node_count()`.
+It performs the same field read; no loop, arithmetic, RNG operation or
+algorithm branch changes. Future semantic changes must not update this oracle.

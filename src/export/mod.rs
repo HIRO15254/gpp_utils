@@ -1,43 +1,327 @@
 //! Derived TSV views. Source JSON remains the only experiment data store.
+mod columns;
+use columns::{ColumnSpec, RUN_COLUMNS, RunField, TRACE_COLUMNS, TraceField};
+
 use crate::{
     error::Result,
     experiment::{
         config::{Condition, SmoothingSpec, SolverSpec},
-        plan::ExperimentPlan,
+        plan::{ExperimentPlan, Job},
+        result::{BasinView, MeasurementView, RunView, ScoreBreakdown},
     },
-    storage::{self, atomic},
+    storage::{self, JobInspection, atomic},
 };
 use anyhow::bail;
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::json;
 use std::{
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
+
 #[derive(Serialize)]
 pub struct ExportSummary {
     pub jobs: usize,
     pub trace_rows: usize,
     pub incomplete_included: bool,
 }
-const RUNS: &str = "batch_id condition_id seed status latest_attempt_status termination graph_id graph_kind node_count expected_degree graph_seed edge_count actual_average_degree alpha neighborhood solver temperature tau smoothing k fitness fitness_version fitness_params_json max_steps completed_steps best_step initial_real final_real best_real final_cut_edges final_size_a final_size_b final_balance_penalty best_cut_edges best_size_a best_size_b best_balance_penalty elapsed_ms final_basin_real_from_real final_basin_real_status final_basin_real_from_smoothed final_basin_smoothed_status final_basin_real_from_best final_basin_best_status applied_moves accepted_moves rejected_moves objective_evaluations_search objective_evaluations_measurement fitness_values_computed_search search_ms measurement_ms";
-const TRACES: &str = "condition_id seed status step current_real best_real search_evaluation current_smoothed basin_real_from_real basin_smoothed_from_real basin_real_status basin_real_steps basin_real_from_smoothed basin_smoothed_from_smoothed basin_smoothed_status basin_smoothed_steps basin_real_from_best basin_best_status basin_best_steps";
-fn enum_text<T: Serialize>(v: &T) -> String {
-    serde_json::to_value(v)
-        .unwrap_or(Value::Null)
-        .as_str()
-        .unwrap_or("")
-        .to_owned()
+struct RunCtx<'a> {
+    plan: &'a ExperimentPlan,
+    job: &'a Job,
+    inspection: &'a JobInspection,
+    view: Option<RunView<'a>>,
+    initial: Option<ScoreBreakdown>,
+    final_breakdown: Option<ScoreBreakdown>,
+    best_breakdown: Option<ScoreBreakdown>,
 }
-fn cell(v: &Value) -> String {
-    match v {
-        Value::Null => String::new(),
-        Value::String(s) => s.clone(),
-        other => other.to_string(),
+struct TraceCtx<'a> {
+    run: &'a RunCtx<'a>,
+    measurement: MeasurementView<'a, 'a>,
+    current: ScoreBreakdown,
+    best: ScoreBreakdown,
+}
+fn enum_text<T: Serialize>(v: &T) -> String {
+    serde_json::to_string(v)
+        .expect("serializable enum")
+        .trim_matches('"')
+        .into()
+}
+fn option<T: ToString>(v: Option<T>) -> String {
+    v.map(|v| v.to_string()).unwrap_or_default()
+}
+fn stored_float(v: f64) -> String {
+    serde_json::to_string(&v).expect("validated finite stored float")
+}
+fn option_stored_float(v: Option<f64>) -> String {
+    v.map(stored_float).unwrap_or_default()
+}
+fn identity_smoothing(c: &Condition) -> bool {
+    matches!(
+        smooth(c),
+        Some(SmoothingSpec::None | SmoothingSpec::WeightedAverage { k: 0 })
+    )
+}
+fn smooth(c: &Condition) -> Option<&SmoothingSpec> {
+    match &c.solver {
+        SolverSpec::Hc { smoothing } | SolverSpec::Sa { smoothing, .. } => Some(smoothing),
+        SolverSpec::Eo { .. } => None,
     }
 }
-fn field(v: &Value, key: &str) -> String {
-    cell(&v[key])
+fn solver(c: &Condition) -> &SolverSpec {
+    &c.solver
+}
+fn basin_string(b: Option<BasinView<'_>>, value: fn(BasinView<'_>) -> Option<String>) -> String {
+    b.and_then(value).unwrap_or_default()
+}
+fn run_value(c: &RunCtx<'_>, f: RunField) -> String {
+    let condition = &c.job.condition;
+    let view = c.view.as_ref();
+    match f {
+        RunField::Batch => c.plan.batch_id.clone(),
+        RunField::Condition => c.job.condition_id.clone(),
+        RunField::Seed => c.job.seed.to_string(),
+        RunField::Status => c.inspection.status.clone(),
+        RunField::Latest => c
+            .inspection
+            .latest_attempt_status
+            .clone()
+            .unwrap_or_default(),
+        RunField::Termination => {
+            if c.inspection.status == "completed" {
+                view.map(|v| enum_text(&v.result().termination))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            }
+        }
+        RunField::GraphId => c.job.graph_id.clone(),
+        RunField::GraphKind => enum_text(&condition.graph.kind),
+        RunField::Nodes => condition.graph.node_count.to_string(),
+        RunField::ExpectedDegree => condition.graph.expected_degree.to_string(),
+        RunField::GraphSeed => condition.graph.seed.to_string(),
+        RunField::Edges => view
+            .map(|v| v.graph().edges().len().to_string())
+            .unwrap_or_default(),
+        RunField::ActualDegree => view
+            .map(|v| {
+                (2.0 * v.graph().edges().len() as f64 / v.graph().node_count() as f64).to_string()
+            })
+            .unwrap_or_default(),
+        RunField::Alpha => condition.alpha.to_string(),
+        RunField::Neighborhood => enum_text(&condition.neighborhood),
+        RunField::Solver => match solver(condition) {
+            SolverSpec::Hc { .. } => "hc",
+            SolverSpec::Sa { .. } => "sa",
+            SolverSpec::Eo { .. } => "eo",
+        }
+        .into(),
+        RunField::Temperature => match solver(condition) {
+            SolverSpec::Sa { temperature, .. } => temperature.to_string(),
+            _ => String::new(),
+        },
+        RunField::Tau => match solver(condition) {
+            SolverSpec::Eo { tau, .. } => tau.to_string(),
+            _ => String::new(),
+        },
+        RunField::Smoothing => match smooth(condition) {
+            Some(SmoothingSpec::None) => "none".into(),
+            Some(SmoothingSpec::AllAverage) => "all_average".into(),
+            Some(SmoothingSpec::RandomKAverage { .. }) => "random_k_average".into(),
+            Some(SmoothingSpec::WeightedAverage { .. }) => "weighted_average".into(),
+            None => String::new(),
+        },
+        RunField::K => match smooth(condition) {
+            Some(SmoothingSpec::RandomKAverage { k } | SmoothingSpec::WeightedAverage { k }) => {
+                k.to_string()
+            }
+            _ => String::new(),
+        },
+        RunField::Fitness => match solver(condition) {
+            SolverSpec::Eo { fitness, .. } => fitness.kind.clone(),
+            _ => String::new(),
+        },
+        RunField::FitnessVersion => {
+            let name = run_value(c, RunField::Fitness);
+            c.plan
+                .experiment
+                .versions
+                .get(&format!("fitness:{name}"))
+                .cloned()
+                .unwrap_or_default()
+        }
+        RunField::FitnessParams => match solver(condition) {
+            SolverSpec::Eo { fitness, .. } => fitness.params.to_string(),
+            _ => String::new(),
+        },
+        RunField::MaxSteps => condition.budget.max_steps.to_string(),
+        RunField::Completed => view
+            .map(|v| v.result().completed_steps.to_string())
+            .unwrap_or_default(),
+        RunField::BestStep => view
+            .map(|v| v.result().best_step.to_string())
+            .unwrap_or_default(),
+        RunField::InitialReal
+        | RunField::FinalReal
+        | RunField::BestReal
+        | RunField::FinalCuts
+        | RunField::FinalA
+        | RunField::FinalB
+        | RunField::FinalPenalty
+        | RunField::BestCuts
+        | RunField::BestA
+        | RunField::BestB
+        | RunField::BestPenalty => match f {
+            RunField::InitialReal => c.initial,
+            RunField::FinalReal
+            | RunField::FinalCuts
+            | RunField::FinalA
+            | RunField::FinalB
+            | RunField::FinalPenalty => c.final_breakdown,
+            RunField::BestReal
+            | RunField::BestCuts
+            | RunField::BestA
+            | RunField::BestB
+            | RunField::BestPenalty => c.best_breakdown,
+            _ => unreachable!("non-breakdown field"),
+        }
+        .map(|b| match f {
+            RunField::InitialReal | RunField::FinalReal | RunField::BestReal => b.real.to_string(),
+            RunField::FinalCuts | RunField::BestCuts => b.cut_edges.to_string(),
+            RunField::FinalA | RunField::BestA => b.size_a.to_string(),
+            RunField::FinalB | RunField::BestB => b.size_b.to_string(),
+            _ => b.balance_penalty.to_string(),
+        })
+        .unwrap_or_default(),
+        RunField::Elapsed => view
+            .map(|v| stored_float(v.result().elapsed_ms))
+            .unwrap_or_default(),
+        RunField::FinalBasinReal => basin_string(
+            view.map(RunView::final_measurement)
+                .and_then(|m| m.real_basin()),
+            |b| Some(stored_float(b.real())),
+        ),
+        RunField::FinalBasinRealStatus => basin_string(
+            view.map(RunView::final_measurement)
+                .and_then(|m| m.real_basin()),
+            |b| Some(enum_text(&b.termination())),
+        ),
+        RunField::FinalBasinSmooth => basin_string(
+            view.map(RunView::final_measurement)
+                .and_then(|m| m.smoothed_basin()),
+            |b| Some(stored_float(b.real())),
+        ),
+        RunField::FinalBasinSmoothStatus => basin_string(
+            view.map(RunView::final_measurement)
+                .and_then(|m| m.smoothed_basin()),
+            |b| Some(enum_text(&b.termination())),
+        ),
+        RunField::FinalBasinBest => basin_string(
+            view.map(RunView::final_measurement)
+                .and_then(|m| m.best_basin()),
+            |b| Some(stored_float(b.real())),
+        ),
+        RunField::FinalBasinBestStatus => basin_string(
+            view.map(RunView::final_measurement)
+                .and_then(|m| m.best_basin()),
+            |b| Some(enum_text(&b.termination())),
+        ),
+        RunField::Applied | RunField::Accepted => {
+            option(view.and_then(|v| v.result().diagnostics.as_ref().map(|d| d.applied_moves)))
+        }
+        RunField::Rejected => {
+            if matches!(solver(condition), SolverSpec::Sa { .. }) {
+                view.and_then(|v| {
+                    v.result().diagnostics.as_ref().map(|d| {
+                        v.result()
+                            .completed_steps
+                            .saturating_sub(d.applied_moves)
+                            .to_string()
+                    })
+                })
+                .unwrap_or_default()
+            } else {
+                String::new()
+            }
+        }
+        RunField::SearchEvals => option(view.and_then(|v| {
+            v.result()
+                .diagnostics
+                .as_ref()
+                .map(|d| d.objective_evaluations_search)
+        })),
+        RunField::MeasurementEvals => option(view.and_then(|v| {
+            v.result()
+                .diagnostics
+                .as_ref()
+                .map(|d| d.objective_evaluations_measurement)
+        })),
+        RunField::FitnessEvals => option(view.and_then(|v| {
+            v.result()
+                .diagnostics
+                .as_ref()
+                .and_then(|d| d.fitness_values_computed_search)
+        })),
+        RunField::SearchMs => option_stored_float(
+            view.and_then(|v| v.result().diagnostics.as_ref().map(|d| d.search_ms)),
+        ),
+        RunField::MeasurementMs => option_stored_float(
+            view.and_then(|v| v.result().diagnostics.as_ref().map(|d| d.measurement_ms)),
+        ),
+    }
+}
+fn trace_value(c: &TraceCtx<'_>, f: TraceField) -> String {
+    let m = &c.measurement;
+    match f {
+        TraceField::Condition => run_value(c.run, RunField::Condition),
+        TraceField::Seed => run_value(c.run, RunField::Seed),
+        TraceField::Status => run_value(c.run, RunField::Status),
+        TraceField::Step => m.step().to_string(),
+        TraceField::CurrentReal => c.current.real.to_string(),
+        TraceField::BestReal => c.best.real.to_string(),
+        TraceField::SearchEvaluation => {
+            if identity_smoothing(&c.run.job.condition) {
+                option(m.search_evaluation())
+            } else {
+                option_stored_float(m.search_evaluation())
+            }
+        }
+        TraceField::CurrentSmoothed => {
+            if identity_smoothing(&c.run.job.condition) {
+                option(m.smoothed_value())
+            } else {
+                option_stored_float(m.smoothed_value())
+            }
+        }
+        TraceField::BasinReal => basin_string(m.real_basin(), |b| Some(stored_float(b.real()))),
+        TraceField::BasinRealSmoothed => {
+            basin_string(m.real_basin(), |b| b.smoothed().map(stored_float))
+        }
+        TraceField::BasinRealStatus => {
+            basin_string(m.real_basin(), |b| Some(enum_text(&b.termination())))
+        }
+        TraceField::BasinRealSteps => {
+            basin_string(m.real_basin(), |b| b.steps().map(|x| x.to_string()))
+        }
+        TraceField::BasinSmooth => {
+            basin_string(m.smoothed_basin(), |b| Some(stored_float(b.real())))
+        }
+        TraceField::BasinSmoothValue => {
+            basin_string(m.smoothed_basin(), |b| b.smoothed().map(stored_float))
+        }
+        TraceField::BasinSmoothStatus => {
+            basin_string(m.smoothed_basin(), |b| Some(enum_text(&b.termination())))
+        }
+        TraceField::BasinSmoothSteps => {
+            basin_string(m.smoothed_basin(), |b| b.steps().map(|x| x.to_string()))
+        }
+        TraceField::BasinBest => basin_string(m.best_basin(), |b| Some(stored_float(b.real()))),
+        TraceField::BasinBestStatus => {
+            basin_string(m.best_basin(), |b| Some(enum_text(&b.termination())))
+        }
+        TraceField::BasinBestSteps => {
+            basin_string(m.best_basin(), |b| b.steps().map(|x| x.to_string()))
+        }
+    }
 }
 fn quote(s: &str) -> String {
     if s.contains(['\t', '\n', '\r', '"']) {
@@ -46,61 +330,20 @@ fn quote(s: &str) -> String {
         s.into()
     }
 }
-fn row(buf: &mut String, cells: Vec<String>) {
-    buf.push_str(
-        &cells
-            .iter()
-            .map(|s| quote(s))
-            .collect::<Vec<_>>()
-            .join("\t"),
-    );
-    buf.push('\n');
+fn write_row(buf: &mut String, cells: impl Iterator<Item = String>) {
+    buf.push_str(&cells.map(|s| quote(&s)).collect::<Vec<_>>().join("\t"));
+    buf.push('\n')
 }
-fn smoothing(condition: &Condition) -> Option<&SmoothingSpec> {
-    match &condition.solver {
-        SolverSpec::Hc { smoothing } | SolverSpec::Sa { smoothing, .. } => Some(smoothing),
-        SolverSpec::Eo { .. } => None,
-    }
+fn describe<F>(cols: &[ColumnSpec<F>]) -> Vec<serde_json::Value> {
+    cols.iter()
+        .map(|c| json!({"name":c.name,"type":c.kind,"unit":c.unit,"meaning":c.meaning}))
+        .collect()
 }
-fn identity(condition: &Condition) -> bool {
-    matches!(
-        smoothing(condition),
-        Some(SmoothingSpec::None | SmoothingSpec::WeightedAverage { k: 0 })
-    )
+fn header<F>(columns: &[ColumnSpec<F>]) -> String {
+    let mut r = String::new();
+    write_row(&mut r, columns.iter().map(|c| c.name.into()));
+    r
 }
-fn real(graph: &crate::graph_partition::Graph, c: &Condition, p: &[bool]) -> String {
-    graph.score(p, c.alpha).to_string()
-}
-fn breakdown(graph: &crate::graph_partition::Graph, c: &Condition, p: &[bool]) -> Vec<String> {
-    let a = p.iter().filter(|&&b| b).count();
-    let b = p.len() - a;
-    let cuts = graph.edges.iter().filter(|e| p[e[0]] != p[e[1]]).count();
-    vec![
-        cuts.to_string(),
-        a.to_string(),
-        b.to_string(),
-        (c.alpha * (a as f64 - b as f64).powi(2)).to_string(),
-    ]
-}
-fn basin(record: &Value, condition: &Condition, smoothed: bool) -> Value {
-    if smoothed && identity(condition) {
-        record["basin_real"].clone()
-    } else if smoothed {
-        record["basin_smoothed"].clone()
-    } else {
-        record["basin_real"].clone()
-    }
-}
-fn basin_smooth(basin: &Value, condition: &Condition) -> String {
-    if smoothing(condition).is_none() {
-        String::new()
-    } else if identity(condition) {
-        field(basin, "real")
-    } else {
-        field(basin, "smoothed")
-    }
-}
-
 pub fn export_tsv(
     plan: &ExperimentPlan,
     root: &Path,
@@ -110,199 +353,66 @@ pub fn export_tsv(
 ) -> Result<ExportSummary> {
     for file in ["runs.tsv", "traces.tsv", "metadata.json"] {
         if out.join(file).exists() && !overwrite {
-            bail!("output already exists: {}", out.join(file).display());
+            bail!("output already exists: {}", out.join(file).display())
         }
     }
-    let mut jobs: Vec<_> = plan.jobs.iter().collect();
-    jobs.sort_by(|a, b| (&a.condition_id, a.seed).cmp(&(&b.condition_id, b.seed)));
     let mut sorted = plan.clone();
-    sorted.jobs = jobs.into_iter().cloned().collect();
+    sorted
+        .jobs
+        .sort_by(|a, b| (&a.condition_id, a.seed).cmp(&(&b.condition_id, b.seed)));
     let inspections = storage::inspect(&sorted, root, include_incomplete)?;
-    let mut runs = RUNS.split_whitespace().collect::<Vec<_>>().join("\t") + "\n";
-    let mut traces = TRACES.split_whitespace().collect::<Vec<_>>().join("\t") + "\n";
+    let mut runs = header(RUN_COLUMNS);
+    let mut traces = header(TRACE_COLUMNS);
     let mut trace_rows = 0;
     for (job, inspection) in sorted.jobs.iter().zip(&inspections) {
-        let c = &job.condition;
-        let v = inspection
+        let view = inspection
             .result
             .as_ref()
-            .map(serde_json::to_value)
-            .transpose()?
-            .unwrap_or(Value::Null);
-        let result = inspection.result.as_ref();
-        let graph = inspection.graph.as_ref();
-        let mut cells = vec![
-            plan.batch_id.clone(),
-            job.condition_id.clone(),
-            job.seed.to_string(),
-            inspection.status.clone(),
-            inspection.latest_attempt_status.clone().unwrap_or_default(),
-            if inspection.status == "completed" {
-                field(&v, "termination")
-            } else {
-                String::new()
-            },
-            job.graph_id.clone(),
-            enum_text(&c.graph.kind),
-            c.graph.node_count.to_string(),
-            c.graph.expected_degree.to_string(),
-            c.graph.seed.to_string(),
-            graph.map(|g| g.edges.len().to_string()).unwrap_or_default(),
-            graph
-                .map(|g| (2.0 * g.edges.len() as f64 / g.node_count as f64).to_string())
-                .unwrap_or_default(),
-            c.alpha.to_string(),
-            enum_text(&c.neighborhood),
-        ];
-        let (kind, temp, tau, fitness, params) = match &c.solver {
-            SolverSpec::Hc { .. } => (
-                "hc",
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-            ),
-            SolverSpec::Sa { temperature, .. } => (
-                "sa",
-                temperature.to_string(),
-                String::new(),
-                String::new(),
-                String::new(),
-            ),
-            SolverSpec::Eo { tau, fitness } => (
-                "eo",
-                String::new(),
-                tau.to_string(),
-                fitness.kind.clone(),
-                fitness.params.to_string(),
-            ),
+            .zip(inspection.graph.as_deref())
+            .map(|(r, g)| RunView::new(g, &job.condition, r))
+            .transpose()?;
+        let initial = view.as_ref().map(|view| {
+            view.measurement(&view.result().records[0])
+                .current_breakdown()
+        });
+        let final_breakdown = view
+            .as_ref()
+            .map(|view| view.breakdown(view.result().final_solution));
+        let best_breakdown = view
+            .as_ref()
+            .map(|view| view.breakdown(view.result().best_solution));
+        let context = RunCtx {
+            plan,
+            job,
+            inspection,
+            view,
+            initial,
+            final_breakdown,
+            best_breakdown,
         };
-        let sm = smoothing(c)
-            .map(serde_json::to_value)
-            .transpose()?
-            .unwrap_or(Value::Null);
-        cells.extend([
-            kind.into(),
-            temp,
-            tau,
-            field(&sm, "kind"),
-            field(&sm, "k"),
-            fitness.clone(),
-            plan.experiment
-                .versions
-                .get(&format!("fitness:{fitness}"))
-                .cloned()
-                .unwrap_or_default(),
-            params,
-            c.budget.max_steps.to_string(),
-            field(&v, "completed_steps"),
-            field(&v, "best_step"),
-        ]);
-        if let (Some(r), Some(g)) = (result, graph) {
-            let initial = &r.partitions[r.records[0].current_solution.0];
-            let final_p = &r.partitions[r.final_solution.0];
-            let best = &r.partitions[r.best_solution.0];
-            cells.extend([real(g, c, initial), real(g, c, final_p), real(g, c, best)]);
-            cells.extend(breakdown(g, c, final_p));
-            cells.extend(breakdown(g, c, best));
-        } else {
-            cells.extend(vec![String::new(); 11]);
-        }
-        cells.push(field(&v, "elapsed_ms"));
-        let last = v["records"]
-            .as_array()
-            .and_then(|r| r.last())
-            .cloned()
-            .unwrap_or(Value::Null);
-        let br = basin(&last, c, false);
-        let bs = basin(&last, c, true);
-        let bb = last["basin_best"].clone();
-        cells.extend([
-            field(&br, "real"),
-            field(&br, "termination"),
-            field(&bs, "real"),
-            field(&bs, "termination"),
-            field(&bb, "real"),
-            field(&bb, "termination"),
-        ]);
-        let d = &v["diagnostics"];
-        let applied = field(d, "applied_moves");
-        let rejected = if kind == "sa" {
-            v["completed_steps"]
-                .as_u64()
-                .zip(d["applied_moves"].as_u64())
-                .map(|(s, a)| s.saturating_sub(a).to_string())
-                .unwrap_or_default()
-        } else {
-            String::new()
-        };
-        cells.extend([
-            applied.clone(),
-            applied,
-            rejected,
-            field(d, "objective_evaluations_search"),
-            field(d, "objective_evaluations_measurement"),
-            field(d, "fitness_values_computed_search"),
-            field(d, "search_ms"),
-            field(d, "measurement_ms"),
-        ]);
-        debug_assert_eq!(cells.len(), RUNS.split_whitespace().count());
-        row(&mut runs, cells);
-        if let (Some(r), Some(g)) = (result, graph) {
-            for (record, rv) in r
-                .records
-                .iter()
-                .zip(v["records"].as_array().expect("records array"))
-            {
-                let current = real(g, c, &r.partitions[record.current_solution.0]);
-                let best = real(g, c, &r.partitions[record.best_solution.0]);
-                let smoothed = if identity(c) {
-                    current.clone()
-                } else {
-                    field(rv, "current_smoothed")
+        write_row(
+            &mut runs,
+            RUN_COLUMNS.iter().map(|col| run_value(&context, col.field)),
+        );
+        if let Some(view) = context.view.as_ref() {
+            for measurement in view.records() {
+                let trace = TraceCtx {
+                    run: &context,
+                    current: measurement.current_breakdown(),
+                    best: measurement.best_breakdown(),
+                    measurement,
                 };
-                let search = if smoothing(c).is_none() {
-                    String::new()
-                } else if matches!(smoothing(c), Some(SmoothingSpec::RandomKAverage { .. })) {
-                    field(rv, "search_evaluation")
-                } else {
-                    smoothed.clone()
-                };
-                let br = basin(rv, c, false);
-                let bs = basin(rv, c, true);
-                let bb = rv["basin_best"].clone();
-                row(
+                write_row(
                     &mut traces,
-                    vec![
-                        job.condition_id.clone(),
-                        job.seed.to_string(),
-                        inspection.status.clone(),
-                        record.step.to_string(),
-                        current,
-                        best,
-                        search,
-                        smoothed,
-                        field(&br, "real"),
-                        basin_smooth(&br, c),
-                        field(&br, "termination"),
-                        field(&br, "steps"),
-                        field(&bs, "real"),
-                        basin_smooth(&bs, c),
-                        field(&bs, "termination"),
-                        field(&bs, "steps"),
-                        field(&bb, "real"),
-                        field(&bb, "termination"),
-                        field(&bb, "steps"),
-                    ],
+                    TRACE_COLUMNS
+                        .iter()
+                        .map(|col| trace_value(&trace, col.field)),
                 );
-                trace_rows += 1;
+                trace_rows += 1
             }
         }
     }
-    let describe = |names: &str| {
-        names.split_whitespace().map(|name|json!({"name":name,"type":column_type(name),"unit":if name.ends_with("_ms"){Some("ms")}else{None},"meaning":column_meaning(name)})).collect::<Vec<_>>()
-    };
-    let metadata = json!({"schema_version":1,"created_unix_ms":SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),"batch_id":plan.batch_id,"include_incomplete":include_incomplete,"selection":if plan.jobs.len()==1{Some(json!({"condition_id":plan.jobs[0].condition_id,"seed":plan.jobs[0].seed}))}else{None},"columns":{"runs":describe(RUNS),"traces":describe(TRACES)}});
+    let metadata = json!({"schema_version":1,"created_unix_ms":SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),"batch_id":plan.batch_id,"include_incomplete":include_incomplete,"selection":if plan.jobs.len()==1{Some(json!({"condition_id":plan.jobs[0].condition_id,"seed":plan.jobs[0].seed}))}else{None},"columns":{"runs":describe(RUN_COLUMNS),"traces":describe(TRACE_COLUMNS)}});
     atomic::write_bytes(&out.join("runs.tsv"), runs.as_bytes(), overwrite)?;
     atomic::write_bytes(&out.join("traces.tsv"), traces.as_bytes(), overwrite)?;
     atomic::write_json(&out.join("metadata.json"), &metadata, overwrite)?;
@@ -311,42 +421,4 @@ pub fn export_tsv(
         trace_rows,
         incomplete_included: include_incomplete,
     })
-}
-fn column_type(name: &str) -> &'static str {
-    if name.ends_with("_ms")
-        || name.contains("real") && !name.contains("status") && !name.contains("steps")
-        || matches!(
-            name,
-            "temperature" | "tau" | "alpha" | "expected_degree" | "actual_average_degree"
-        )
-        || name.contains("smoothed") && !name.contains("status") && !name.contains("steps")
-        || name.ends_with("penalty")
-        || name == "search_evaluation"
-    {
-        "number"
-    } else if matches!(
-        name,
-        "seed"
-            | "graph_seed"
-            | "node_count"
-            | "edge_count"
-            | "k"
-            | "step"
-            | "best_step"
-            | "completed_steps"
-            | "max_steps"
-    ) || name.contains("moves")
-        || name.contains("evaluations")
-        || name.contains("computed")
-        || name.contains("size_")
-        || name.ends_with("cut_edges")
-        || name.ends_with("steps")
-    {
-        "integer"
-    } else {
-        "string"
-    }
-}
-fn column_meaning(name: &str) -> String {
-    match name {"current_real"=>"Real objective of current partition".into(),"best_real"=>"Real objective of incumbent partition across every visited step".into(),"basin_real_from_best"|"final_basin_real_from_best"=>"Real objective reached by a real-objective basin descent from the incumbent partition".into(),"basin_best_status"|"final_basin_best_status"=>"Termination status of real-objective basin descent from the incumbent partition".into(),"basin_best_steps"=>"Scanned basin steps from the incumbent partition; present when diagnostics are enabled".into(),"search_evaluation"=>"Evaluation retained by the search; blank for EO or unavailable measurement".into(),"latest_attempt_status"=>"Latest unfinished attempt, separately from a reusable completed result".into(),"elapsed_ms"=>"Run initialization, search and measurement time; excludes graph generation and disk write".into(),"fitness"=>"Registered vertex fitness name".into(),"k"=>"Effective smoothing sample count".into(),_=>name.replace('_'," ")}
 }

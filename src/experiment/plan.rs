@@ -14,6 +14,7 @@ use super::config::*;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
+/// One expanded condition/seed pair. IDs are derived from scientific inputs.
 pub struct Job {
     pub condition_id: String,
     pub graph_id: String,
@@ -23,6 +24,8 @@ pub struct Job {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
+/// Unexpanded normalized settings with pinned semantic versions.
+/// This is the persisted experiment contract, rather than an expanded manifest.
 pub struct StoredExperiment {
     pub schema_version: u32,
     pub versions: BTreeMap<String, String>,
@@ -31,6 +34,9 @@ pub struct StoredExperiment {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
+/// Validated expansion in canonical condition-ID/seed order.
+/// Storage revalidates public fields before execution; use compile functions
+/// rather than constructing or modifying jobs manually.
 pub struct ExperimentPlan {
     pub batch_id: String,
     pub experiment: StoredExperiment,
@@ -115,6 +121,10 @@ pub fn minimal_sample_toml() -> &'static str {
     include_str!("../../examples/configs/minimal.toml")
 }
 
+/// Validate and expand settings using only the built-in fitness definition.
+/// Performs no I/O or graph generation. For custom fitness, use
+/// [`compile_experiment_with_versions`] and validate with the same registry
+/// passed to execution and resume.
 pub fn compile_experiment(spec: ExperimentSpec) -> crate::error::Result<ExperimentPlan> {
     compile_experiment_with_versions(
         spec,
@@ -122,6 +132,9 @@ pub fn compile_experiment(spec: ExperimentSpec) -> crate::error::Result<Experime
     )
 }
 
+/// Expand with available fitness versions. This checks names and versions,
+/// but does not have factory objects to validate custom parameters. Before I/O,
+/// call [`crate::storage::validate_registry`] with the same registry used to run.
 pub fn compile_experiment_with_versions(
     spec: ExperimentSpec,
     fitness_versions: &BTreeMap<String, String>,
@@ -140,10 +153,14 @@ pub fn compile_experiment_with_versions(
     })
 }
 
+/// Recompile persisted settings and reject unsupported pinned versions.
+/// Custom factory availability/parameters require the registry-aware variant.
 pub fn compile_stored(stored: StoredExperiment) -> crate::error::Result<ExperimentPlan> {
     compile_with_stored(stored)
 }
 
+/// Recompile saved settings and validate custom factories and their versions.
+/// Does not migrate old semantics or silently replace saved version strings.
 pub fn compile_stored_with_registry(
     stored: StoredExperiment,
     registry: &crate::fitness::FitnessRegistry,

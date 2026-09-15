@@ -7,13 +7,31 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
 #[derive(Clone, Debug)]
+/// A normalized, immutable undirected graph.
+///
+/// Build a new graph with [`Self::from_edges`] when changing its topology. The
+/// edge list and adjacency lists must always describe the same graph.
+///
+/// ```compile_fail
+/// use gpp_utils::graph_partition::Graph;
+/// let mut graph = Graph::from_edges(4, vec![]).unwrap();
+/// graph.edges.push([0, 1]); // topology is private
+/// ```
+///
+/// ```compile_fail
+/// use gpp_utils::graph_partition::Graph;
+/// let mut graph = Graph::from_edges(4, vec![]).unwrap();
+/// graph.node_count = 2; // size cannot diverge from adjacency
+/// ```
 pub struct Graph {
-    pub node_count: usize,
-    pub edges: Vec<[usize; 2]>,
+    node_count: usize,
+    edges: Vec<[usize; 2]>,
     adjacency: Vec<Vec<usize>>,
 }
 
 impl Graph {
+    /// Validate endpoints, reject loops/duplicate edges and build canonical
+    /// edges plus matching adjacency lists. Endpoints are zero based.
     pub fn from_edges(node_count: usize, edges: Vec<[usize; 2]>) -> Result<Self> {
         let mut normalized = BTreeSet::new();
         for [a, b] in edges {
@@ -97,6 +115,17 @@ impl Graph {
         Self::from_edges(spec.node_count, edges)
     }
 
+    /// Number of vertices, numbered `0..node_count()`.
+    pub fn node_count(&self) -> usize {
+        self.node_count
+    }
+
+    /// Canonical edges in lexicographic order, each with its smaller endpoint first.
+    pub fn edges(&self) -> &[[usize; 2]] {
+        &self.edges
+    }
+
+    /// Sorted adjacent vertex IDs. Panics if `vertex` is out of range.
     pub fn neighbors(&self, vertex: usize) -> &[usize] {
         &self.adjacency[vertex]
     }

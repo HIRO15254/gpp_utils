@@ -14,6 +14,6 @@
 
 ## 変更と検証
 
-各エージェントは担当範囲外のファイルを変更しない。共有契約を変更する場合は、親エージェントが先に契約を確定し、影響する担当へ通知する。各担当は変更内容、実行した検証、未解決事項を親へ報告する。親は統合後にfmt、clippy、テスト、releaseビルドと文書・スキーマ整合性を確認する。
+各エージェントは担当範囲外のファイルを変更しない。共有契約を変更する場合は、親エージェントが先に契約を確定し、影響する担当へ通知する。各担当は変更内容、実行した検証、未解決事項を親へ報告する。親は統合後に`python scripts/check.py`、文書・スキーマ整合性を確認する。このスクリプトはfmt、locked clippy、全ターゲット／docテスト、release exact regression、release build、警告をエラーにするdoc生成を同じ順序で実行する。個別コマンドをCIと別に増やさない。
 
-本ファイルと`docs/application-plan.md`は実装時のエージェント分担・モデル選択の正本である。仕様の正本は`docs/application-plan.md`、保存形式の正本は`docs/output-format.md`とする。
+本ファイルと`docs/application-plan.md`は実装時のエージェント分担・モデル選択の正本である。計算仕様は`docs/algorithms.md`、保存形式とTSV列は`docs/output-format.md`、拡張時の互換性確認は`docs/extending.md`を正本とする。過去の実測は`docs/verification.md`にあり、現在のCI成功を表すものではない。

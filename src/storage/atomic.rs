@@ -1,5 +1,5 @@
-use crate::error::Result;
-use anyhow::{Context, bail};
+use crate::error::{Result, UnsupportedSchema};
+use anyhow::Context;
 use fs2::FileExt;
 use serde::Serialize;
 use std::{
@@ -74,7 +74,7 @@ pub fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     if let Some(version) = value.get("schema_version")
         && version.as_u64() != Some(1)
     {
-        bail!("unsupported schema version in {}", path.display());
+        return Err(UnsupportedSchema { path: path.into() }.into());
     }
     serde_json::from_value(value).with_context(|| format!("invalid data: {}", path.display()))
 }

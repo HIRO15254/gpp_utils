@@ -231,7 +231,7 @@ struct CancellingFitness(CancellationToken);
 impl VertexFitness for CancellingFitness {
     fn values(&self, graph: &Graph, _: &PartitionState) -> gpp_utils::error::Result<Vec<f64>> {
         self.0.cancel();
-        Ok(vec![0.0; graph.node_count])
+        Ok(vec![0.0; graph.node_count()])
     }
 }
 struct CancellingFactory(CancellationToken);
@@ -290,7 +290,7 @@ impl FitnessFactory for CountingFactory {
 impl VertexFitness for CountingFitness {
     fn values(&self, graph: &Graph, _: &PartitionState) -> gpp_utils::error::Result<Vec<f64>> {
         self.0.fetch_add(1, Ordering::SeqCst);
-        Ok((0..graph.node_count).map(|x| x as f64).collect())
+        Ok((0..graph.node_count()).map(|x| x as f64).collect())
     }
 }
 
@@ -605,6 +605,6 @@ fn completed_json_omits_derived_scores_and_redundant_condition_fields() {
     let mut extra_partition = result.clone();
     extra_partition
         .partitions
-        .push(vec![false; graph.node_count]);
+        .push(vec![false; graph.node_count()]);
     assert!(extra_partition.validate(&graph, &c).is_err());
 }

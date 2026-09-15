@@ -92,7 +92,7 @@ pub fn evaluate(
     cancel: &CancellationToken,
     evaluations: &mut u64,
 ) -> Result<f64> {
-    validate(spec, graph.node_count, neighborhood)?;
+    validate(spec, graph.node_count(), neighborhood)?;
     let real = state.score(alpha);
     if matches!(spec, SmoothingSpec::None) | matches!(spec, SmoothingSpec::WeightedAverage { k: 0 })
     {
@@ -137,7 +137,7 @@ pub fn evaluate(
         let needed = k - count;
         let r = rng.unwrap();
         let distance_two =
-            (max_random_k(graph.node_count, neighborhood) as usize).saturating_sub(first.len());
+            (max_random_k(graph.node_count(), neighborhood) as usize).saturating_sub(first.len());
         // Floyd's algorithm samples exact canonical ordinals without replacement.
         let mut ordinals = std::collections::BTreeSet::new();
         for j in distance_two - needed..distance_two {
@@ -177,7 +177,7 @@ fn apply_distance_two(
 ) {
     match neighborhood {
         Neighborhood::Flip => {
-            let (a, b) = nth_pair(graph.node_count, ordinal);
+            let (a, b) = nth_pair(graph.node_count(), ordinal);
             state.apply_flip(graph, a);
             state.apply_flip(graph, b);
         }

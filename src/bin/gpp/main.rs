@@ -16,6 +16,7 @@ use gpp_utils::{
             compile_experiment_with_versions, compile_stored_with_registry, load_spec,
             minimal_sample_toml,
         },
+        result::RunView,
     },
     fitness::FitnessRegistry,
     optimization::CancellationToken,
@@ -350,24 +351,17 @@ fn inspect(
         .filter(|(job, _)| {
             condition.is_none_or(|id| job.condition_id == id) && seed.is_none_or(|s| job.seed == s)
         })
-        .map(|(job, row)| {
+        .map(|(job, row)| -> anyhow::Result<_> {
             let scores = row
                 .result
                 .as_ref()
-                .zip(row.graph.as_ref())
+                .zip(row.graph.as_deref())
                 .map(|(result, graph)| {
-                    (
-                        graph.score(
-                            &result.partitions[result.final_solution.0],
-                            job.condition.alpha,
-                        ),
-                        graph.score(
-                            &result.partitions[result.best_solution.0],
-                            job.condition.alpha,
-                        ),
-                    )
-                });
-            InspectRow {
+                    RunView::new(graph, &job.condition, result)
+                        .map(|view| (view.final_score(), view.best_score()))
+                })
+                .transpose()?;
+            Ok(InspectRow {
                 condition_id: &job.condition_id,
                 seed: job.seed,
                 status: &row.status,
@@ -379,9 +373,9 @@ fn inspect(
                 termination: row.result.as_ref().map(|result| result.termination),
                 completed_steps: row.result.as_ref().map(|result| result.completed_steps),
                 budget_max_steps: job.condition.budget.max_steps,
-            }
+            })
         })
-        .collect();
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let mut counts = std::collections::BTreeMap::new();
     for row in &display {
         *counts.entry(row.status.to_owned()).or_insert(0) += 1;

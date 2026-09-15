@@ -13,7 +13,7 @@
 - 計算予算のスイープ・条件別指定、探索シードごとのラウンド実行、暫定解からの実評価ベイスン計測
 - 結果はJSON正本、必要時にTSVを生成。集計・作図は外部ツールで行う
 
-GUI、SQA、連続緩和、`k_average`は提供しません。詳細は [docs/application-plan.md](docs/application-plan.md)、保存形式は [docs/output-format.md](docs/output-format.md)、数式は [docs/algorithms.md](docs/algorithms.md)を参照してください。
+GUI、SQA、連続緩和、`k_average`は提供しません。利用境界とCLI・設定仕様は [docs/application-plan.md](docs/application-plan.md)、保存形式とTSV列は [docs/output-format.md](docs/output-format.md)、数式は [docs/algorithms.md](docs/algorithms.md)、拡張時の互換性は [docs/extending.md](docs/extending.md)を参照してください。
 
 計算結果を維持する高速化と再測定方法は [docs/performance.md](docs/performance.md)に記載しています。
 
@@ -119,15 +119,14 @@ fn main() -> anyhow::Result<()> {
 }
 ```
 
-実行可能な例は`cargo run --release --example basic_usage`、探索速度の測定は`cargo run --release --example bench_search`で実行できます。`RunView`が保存された解参照から派生値を生成します。
+実行可能な例は`cargo run --release --example basic_usage`、独自EO適応度の登録は`cargo run --release --example custom_fitness`、探索速度の測定は`cargo run --release --example bench_search`で実行できます。`Graph::node_count()`と`Graph::edges()`は読み取り用getterです。`RunView`は`breakdown()`で実スコア、cut、群サイズ、バランスペナルティを型付きで生成し、`measurement()`で各計測点の現行解・暫定解・ベイスン派生値を返します。保存済みの分割参照は`try_partition()`で安全に解決できます。
 
 ## 開発
 
 ```text
-cargo fmt -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets
-cargo build --release --all-targets
+python scripts/check.py
 ```
+
+この入口はローカルとCIで共通です。固定された`Cargo.lock`を使い、fmt、clippy、通常・docテスト、release exact regression、release build、Rustdocを検証します。
 
 実装方針、サブエージェントの並列分担、GPT-5.6 Luna/Terra/Solの複雑さ別利用方針は [AGENTS.md](AGENTS.md)に記載しています。

@@ -23,10 +23,10 @@ pub fn run_one(
     cancel: &CancellationToken,
     registry: &FitnessRegistry,
 ) -> Result<RunResult> {
-    if graph.node_count < 2 {
+    if graph.node_count() < 2 {
         return Err(Error::msg("node_count must be at least 2"));
     }
-    let n = graph.node_count as f64;
+    let n = graph.node_count() as f64;
     if !(n * (n - 1.0) / 2.0 + condition.alpha * n * n).is_finite() {
         return Err(Error::msg("maximum possible score is not finite"));
     }
@@ -48,7 +48,7 @@ pub fn run_one(
             "steps are only allowed for explicit measurement",
         ));
     }
-    if condition.graph.node_count != graph.node_count {
+    if condition.graph.node_count != graph.node_count() {
         return Err(Error::msg("condition graph size does not match graph"));
     }
     if !condition.alpha.is_finite() || condition.alpha < 0.0 {
@@ -65,10 +65,10 @@ pub fn run_one(
             if !temperature.is_finite() || *temperature < 0.0 {
                 return Err(Error::msg("temperature must be finite and non-negative"));
             }
-            smoothing::validate(smoothing, graph.node_count, condition.neighborhood)?;
+            smoothing::validate(smoothing, graph.node_count(), condition.neighborhood)?;
         }
         SolverSpec::Hc { smoothing } => {
-            smoothing::validate(smoothing, graph.node_count, condition.neighborhood)?;
+            smoothing::validate(smoothing, graph.node_count(), condition.neighborhood)?;
         }
         SolverSpec::Eo { tau, fitness } => {
             if !tau.is_finite() || *tau <= 0.0 {
@@ -77,7 +77,7 @@ pub fn run_one(
             registry.validate(fitness)?;
         }
     }
-    if matches!(condition.neighborhood, Neighborhood::Swap) && !graph.node_count.is_multiple_of(2) {
+    if matches!(condition.neighborhood, Neighborhood::Swap) && !graph.node_count().is_multiple_of(2) {
         return Err(Error::msg("swap requires an even node count"));
     }
     let started = Instant::now();

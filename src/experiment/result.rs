@@ -124,12 +124,12 @@ impl RunResult {
         ensure!(!self.partitions.is_empty(), "empty partition pool");
         let mut unique = BTreeSet::new();
         for p in &self.partitions {
-            ensure!(p.len() == graph.node_count, "invalid partition length");
+            ensure!(p.len() == graph.node_count(), "invalid partition length");
             ensure!(unique.insert(p), "duplicate partition in pool");
             if condition.neighborhood == Neighborhood::Swap {
                 ensure!(
-                    graph.node_count.is_multiple_of(2)
-                        && p.iter().filter(|&&v| v).count() == graph.node_count / 2,
+                    graph.node_count().is_multiple_of(2)
+                        && p.iter().filter(|&&v| v).count() == graph.node_count() / 2,
                     "unbalanced swap partition"
                 );
             }
@@ -391,6 +391,51 @@ pub struct RunView<'a> {
     condition: &'a Condition,
     result: &'a RunResult,
 }
+
+/// A real-objective score together with the terms used to derive it for TSV
+/// views. `balance_penalty` intentionally keeps the historical `powi(2)`
+/// evaluation used by the exporter.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScoreBreakdown {
+    pub real: f64,
+    pub cut_edges: usize,
+    pub size_a: usize,
+    pub size_b: usize,
+    pub balance_penalty: f64,
+}
+
+/// A typed view of a measured basin result. The selected result may be the
+/// real basin used as the smoothed-basin fallback for identity smoothing.
+#[derive(Clone, Copy, Debug)]
+pub struct BasinView<'a> {
+    result: &'a BasinResult,
+    smoothed: Option<f64>,
+}
+
+impl<'a> BasinView<'a> {
+    pub fn real(self) -> f64 {
+        self.result.real
+    }
+    pub fn smoothed(self) -> Option<f64> {
+        self.smoothed
+    }
+    pub fn termination(self) -> BasinTermination {
+        self.result.termination
+    }
+    pub fn steps(self) -> Option<u64> {
+        self.result.steps
+    }
+    pub fn result(self) -> &'a BasinResult {
+        self.result
+    }
+}
+
+/// Typed derived values for one measurement record.
+pub struct MeasurementView<'view, 'result> {
+    view: &'view RunView<'result>,
+    record: &'result MeasurementRecord,
+}
+
 impl<'a> RunView<'a> {
     pub fn new(graph: &'a Graph, condition: &'a Condition, result: &'a RunResult) -> Result<Self> {
         result.validate(graph, condition)?;
@@ -400,6 +445,23 @@ impl<'a> RunView<'a> {
             result,
         })
     }
+    pub fn graph(&self) -> &'a Graph {
+        self.graph
+    }
+    pub fn condition(&self) -> &'a Condition {
+        self.condition
+    }
+    pub fn result(&self) -> &'a RunResult {
+        self.result
+    }
+    /// Returns `None` when `id` is not in this result's partition pool.
+    pub fn try_partition(&self, id: SolutionId) -> Option<&[bool]> {
+        self.result.partitions.get(id.0).map(Vec::as_slice)
+    }
+    /// Returns a partition from this validated result.
+    ///
+    /// Panics when called with an arbitrary `SolutionId` outside the pool; use
+    /// [`Self::try_partition`] for unchecked external IDs.
     pub fn partition(&self, id: SolutionId) -> &[bool] {
         &self.result.partitions[id.0]
     }
@@ -411,5 +473,118 @@ impl<'a> RunView<'a> {
     }
     pub fn best_score(&self) -> f64 {
         self.score(self.result.best_solution)
+    }
+    pub fn breakdown(&self, id: SolutionId) -> ScoreBreakdown {
+        let partition = self.partition(id);
+        let size_a = partition.iter().filter(|&&value| value).count();
+        let size_b = partition.len() - size_a;
+        let cut_edges = self
+            .graph
+            .edges()
+            .iter()
+            .filter(|&&[a, b]| partition[a] != partition[b])
+            .count();
+        ScoreBreakdown {
+            real: self.score(id),
+            cut_edges,
+            size_a,
+            size_b,
+            balance_penalty: self.condition.alpha * (size_a as f64 - size_b as f64).powi(2),
+        }
+    }
+    pub fn measurement<'view>(
+        &'view self,
+        record: &'a MeasurementRecord,
+    ) -> MeasurementView<'view, 'a> {
+        MeasurementView { view: self, record }
+    }
+    pub fn records(&self) -> impl Iterator<Item = MeasurementView<'_, 'a>> {
+        self.result
+            .records
+            .iter()
+            .map(|record| self.measurement(record))
+    }
+    pub fn final_measurement(&self) -> MeasurementView<'_, 'a> {
+        self.measurement(
+            self.result
+                .records
+                .last()
+                .expect("validated result has records"),
+        )
+    }
+}
+
+impl<'view, 'result> MeasurementView<'view, 'result> {
+    pub fn record(&self) -> &'result MeasurementRecord {
+        self.record
+    }
+    pub fn step(&self) -> u64 {
+        self.record.step
+    }
+    pub fn current_breakdown(&self) -> ScoreBreakdown {
+        self.view.breakdown(self.record.current_solution)
+    }
+    pub fn best_breakdown(&self) -> ScoreBreakdown {
+        self.view.breakdown(self.record.best_solution)
+    }
+    /// The displayed smoothing value, including the identity-smoothing fallback.
+    pub fn smoothed_value(&self) -> Option<f64> {
+        if identity_smoothing(self.view.condition) {
+            Some(self.current_breakdown().real)
+        } else {
+            self.record.current_smoothed
+        }
+    }
+    /// The value used by the search at this measurement. EO has no smoothing
+    /// measurement, random smoothing retains its separately sampled value.
+    pub fn search_evaluation(&self) -> Option<f64> {
+        match smoothing(self.view.condition) {
+            None => None,
+            Some(SmoothingSpec::RandomKAverage { .. }) => self.record.search_evaluation,
+            Some(_) => self.smoothed_value(),
+        }
+    }
+    pub fn real_basin(&self) -> Option<BasinView<'result>> {
+        self.record.basin_real.as_ref().map(|result| BasinView {
+            result,
+            smoothed: basin_smoothed(self.view.condition, result),
+        })
+    }
+    pub fn smoothed_basin(&self) -> Option<BasinView<'result>> {
+        let result = if identity_smoothing(self.view.condition) {
+            self.record.basin_real.as_ref()
+        } else {
+            self.record.basin_smoothed.as_ref()
+        }?;
+        Some(BasinView {
+            result,
+            smoothed: basin_smoothed(self.view.condition, result),
+        })
+    }
+    pub fn best_basin(&self) -> Option<BasinView<'result>> {
+        self.record.basin_best.as_ref().map(|result| BasinView {
+            result,
+            smoothed: None,
+        })
+    }
+}
+
+fn smoothing(condition: &Condition) -> Option<&SmoothingSpec> {
+    match &condition.solver {
+        SolverSpec::Hc { smoothing } | SolverSpec::Sa { smoothing, .. } => Some(smoothing),
+        SolverSpec::Eo { .. } => None,
+    }
+}
+fn identity_smoothing(condition: &Condition) -> bool {
+    matches!(
+        smoothing(condition),
+        Some(SmoothingSpec::None | SmoothingSpec::WeightedAverage { k: 0 })
+    )
+}
+fn basin_smoothed(condition: &Condition, basin: &BasinResult) -> Option<f64> {
+    match smoothing(condition) {
+        None => None,
+        Some(_) if identity_smoothing(condition) => Some(basin.real),
+        Some(_) => basin.smoothed,
     }
 }

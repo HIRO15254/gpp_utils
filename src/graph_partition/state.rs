@@ -2,6 +2,13 @@ use super::Graph;
 use crate::error::{Error, Result};
 
 #[derive(Clone, Debug)]
+/// Job-local partition and incremental objective cache.
+///
+/// All evaluation and update calls must use the same immutable graph passed to
+/// [`Self::new`]. Build a new state after rebuilding a graph's topology. Vertices
+/// passed to low-level move methods must be in range; swap endpoints must belong
+/// to different groups. The experiment runner validates and maintains these
+/// preconditions for callers using the high-level API.
 pub struct PartitionState {
     partition: Vec<bool>,
     cut_edges: i64,
@@ -11,12 +18,12 @@ pub struct PartitionState {
 
 impl PartitionState {
     pub fn new(graph: &Graph, partition: Vec<bool>) -> Result<Self> {
-        if partition.len() != graph.node_count {
+        if partition.len() != graph.node_count() {
             return Err(Error::msg("partition length does not match graph"));
         }
-        let mut cuts_at = vec![0; graph.node_count];
+        let mut cuts_at = vec![0; graph.node_count()];
         let mut cut_edges = 0;
-        for &[a, b] in &graph.edges {
+        for &[a, b] in graph.edges() {
             if partition[a] != partition[b] {
                 cuts_at[a] += 1;
                 cuts_at[b] += 1;

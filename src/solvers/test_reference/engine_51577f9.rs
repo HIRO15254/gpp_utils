@@ -41,10 +41,10 @@ impl<'a> Engine<'a> {
         };
         let seedb = seed.to_le_bytes();
         let mut init = rng_for(&[hash.as_bytes(), nlabel, &seedb, b"initial"]);
-        let mut p: Vec<bool> = (0..graph.node_count).map(|_| init.r#gen()).collect();
+        let mut p: Vec<bool> = (0..graph.node_count()).map(|_| init.r#gen()).collect();
         if matches!(condition.neighborhood, Neighborhood::Swap) {
             p.fill(false);
-            for x in p.iter_mut().take(graph.node_count / 2) {
+            for x in p.iter_mut().take(graph.node_count() / 2) {
                 *x = true
             }
             p.shuffle(&mut init)
@@ -194,7 +194,7 @@ impl<'a> Engine<'a> {
     }
     fn random_move(&mut self, cancel: &CancellationToken) -> Result<Move> {
         Ok(match self.condition.neighborhood {
-            Neighborhood::Flip => Move::Flip(self.select_rng.gen_range(0..self.graph.node_count)),
+            Neighborhood::Flip => Move::Flip(self.select_rng.gen_range(0..self.graph.node_count())),
             Neighborhood::Swap => {
                 let mut draws = 0usize;
                 let a = loop {
@@ -202,7 +202,7 @@ impl<'a> Engine<'a> {
                         cancel.check()?;
                     }
                     draws += 1;
-                    let v = self.select_rng.gen_range(0..self.graph.node_count);
+                    let v = self.select_rng.gen_range(0..self.graph.node_count());
                     if self.state.partition()[v] {
                         break v;
                     }
@@ -212,7 +212,7 @@ impl<'a> Engine<'a> {
                         cancel.check()?;
                     }
                     draws += 1;
-                    let v = self.select_rng.gen_range(0..self.graph.node_count);
+                    let v = self.select_rng.gen_range(0..self.graph.node_count());
                     if !self.state.partition()[v] {
                         break v;
                     }
@@ -282,7 +282,7 @@ impl<'a> Engine<'a> {
             .unwrap()
             .values(self.graph, &self.state)?;
         self.fitness_values += fit.len() as u64;
-        if fit.len() != self.graph.node_count || fit.iter().any(|x| !x.is_finite()) {
+        if fit.len() != self.graph.node_count() || fit.iter().any(|x| !x.is_finite()) {
             return Err(Error::msg("fitness returned invalid values"));
         }
         let mut ranked: Vec<usize> = (0..fit.len()).collect();

@@ -1,7 +1,7 @@
 //! Immutable experiment inputs and atomic result storage.
 pub mod atomic;
 use crate::{
-    error::Result,
+    error::{Result, UnsupportedSchema},
     experiment::{
         config::Condition,
         plan::{ExperimentPlan, Job, StoredExperiment, compile_stored},
@@ -152,8 +152,8 @@ fn prepare_graph(root: &Path, job: &Job, cancel: &CancellationToken) -> Result<G
         &path,
         &StoredGraph {
             schema_version: 1,
-            node_count: graph.node_count,
-            edges: graph.edges.clone(),
+            node_count: graph.node_count(),
+            edges: graph.edges().to_vec(),
             content_hash: graph.content_hash(),
         },
         false,
@@ -206,15 +206,58 @@ fn restore_partial(
     result.validate(graph, condition)?;
     Ok(Some(result))
 }
-fn read_marker(path: &Path) -> Result<Option<Incomplete>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let m: Incomplete = atomic::read_json(path)?;
+enum MarkerState {
+    Missing,
+    Valid(Incomplete),
+    Invalid(anyhow::Error),
+    Unsupported(anyhow::Error),
+}
+fn read_marker(path: &Path) -> Result<MarkerState> {
+    let m: Incomplete = match atomic::read_json(path) {
+        Ok(m) => m,
+        Err(e) if e.is::<UnsupportedSchema>() => return Ok(MarkerState::Unsupported(e)),
+        Err(e)
+            if e.root_cause()
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(MarkerState::Missing);
+        }
+        Err(e) if e.root_cause().is::<std::io::Error>() => return Err(e),
+        Err(e) => return Ok(MarkerState::Invalid(e)),
+    };
     if !matches!(m.status.as_str(), "running" | "failed" | "cancelled") || m.attempt_id.is_empty() {
-        bail!("invalid incomplete marker");
+        return Ok(MarkerState::Invalid(anyhow::anyhow!(
+            "invalid incomplete marker in {}",
+            path.display()
+        )));
     }
-    Ok(Some(m))
+    Ok(MarkerState::Valid(m))
+}
+fn file_exists(path: &Path) -> Result<bool> {
+    match std::fs::metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+fn prepare_marker_for_write(
+    state: MarkerState,
+    path: &Path,
+    options: &RuntimeOptions,
+    attempt: &str,
+) -> Result<()> {
+    match state {
+        MarkerState::Missing | MarkerState::Valid(_) => Ok(()),
+        MarkerState::Unsupported(e) => Err(e),
+        MarkerState::Invalid(e) if options.recover_corrupt || options.overwrite => {
+            let backup = path.with_extension(format!("corrupt-{attempt}.json"));
+            std::fs::copy(path, &backup)
+                .with_context(|| format!("backing up invalid marker: {e:#}"))?;
+            Ok(())
+        }
+        MarkerState::Invalid(e) => Err(e),
+    }
 }
 pub fn inspect(
     plan: &ExperimentPlan,
@@ -236,8 +279,9 @@ pub fn inspect(
             result: None,
             graph: None,
         };
-        if path.exists()
-            || (include_incomplete && marker.as_ref().is_some_and(|m| m.partial_result.is_some()))
+        if file_exists(&path)?
+            || (include_incomplete
+                && matches!(&marker, MarkerState::Valid(m) if m.partial_result.is_some()))
         {
             let graph = if let Some(g) = graphs.get(&job.graph_id) {
                 g.clone()
@@ -246,15 +290,15 @@ pub fn inspect(
                 graphs.insert(job.graph_id.clone(), g.clone());
                 g
             };
-            if path.exists() {
+            if file_exists(&path)? {
                 row.result = Some(read_result(&path, &graph, &job.condition)?);
                 row.status = "completed".into();
-            } else if let Some(m) = &marker {
+            } else if let MarkerState::Valid(m) = &marker {
                 row.result = restore_partial(m, &graph, &job.condition)?;
             }
             row.graph = Some(graph);
         }
-        if let Some(m) = marker {
+        if let MarkerState::Valid(m) = marker {
             let stale = row
                 .result
                 .as_ref()
@@ -271,6 +315,15 @@ pub fn inspect(
                 row.latest_attempt_status = Some(status);
                 row.error = m.error;
             }
+        } else if let MarkerState::Invalid(e) | MarkerState::Unsupported(e) = marker {
+            row.latest_attempt_status = Some("invalid_marker".into());
+            if row.status != "completed" {
+                row.status = "invalid_marker".into();
+            }
+            row.error = Some(Failure {
+                code: "marker_issue".into(),
+                message: format!("{e:#}"),
+            });
         }
         rows.push(row);
     }
@@ -410,8 +463,18 @@ fn run_job(
         error: None,
         partial_result: None,
     };
-    if !path.exists() {
+    let existing_path = file_exists(&path)?;
+    let mut marker_state = Some(read_marker(&marker_path)?);
+    let mut marker_written = false;
+    if !existing_path {
+        prepare_marker_for_write(
+            marker_state.take().expect("marker classified"),
+            &marker_path,
+            options,
+            &marker.attempt_id,
+        )?;
         atomic::write_json(&marker_path, &marker, true)?;
+        marker_written = true;
     }
     let graph = graph_cell.get_or_init(|| {
         prepare_graph(&options.root, job, cancel)
@@ -420,10 +483,10 @@ fn run_job(
     });
     let computation = (|| -> Result<String> {
         let graph = graph.as_ref().map_err(|e| anyhow::anyhow!("{e}"))?;
-        if path.exists() {
+        if existing_path {
             match read_result(&path, graph, &job.condition) {
                 Ok(existing) if !options.overwrite => {
-                    if let Some(old) = read_marker(&marker_path)?
+                    if let Some(MarkerState::Valid(old)) = &marker_state
                         && old.attempt_id == existing.attempt_id
                     {
                         std::fs::remove_file(&marker_path)?;
@@ -432,7 +495,8 @@ fn run_job(
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    if format!("{e:#}").contains("unsupported schema")
+                    if e.is::<UnsupportedSchema>()
+                        || e.root_cause().is::<std::io::Error>()
                         || !(options.recover_corrupt || options.overwrite)
                     {
                         return Err(e);
@@ -442,7 +506,16 @@ fn run_job(
                 }
             }
         }
-        atomic::write_json(&marker_path, &marker, true)?;
+        if !marker_written {
+            prepare_marker_for_write(
+                marker_state.take().expect("marker classified"),
+                &marker_path,
+                options,
+                &marker.attempt_id,
+            )?;
+            atomic::write_json(&marker_path, &marker, true)?;
+            marker_written = true;
+        }
         let mut result = run_one(graph, &job.condition, job.seed, cancel, registry)?;
         result.attempt_id = marker.attempt_id.clone();
         if result.termination == RunTermination::Cancelled {
@@ -476,8 +549,10 @@ fn run_job(
                 .into(),
                 message: format!("{e:#}"),
             });
-            atomic::write_json(&marker_path, &marker, true)
-                .with_context(|| format!("original failure: {e:#}"))?;
+            if marker_written {
+                atomic::write_json(&marker_path, &marker, true)
+                    .with_context(|| format!("original failure: {e:#}"))?;
+            }
             if cancel.is_cancelled() {
                 Ok("cancelled".into())
             } else {
