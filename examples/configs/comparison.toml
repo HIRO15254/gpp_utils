@@ -1,0 +1,42 @@
+schema_version = 1
+name = "comparison"
+run_seeds = [0, 1, 2]
+neighborhoods = ["flip", "swap"]
+
+[problem]
+alpha = 0.05
+
+[budget]
+max_steps = 100
+
+[measurement]
+schedule = "logarithmic"
+basin = "both"
+max_basin_steps = 100
+diagnostics = false
+
+[[graphs]]
+kind = "random"
+node_counts = [12]
+expected_degrees = [5.0]
+seeds = [42]
+
+[[solvers]]
+kind = "sa"
+temperatures = [0.1, 1.0]
+[[solvers.smoothing]]
+kind = "none"
+[[solvers.smoothing]]
+kind = "random_k_average"
+ks = [8, 32]
+
+[[solvers]]
+kind = "hc"
+[[solvers.smoothing]]
+kind = "none"
+
+[[solvers]]
+kind = "eo"
+taus = [1.2, 1.5]
+[[solvers.fitnesses]]
+kind = "default"

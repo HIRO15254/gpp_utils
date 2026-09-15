@@ -1,0 +1,15 @@
+schema_version = 1
+run_seeds = [0]
+neighborhoods = ["flip"]
+
+[budget]
+max_steps = 100
+
+[[graphs]]
+kind = "random"
+node_counts = [20]
+expected_degrees = [3.0]
+seeds = [42]
+
+[[solvers]]
+kind = "hc"
