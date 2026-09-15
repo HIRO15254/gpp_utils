@@ -109,6 +109,12 @@ struct RuntimeArgs {
     threads: Option<usize>,
     #[arg(long)]
     overwrite: bool,
+    /// Finish all conditions for each search seed before starting the next seed.
+    #[arg(long)]
+    rounds: bool,
+    /// Soft time limit checked before each round; the active round finishes.
+    #[arg(long, value_name = "SECONDS", requires = "rounds")]
+    deadline_seconds: Option<u64>,
 }
 
 fn main() {
@@ -282,6 +288,8 @@ fn run_plan(
             .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from)),
         overwrite: runtime.overwrite,
         recover_corrupt,
+        rounds: runtime.rounds,
+        round_deadline: runtime.deadline_seconds.map(std::time::Duration::from_secs),
     };
     if options.threads == 0 {
         return Err(anyhow::Error::new(InputError));
@@ -296,10 +304,12 @@ fn run_plan(
         }
     })?;
     output(&summary, json);
-    Ok(if summary.cancelled > 0 || summary.not_started > 0 {
+    Ok(if token.is_cancelled() || summary.cancelled > 0 {
         130
     } else if summary.failed > 0 {
         1
+    } else if summary.not_started > 0 && !summary.deadline_reached {
+        130
     } else {
         0
     })
@@ -317,6 +327,7 @@ struct InspectRow<'a> {
     error: Option<&'a gpp_utils::storage::Failure>,
     termination: Option<gpp_utils::experiment::result::RunTermination>,
     completed_steps: Option<u64>,
+    budget_max_steps: u64,
 }
 #[derive(Serialize)]
 struct InspectOutput<'a> {
@@ -367,6 +378,7 @@ fn inspect(
                 error: row.error.as_ref(),
                 termination: row.result.as_ref().map(|result| result.termination),
                 completed_steps: row.result.as_ref().map(|result| result.completed_steps),
+                budget_max_steps: job.condition.budget.max_steps,
             }
         })
         .collect();

@@ -1,0 +1,43 @@
+# Three seeds, eight conditions, and 24 jobs. Run with --rounds.
+schema_version = 1
+name = "Budget sweeps with incumbent basins"
+run_seeds = [0, 1, 2]
+
+[problem]
+alpha = 0.05
+
+[budget]
+max_steps = [10, 30]
+
+[measurement]
+schedule = "explicit"
+steps = [1, 5]
+basin = "real"
+best_basin = true
+max_basin_steps = 100
+diagnostics = true
+
+[[graphs]]
+kind = "random"
+node_counts = [12]
+expected_degrees = [3.0]
+seeds = [42]
+
+# These SA conditions inherit both budgets from [budget].
+[[conditions]]
+neighborhoods = ["flip"]
+
+[[conditions.solvers]]
+kind = "sa"
+temperatures = [0.0, 1.0]
+
+# These EO conditions use their own budgets and neighborhood.
+[[conditions]]
+neighborhoods = ["swap"]
+
+[conditions.budget]
+max_steps = [20, 40]
+
+[[conditions.solvers]]
+kind = "eo"
+taus = [1.2, 1.5]

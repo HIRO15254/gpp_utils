@@ -96,6 +96,7 @@ fn condition_for(
             basin: BasinMode::Both,
             max_basin_steps: 40,
             diagnostics: true,
+            best_basin: false,
         },
     }
 }

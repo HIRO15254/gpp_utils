@@ -46,6 +46,8 @@ pub struct MeasurementRecord {
     pub basin_real: Option<BasinResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub basin_smoothed: Option<BasinResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub basin_best: Option<BasinResult>,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -189,6 +191,8 @@ impl RunResult {
             "unexpected or missing measurement steps"
         );
         let mut previous: Option<&MeasurementRecord> = None;
+        let mut best_basins: std::collections::BTreeMap<SolutionId, &BasinResult> =
+            std::collections::BTreeMap::new();
         let mut encountered = BTreeSet::new();
         for r in &self.records {
             ensure!(
@@ -250,6 +254,7 @@ impl RunResult {
             }
             let wants_real = condition.measurement.basin != BasinMode::None;
             let wants_smooth = condition.measurement.basin == BasinMode::Both && nontrivial;
+            let wants_best = condition.measurement.best_basin;
             if !wants_real {
                 ensure!(r.basin_real.is_none(), "unexpected real basin");
             } else if !partial_endpoint {
@@ -259,6 +264,11 @@ impl RunResult {
                 ensure!(r.basin_smoothed.is_none(), "unexpected smoothed basin");
             } else if !partial_endpoint {
                 ensure!(r.basin_smoothed.is_some(), "missing smoothed basin");
+            }
+            if !wants_best {
+                ensure!(r.basin_best.is_none(), "unexpected best basin");
+            } else if !partial_endpoint {
+                ensure!(r.basin_best.is_some(), "missing best basin");
             }
             for basin in [r.basin_real.as_ref(), r.basin_smoothed.as_ref()]
                 .into_iter()
@@ -281,6 +291,39 @@ impl RunResult {
                         steps > 0 && steps <= condition.measurement.max_basin_steps,
                         "invalid basin scan count"
                     );
+                }
+            }
+            if let Some(basin) = r.basin_best.as_ref() {
+                ensure!(basin.real.is_finite(), "non-finite best basin");
+                ensure!(
+                    basin.real <= scores[r.best_solution.0],
+                    "best basin is worse than its incumbent"
+                );
+                ensure!(
+                    basin.smoothed.is_none(),
+                    "best basin must use real objective"
+                );
+                ensure!(
+                    basin.steps.is_some() == condition.measurement.diagnostics,
+                    "best basin diagnostics mismatch"
+                );
+                if let Some(steps) = basin.steps {
+                    ensure!(
+                        steps > 0 && steps <= condition.measurement.max_basin_steps,
+                        "invalid best basin scan count"
+                    );
+                }
+                if let Some(previous_basin) = best_basins.get(&r.best_solution) {
+                    ensure!(
+                        previous_basin.real.to_bits() == basin.real.to_bits()
+                            && previous_basin.smoothed.map(f64::to_bits)
+                                == basin.smoothed.map(f64::to_bits)
+                            && previous_basin.termination == basin.termination
+                            && previous_basin.steps == basin.steps,
+                        "inconsistent repeated best basin"
+                    );
+                } else {
+                    best_basins.insert(r.best_solution, basin);
                 }
             }
         }

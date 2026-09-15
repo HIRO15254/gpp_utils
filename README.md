@@ -10,6 +10,7 @@
 - 平滑化: `none`、`all_average`、`random_k_average`、`weighted_average`（HC/SAのみ）
 - EO: 必須の `taus` と適応度 `default`（`good_edge_fraction`）。Rustの登録機構で拡張可能
 - TOML/JSON設定、直積スイープ、CPU並列、キャンセル、ジョブ単位の再開
+- 計算予算のスイープ・条件別指定、探索シードごとのラウンド実行、暫定解からの実評価ベイスン計測
 - 結果はJSON正本、必要時にTSVを生成。集計・作図は外部ツールで行う
 
 GUI、SQA、連続緩和、`k_average`は提供しません。詳細は [docs/application-plan.md](docs/application-plan.md)、保存形式は [docs/output-format.md](docs/output-format.md)、数式は [docs/algorithms.md](docs/algorithms.md)を参照してください。
@@ -66,6 +67,19 @@ kind = "none"
 
 比較実験では配列を増やして全組み合わせを実行します。例えば近傍、SAの温度、平滑化、EOの`taus`、`run_seeds`を列挙します。Swapを使うグラフの頂点数は偶数にしてください。EOの`taus`は必須です。
 
+`budget.max_steps = [100, 1000]`で計算予算もスイープできます。手法・近傍によって予算を変える場合は、ルートの`neighborhoods`・`solvers`を`[[conditions]]`へ移し、各グループに`neighborhoods`・`solvers`と任意の`budget`を設定します。グループに予算がなければ全体から継承します。明示した計測ステップはすべての有効予算以下にしてください。
+
+[rounds.toml](examples/configs/rounds.toml)は、SAとEOに異なる予算を割り当て、暫定解ベイスンも計測する24ジョブの例です。
+
+```text
+gpp validate examples/configs/rounds.toml
+gpp run examples/configs/rounds.toml --root data/rounds-demo --rounds --deadline-seconds 60
+gpp resume --batch <batch_id> --root data/rounds-demo --rounds --deadline-seconds 60
+gpp export --batch <batch_id> --root data/rounds-demo --out export
+```
+
+`--rounds`は探索シードを数値昇順に1つずつ進め、同じシードの全条件を並列実行します。期限は次のラウンドを始める前に確認し、実行中のラウンドは最後まで処理します。そのため指定秒数を超える場合があります。期限停止は成功終了となり、再開時は完了結果を再利用します。ラウンド内に失敗がある場合は後続ラウンドを開始しません。
+
 ## 保存される結果
 
 ```text
@@ -78,6 +92,8 @@ data/v1/
 ```
 
 各実行JSONは、重複排除した`partitions`配列と、終了時の現行解`final_solution`、終了時の暫定解`best_solution`、各計測点の`current_solution` / `best_solution`参照を保存します。暫定解はそのステップまでに実評価値が最小だった現行解です。同点では先に得た解を維持します。実評価値、カット数、群サイズ、ペナルティなど分割から求められる値は保存せず、読み込み時または`export`時に算出します。
+
+`measurement.best_basin = true`で、暫定解から実目的関数による山登りを行い、各計測点に`basin_best`を追加します。現行解からの`measurement.basin`とは独立に選べます。同じ暫定分割が続く間は完了済みの計測を再利用し、探索には影響させません。ベイスン終点の分割は保存しません。既定値はfalseで、従来設定のIDと探索結果を維持します。
 
 `export`は`runs.tsv`、`traces.tsv`、`metadata.json`を生成します。これらは再生成可能な分析用ファイルで、通常の実験実行では作成されません。
 

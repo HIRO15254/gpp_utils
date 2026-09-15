@@ -40,6 +40,7 @@ mod tests {
             basin: BasinMode::None,
             max_basin_steps: 1,
             diagnostics: false,
+            best_basin: false,
         };
         assert_eq!(
             checkpoints(&m, 12),

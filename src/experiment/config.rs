@@ -80,6 +80,32 @@ pub struct Budget {
     pub max_steps: u64,
 }
 
+/// One or more step limits used to expand an experiment budget sweep.
+///
+/// The untagged representation intentionally keeps a single value identical to
+/// the historical `max_steps = 100` format.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum StepCounts {
+    One(u64),
+    Many(Vec<u64>),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetSweep {
+    pub max_steps: StepCounts,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ConditionSweep {
+    pub neighborhoods: Vec<Neighborhood>,
+    pub solvers: Vec<SolverSweep>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<BudgetSweep>,
+}
+
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Schedule {
@@ -110,6 +136,9 @@ pub struct Measurement {
     pub max_basin_steps: u64,
     #[serde(default)]
     pub diagnostics: bool,
+    /// Measure a real-objective basin starting at the incumbent partition.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub best_basin: bool,
 }
 fn default_max_basin_steps() -> u64 {
     10_000
@@ -122,6 +151,7 @@ impl Default for Measurement {
             basin: BasinMode::Both,
             max_basin_steps: 10_000,
             diagnostics: false,
+            best_basin: false,
         }
     }
 }
@@ -201,12 +231,16 @@ pub struct ExperimentSpec {
     #[serde(default)]
     pub name: Option<String>,
     pub run_seeds: Vec<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub neighborhoods: Vec<Neighborhood>,
     #[serde(default)]
     pub problem: ProblemSweep,
-    pub budget: Budget,
+    pub budget: BudgetSweep,
     #[serde(default)]
     pub measurement: Measurement,
     pub graphs: Vec<GraphSweep>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub solvers: Vec<SolverSweep>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditions: Vec<ConditionSweep>,
 }

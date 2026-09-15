@@ -222,6 +222,7 @@ pub fn run_one(
             search_evaluation: r.search_evaluation,
             basin_real: r.basin_real,
             basin_smoothed: r.basin_smoothed,
+            basin_best: None,
         })
         .collect();
     let final_solution = intern(engine.state.partition().to_vec());

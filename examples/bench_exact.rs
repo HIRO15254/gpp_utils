@@ -235,6 +235,7 @@ fn condition(
             basin,
             max_basin_steps: basin_steps,
             diagnostics,
+            best_basin: false,
         },
     }
 }

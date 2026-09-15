@@ -40,6 +40,10 @@ export/                            # gpp exportを実行したときだけ作成
 
 schema_version、versions、specを保存する。specは入力時の既定値を明示した未展開のExperimentSpecで、グラフ生成条件、近傍方式、手法パラメータの配列、探索シードの配列、予算、計測設定を持つ。元のTOML/JSONそのものと別の展開済み設定を二重保存しない。
 
+`budget.max_steps`はスカラーまたは正の整数配列。任意の`conditions[]`はグループごとの`neighborhoods`・`solvers`と、省略時に全体から継承する`budget`を持つ。グループを使う場合、ルートの近傍・ソルバー配列は空または省略する。予算配列は昇順、1要素ならスカラーへ正規化する。結果パスを計算する各展開条件の予算はスカラー一つとなる。
+
+追加計測`measurement.best_basin`の既定値falseと空の`conditions`は保存時に省略する。この省略により既存のスカラー予算・追加計測なしの条件IDとバッチIDを維持する。trueは条件IDに含め、未計測の結果を計測済みとして再利用しない。ラウンド実行の有無・期限・スレッド数は実行オプションであり、保存条件やIDに含めない。
+
 versionsはアルゴリズム、RNG導出、グラフ生成、計測、設定展開・正規化、および使用する適応度定義のバージョンを固定する。適応度の登録名はdefault、定義はgood_edge_fraction。名前とバージョンから決まる定義の説明文字列は結果へ複製しない。k_averageは設定として受け付けない。
 
 入力のグラフサイズや近傍方式から有効なKなどを算出する。展開・正規化のバージョンが未対応なら再開を拒否する。展開済みジョブ一覧、設定ID一覧、job_keyから結果への対応表は保存しない。
@@ -107,12 +111,17 @@ seed_<seed>.jsonは次の項目だけを持つ。
 |---|---|
 | basin_real | 実目的関数で山登りした結果。real、terminationを保存。非自明な平滑化がある場合のみsmoothedも保存 |
 | basin_smoothed | 平滑化で山登りした結果。real、smoothed、terminationを保存 |
+| basin_best | `best_basin=true`の場合だけ、暫定解から実目的関数で山登りした結果。real、terminationを保存。smoothedは常に省略 |
 
 terminationはlocal_optimumまたはstep_limit。値が局所最適か単なる打ち切り終点かを判別するために残す。走査数は通常保存せず、診断有効時だけstepsを追加する。
 
 noneおよびweighted_averageの有効K=0では、both指定でもbasin_realだけ保存する。対応する平滑化ベイスンは表示・export時に同じ測定結果から生成する。EOではboth要求も実空間だけに解決し、basin_smoothedは非適用とする。有効な計測モードは条件から求まるので別フィールドとして保存しない。
 
 ベイスン値は、現在スコアだけからは求められず、ベイスン終点の分割も保存しないため保持する。測定のために訪問した解を探索のbest_realへ混ぜない。
+
+`basin_real`と`basin_smoothed`は現行解を始点とし、`measurement.basin`で選ぶ。`basin_best`は独立した選択なので`basin=none`でも保存できる。同じ暫定分割が続く計測点では直前の完了した`basin_best`を再利用する。専用の同点処理RNGはグラフ内容・近傍・alpha・探索シード・暫定分割・用途ラベルから導出し、計測ステップ・計算予算・ソルバーに依存させない。実評価値は始点の暫定解以下でなければならず、同じ暫定分割を参照する完了計測はビット単位で同じ値を持つ。終点の分割・群サイズ差は保存しない。診断のstepsは初回計算時の走査数であり、キャッシュ再利用時の追加計算量ではない。累積の目的関数実計算数には再利用を含めない。
+
+暫定解ベイスンが有効な完了レコードでは`basin_best`を必須とする。中断時の最後の未完成計測は他の追加計測と同様に省略し、確定済みの現行解・暫定解参照だけを保存できる。未完成値をキャッシュに登録しない。
 
 ### 任意の診断情報
 
@@ -150,29 +159,34 @@ measurement.diagnosticsの既定値はfalse。trueの実行だけ、結果のdia
       "step": 0,
       "current_solution": 0,
       "best_solution": 0,
-      "basin_real": { "real": 2.0, "termination": "local_optimum" }
+      "basin_real": { "real": 2.0, "termination": "local_optimum" },
+      "basin_best": { "real": 2.0, "termination": "local_optimum" }
     },
     {
       "step": 1,
       "current_solution": 1,
       "best_solution": 1,
-      "basin_real": { "real": 2.0, "termination": "local_optimum" }
+      "basin_real": { "real": 2.0, "termination": "local_optimum" },
+      "basin_best": { "real": 2.0, "termination": "local_optimum" }
     },
     {
       "step": 3,
       "current_solution": 1,
       "best_solution": 1,
-      "basin_real": { "real": 2.0, "termination": "local_optimum" }
+      "basin_real": { "real": 2.0, "termination": "local_optimum" },
+      "basin_best": { "real": 2.0, "termination": "local_optimum" }
     }
   ]
 }
 ```
 
-この例の計測設定はexplicitのsteps=[1]。0と終了点3を自動追加する。step=0のベイスン値は2だが、探索の現行解・暫定解はともにpartitions[0]から復元する。終了点の現行解・暫定解はpartitions[1]を共有参照する。
+この例の計測設定はexplicitのsteps=[1]、basin=real、best_basin=true。0と終了点3を自動追加する。step=0のベイスン値は2だが、探索の現行解・暫定解はともにpartitions[0]から復元する。終了点の現行解・暫定解はpartitions[1]を共有参照し、step=3のbasin_bestはstep=1の完了計測を再利用する。
 
 ## 6. 再開・失敗を扱う最小の運用データ
 
 plan.json、manifest.json、summary.json、展開済みジョブ一覧、状態一覧の正本は作らない。inspect・resumeはexperiment.jsonを再展開し、期待する結果パスを求め、ファイルを検証して状態と件数をその都度計算する。BatchSummaryはメモリ上の戻り値・標準出力として維持し、自動保存しない。
+
+ラウンドも保存シードの数値昇順から再構成する。`completed_rounds`と`deadline_reached`はBatchSummaryだけに含める。期限による停止では未開始ジョブのマーカーを作らず、実行中のラウンドの確定を待つ。再開時は既存の完了結果を再利用して不足分を実行するため、ラウンド用マニフェストやタイマー状態を保存しない。
 
 ジョブ開始時にseed_<seed>.incomplete.jsonを小さなマーカーとして作る。内容はschema_version、attempt_id、status=running。協調的中断または失敗時に、status=cancelled/failed、error（code/messageと必要最小限の文脈）、保存可能なpartial_resultへ更新する。条件や完了結果は複製しない。
 
@@ -197,25 +211,25 @@ exportは条件・グラフ・疎な結果を読み、便利な表へ展開す�
 1. batch_id、condition_id、seed、status、latest_attempt_status、termination。
 2. graph_id、graph_kind、node_count、expected_degree、graph_seed、edge_count、actual_average_degree、alpha、neighborhood。
 3. solver、temperature、tau、smoothing、k、fitness、fitness_version、fitness_params_json。
-4. completed_steps、best_step、initial_real、final_real、best_real、final_cut_edges、final_size_a、final_size_b、final_balance_penalty、best_cut_edges、best_size_a、best_size_b、best_balance_penalty、elapsed_ms。
-5. final_basin_real_from_real、final_basin_real_status、final_basin_real_from_smoothed、final_basin_smoothed_status。
+4. max_steps、completed_steps、best_step、initial_real、final_real、best_real、final_cut_edges、final_size_a、final_size_b、final_balance_penalty、best_cut_edges、best_size_a、best_size_b、best_balance_penalty、elapsed_ms。
+5. final_basin_real_from_real、final_basin_real_status、final_basin_real_from_smoothed、final_basin_smoothed_status、final_basin_real_from_best、final_basin_best_status。
 6. applied_moves、accepted_moves、rejected_moves、objective_evaluations_search、objective_evaluations_measurement、fitness_values_computed_search、search_ms、measurement_ms。
 
 条件はexperiment.jsonの展開結果から、グラフの統計は辺リストから、初期・最終・最良の評価内訳は参照分割から算出する。completed_steps=0の部分結果も確定した分割から算出する。未開始・失敗ジョブも条件と状態の行は出し、結果のない列は空欄。診断無効時は診断由来列も空欄。通常の正本にこの表を保存しない。
 
 ### traces.tsv：1計測点1行
 
-列順はcondition_id、seed、status、step、current_solution、best_solution、current_real、best_real、search_evaluation、current_smoothed、basin_real_from_real、basin_smoothed_from_real、basin_real_status、basin_real_steps、basin_real_from_smoothed、basin_smoothed_from_smoothed、basin_smoothed_status、basin_smoothed_steps。current_solutionとbest_solutionはSolutionIdであり、実評価値はそこから生成する。
+列順はcondition_id、seed、status、step、current_real、best_real、search_evaluation、current_smoothed、basin_real_from_real、basin_smoothed_from_real、basin_real_status、basin_real_steps、basin_real_from_smoothed、basin_smoothed_from_smoothed、basin_smoothed_status、basin_smoothed_steps、basin_real_from_best、basin_best_status、basin_best_steps。実評価値はJSONのcurrent_solutionとbest_solution参照から生成する。
 
-初期・終了点の実評価値、noneの場合の平滑化値、重複を省略したベイスン値は、前述の規則で補完する。current_solutionとbest_solutionは保存されたpartitionsへの参照として出力する。途中のスコア内訳・時間・カウンターは元データがないため追加しない。EOの平滑化列は空欄。未計測や診断無効のstepsも空欄。condition_idとseedでruns.tsvへ結合できる。
+初期・終了点の実評価値、noneの場合の平滑化値、重複を省略したベイスン値は、前述の規則で補完する。分割配列とSolutionIdはTSVへ複製しない。保存された途中計測点のカット数・群サイズ・ペナルティはJSONの参照分割から取得できる。途中の時間・カウンターは元データがないため追加しない。EOの平滑化列は空欄。未計測や診断無効のstepsも空欄。condition_idとseedでruns.tsvへ結合できる。
 
 出力例の主要列だけを抜き出すと次の表になる。
 
-| step | current_solution | best_solution | current_real | best_real | basin_real_from_real | basin_real_status |
+| step | current_real | best_real | basin_real_from_real | basin_real_status | basin_real_from_best | basin_best_status |
 |---|---|---|---|---|---|---|
-| 0 | 0 | 0 | 4 | 4 | 2 | local_optimum |
-| 1 | 1 | 1 | 2 | 2 | 2 | local_optimum |
-| 3 | 1 | 1 | 2 | 2 | 2 | local_optimum |
+| 0 | 4 | 4 | 2 | local_optimum | 2 | local_optimum |
+| 1 | 2 | 2 | 2 | local_optimum | 2 | local_optimum |
+| 3 | 2 | 2 | 2 | local_optimum | 2 | local_optimum |
 
 --include-incomplete指定時だけ、完了結果がないジョブの最新の読み取り可能な部分結果を追加する。異なる試行の系列を連結しない。有効な完了結果がある場合はそれを出力する。
 

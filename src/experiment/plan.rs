@@ -194,6 +194,7 @@ fn compile_with_stored(mut stored: StoredExperiment) -> crate::error::Result<Exp
     let mut graphs = BTreeSet::new();
     let mut conditions = BTreeSet::new();
     let mut graph_ids = BTreeMap::new();
+    let condition_groups = expand_condition_groups(&stored.spec)?;
     for graph in expand_graphs(&stored.spec)? {
         validate_graph(&graph, stored.spec.problem.alpha)?;
         let graph_id = hash(&(&graph, stored.versions.get("generation")))?;
@@ -206,36 +207,40 @@ fn compile_with_stored(mut stored: StoredExperiment) -> crate::error::Result<Exp
         let graph_id = graph_ids
             .remove(&graph.clone_key())
             .expect("expanded graph exists");
-        for neighborhood in &stored.spec.neighborhoods {
-            if matches!(neighborhood, Neighborhood::Swap) && graph.node_count % 2 != 0 {
-                bail!(
-                    "swap requires an even node_count (got {})",
-                    graph.node_count
-                );
-            }
-            for solver in expand_solvers(&stored.spec.solvers, graph.node_count, neighborhood)? {
-                let condition = Condition {
-                    graph: graph.clone(),
-                    neighborhood: *neighborhood,
-                    alpha: stored.spec.problem.alpha,
-                    solver,
-                    budget: stored.spec.budget,
-                    measurement: stored.spec.measurement.clone(),
-                };
-                let condition_id = hash(&(
-                    &condition,
-                    condition_versions(&stored.versions, &condition.solver)?,
-                ))?;
-                if !conditions.insert(condition_id.clone()) {
-                    bail!("duplicate effective condition");
+        for group in &condition_groups {
+            for neighborhood in &group.neighborhoods {
+                if matches!(neighborhood, Neighborhood::Swap) && graph.node_count % 2 != 0 {
+                    bail!(
+                        "swap requires an even node_count (got {})",
+                        graph.node_count
+                    );
                 }
-                for &seed in &stored.spec.run_seeds {
-                    jobs.push(Job {
-                        condition_id: condition_id.clone(),
-                        graph_id: graph_id.clone(),
-                        condition: condition.clone(),
-                        seed,
-                    });
+                for solver in expand_solvers(&group.solvers, graph.node_count, neighborhood)? {
+                    for budget in &group.budgets {
+                        let condition = Condition {
+                            graph: graph.clone(),
+                            neighborhood: *neighborhood,
+                            alpha: stored.spec.problem.alpha,
+                            solver: solver.clone(),
+                            budget: *budget,
+                            measurement: stored.spec.measurement.clone(),
+                        };
+                        let condition_id = hash(&(
+                            &condition,
+                            condition_versions(&stored.versions, &condition.solver)?,
+                        ))?;
+                        if !conditions.insert(condition_id.clone()) {
+                            bail!("duplicate effective condition");
+                        }
+                        for &seed in &stored.spec.run_seeds {
+                            jobs.push(Job {
+                                condition_id: condition_id.clone(),
+                                graph_id: graph_id.clone(),
+                                condition: condition.clone(),
+                                seed,
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -274,12 +279,16 @@ fn condition_versions(
 
 fn requested_fitnesses(spec: &ExperimentSpec) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
-    for solver in &spec.solvers {
-        if let SolverSweep::Eo { fitnesses, .. } = solver {
-            if let Some(fitnesses) = fitnesses {
-                names.extend(fitnesses.iter().map(|f| f.kind.clone()));
-            } else {
-                names.insert("default".into());
+    for solvers in std::iter::once(&spec.solvers)
+        .chain(spec.conditions.iter().map(|condition| &condition.solvers))
+    {
+        for solver in solvers {
+            if let SolverSweep::Eo { fitnesses, .. } = solver {
+                if let Some(fitnesses) = fitnesses {
+                    names.extend(fitnesses.iter().map(|f| f.kind.clone()));
+                } else {
+                    names.insert("default".into());
+                }
             }
         }
     }
@@ -337,7 +346,19 @@ fn normalize_spec(spec: &mut ExperimentSpec) -> crate::error::Result<()> {
             }
         }
     }
-    for solver in &mut spec.solvers {
+    normalize_solvers(&mut spec.solvers);
+    for condition in &mut spec.conditions {
+        normalize_budget_sweep(condition.budget.as_mut(), "conditions.budget")?;
+        normalize_solvers(&mut condition.solvers);
+    }
+    normalize_budget_sweep(Some(&mut spec.budget), "budget")?;
+    spec.conditions
+        .sort_by_key(|condition| hash(condition).expect("condition is serializable"));
+    Ok(())
+}
+
+fn normalize_solvers(solvers: &mut [SolverSweep]) {
+    for solver in solvers {
         match solver {
             SolverSweep::Sa { temperatures, .. } => {
                 for t in temperatures {
@@ -366,24 +387,58 @@ fn normalize_spec(spec: &mut ExperimentSpec) -> crate::error::Result<()> {
             _ => {}
         }
     }
+}
+
+fn normalize_budget_sweep(
+    budget: Option<&mut BudgetSweep>,
+    label: &str,
+) -> crate::error::Result<()> {
+    let Some(budget) = budget else {
+        return Ok(());
+    };
+    match &mut budget.max_steps {
+        StepCounts::One(steps) => {
+            if *steps == 0 {
+                bail!("{label}.max_steps must be at least 1");
+            }
+        }
+        StepCounts::Many(steps) => {
+            if steps.is_empty() || steps.contains(&0) {
+                bail!("{label}.max_steps must be non-empty and positive");
+            }
+            unique(steps, &format!("{label}.max_steps"))?;
+            steps.sort_unstable();
+            if steps.len() == 1 {
+                budget.max_steps = StepCounts::One(steps[0]);
+            }
+        }
+    }
     Ok(())
 }
 
 fn validate_top_level(spec: &ExperimentSpec) -> crate::error::Result<()> {
-    if spec.run_seeds.is_empty()
-        || spec.neighborhoods.is_empty()
-        || spec.graphs.is_empty()
-        || spec.solvers.is_empty()
-    {
-        bail!("run_seeds, neighborhoods, graphs, and solvers must be non-empty");
+    if spec.run_seeds.is_empty() || spec.graphs.is_empty() {
+        bail!("run_seeds and graphs must be non-empty");
+    }
+    if spec.conditions.is_empty() {
+        if spec.neighborhoods.is_empty() || spec.solvers.is_empty() {
+            bail!("neighborhoods and solvers must be non-empty without conditions");
+        }
+    } else {
+        if !spec.neighborhoods.is_empty() || !spec.solvers.is_empty() {
+            bail!("neighborhoods and solvers must be empty when conditions are specified");
+        }
+        for condition in &spec.conditions {
+            if condition.neighborhoods.is_empty() || condition.solvers.is_empty() {
+                bail!("condition neighborhoods and solvers must be non-empty");
+            }
+            unique(&condition.neighborhoods, "conditions.neighborhoods")?;
+        }
     }
     unique(&spec.run_seeds, "run_seeds")?;
     unique(&spec.neighborhoods, "neighborhoods")?;
     if !spec.problem.alpha.is_finite() || spec.problem.alpha < 0.0 {
         bail!("problem.alpha must be finite and non-negative");
-    }
-    if spec.budget.max_steps == 0 {
-        bail!("budget.max_steps must be at least 1");
     }
     if spec.measurement.max_basin_steps == 0 {
         bail!("measurement.max_basin_steps must be at least 1");
@@ -395,13 +450,14 @@ fn validate_top_level(spec: &ExperimentSpec) -> crate::error::Result<()> {
         _ => {}
     }
     unique(&spec.measurement.steps, "measurement.steps")?;
-    if spec
-        .measurement
-        .steps
-        .iter()
-        .any(|&step| step > spec.budget.max_steps)
-    {
-        bail!("measurement.steps must not exceed budget.max_steps");
+    let groups = expand_condition_groups(spec)?;
+    if spec.measurement.steps.iter().any(|&step| {
+        groups
+            .iter()
+            .flat_map(|group| group.budgets.iter())
+            .any(|budget| step > budget.max_steps)
+    }) {
+        bail!("measurement.steps must not exceed every effective budget.max_steps");
     }
     for graph in &spec.graphs {
         if graph.node_counts.is_empty()
@@ -414,6 +470,46 @@ fn validate_top_level(spec: &ExperimentSpec) -> crate::error::Result<()> {
         unique(&graph.seeds, "graphs.seeds")?;
     }
     Ok(())
+}
+
+#[derive(Clone)]
+struct ConditionGroup {
+    neighborhoods: Vec<Neighborhood>,
+    solvers: Vec<SolverSweep>,
+    budgets: Vec<Budget>,
+}
+
+fn expand_budget(budget: &BudgetSweep) -> Vec<Budget> {
+    match &budget.max_steps {
+        StepCounts::One(max_steps) => vec![Budget {
+            max_steps: *max_steps,
+        }],
+        StepCounts::Many(max_steps) => max_steps
+            .iter()
+            .map(|max_steps| Budget {
+                max_steps: *max_steps,
+            })
+            .collect(),
+    }
+}
+
+fn expand_condition_groups(spec: &ExperimentSpec) -> crate::error::Result<Vec<ConditionGroup>> {
+    if spec.conditions.is_empty() {
+        return Ok(vec![ConditionGroup {
+            neighborhoods: spec.neighborhoods.clone(),
+            solvers: spec.solvers.clone(),
+            budgets: expand_budget(&spec.budget),
+        }]);
+    }
+    Ok(spec
+        .conditions
+        .iter()
+        .map(|condition| ConditionGroup {
+            neighborhoods: condition.neighborhoods.clone(),
+            solvers: condition.solvers.clone(),
+            budgets: expand_budget(condition.budget.as_ref().unwrap_or(&spec.budget)),
+        })
+        .collect())
 }
 
 fn unique<T: Ord + std::fmt::Debug>(items: &[T], label: &str) -> crate::error::Result<()> {
@@ -695,7 +791,7 @@ mod tests {
         let mut spec: ExperimentSpec = toml::from_str(minimal_sample_toml()).unwrap();
         spec.measurement.schedule = Schedule::Explicit;
         assert!(compile_experiment(spec.clone()).is_ok());
-        spec.measurement.steps.push(spec.budget.max_steps + 1);
+        spec.measurement.steps.push(101);
         assert!(compile_experiment(spec).is_err());
     }
 

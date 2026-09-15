@@ -102,6 +102,7 @@ pub fn run_one(
     let mut raw = Vec::new();
     let mut measurement_evals = 0u64;
     let mut measurement_ms = 0.0;
+    let mut best_basin_cache: Option<(Vec<bool>, BasinResult)> = None;
     if let Err(error) = record_if_due(
         graph,
         condition,
@@ -115,6 +116,7 @@ pub fn run_one(
         cancel,
         &mut measurement_evals,
         &mut measurement_ms,
+        &mut best_basin_cache,
     ) {
         if cancel.is_cancelled() {
             termination = RunTermination::Cancelled;
@@ -160,6 +162,7 @@ pub fn run_one(
             cancel,
             &mut measurement_evals,
             &mut measurement_ms,
+            &mut best_basin_cache,
         ) {
             if cancel.is_cancelled() {
                 termination = RunTermination::Cancelled;
@@ -196,6 +199,7 @@ pub fn run_one(
             cancel,
             &mut measurement_evals,
             &mut measurement_ms,
+            &mut best_basin_cache,
         ) {
             if !cancel.is_cancelled() {
                 return Err(error);
@@ -235,6 +239,7 @@ pub fn run_one(
             search_evaluation: r.search_evaluation,
             basin_real: r.basin_real,
             basin_smoothed: r.basin_smoothed,
+            basin_best: r.basin_best,
         })
         .collect();
     let final_solution = intern(engine.state.partition().to_vec());
@@ -278,6 +283,7 @@ struct RawRecord {
     search_evaluation: Option<f64>,
     basin_real: Option<BasinResult>,
     basin_smoothed: Option<BasinResult>,
+    basin_best: Option<BasinResult>,
 }
 impl RawRecord {
     fn plain(step: u64, current: Vec<bool>, best: Vec<bool>) -> Self {
@@ -289,6 +295,7 @@ impl RawRecord {
             search_evaluation: None,
             basin_real: None,
             basin_smoothed: None,
+            basin_best: None,
         }
     }
 }
@@ -305,9 +312,22 @@ fn record_if_due(
     cancel: &CancellationToken,
     evals: &mut u64,
     ms: &mut f64,
+    best_basin_cache: &mut Option<(Vec<bool>, BasinResult)>,
 ) -> Result<()> {
     if wanted.get(*next) == Some(&step) {
-        record(graph, c, seed, e, best, step, out, cancel, evals, ms)?;
+        record(
+            graph,
+            c,
+            seed,
+            e,
+            best,
+            step,
+            out,
+            cancel,
+            evals,
+            ms,
+            best_basin_cache,
+        )?;
         *next += 1
     }
     Ok(())
@@ -323,6 +343,7 @@ fn record(
     cancel: &CancellationToken,
     evals: &mut u64,
     ms: &mut f64,
+    best_basin_cache: &mut Option<(Vec<bool>, BasinResult)>,
 ) -> Result<()> {
     let start = Instant::now();
     let smoothing_spec = match &c.solver {
@@ -365,6 +386,7 @@ fn record(
         cancel,
         evals,
     )?;
+    let basin_best = measure_best_basin(graph, c, seed, best, cancel, evals, best_basin_cache)?;
     *ms += start.elapsed().as_secs_f64() * 1000.0;
     out.push(RawRecord {
         step,
@@ -374,8 +396,47 @@ fn record(
         search_evaluation,
         basin_real,
         basin_smoothed,
+        basin_best,
     });
     Ok(())
+}
+fn measure_best_basin(
+    graph: &Graph,
+    c: &Condition,
+    seed: u64,
+    best: &[bool],
+    cancel: &CancellationToken,
+    evals: &mut u64,
+    cache: &mut Option<(Vec<bool>, BasinResult)>,
+) -> Result<Option<BasinResult>> {
+    if !c.measurement.best_basin {
+        return Ok(None);
+    }
+    if let Some((partition, result)) = cache.as_ref() {
+        if partition == best {
+            return Ok(Some(result.clone()));
+        }
+    }
+    let hash = graph.content_hash();
+    let neighborhood = match c.neighborhood {
+        Neighborhood::Flip => b"flip".as_slice(),
+        Neighborhood::Swap => b"swap".as_slice(),
+    };
+    let alpha = c.alpha.to_bits().to_le_bytes();
+    let search_seed = seed.to_le_bytes();
+    let partition = best.iter().map(|&x| u8::from(x)).collect::<Vec<_>>();
+    let mut ties = rng_for(&[
+        hash.as_bytes(),
+        neighborhood,
+        &alpha,
+        &search_seed,
+        &partition,
+        b"basin-best-real-v1",
+    ]);
+    let state = PartitionState::new(graph, best.to_vec())?;
+    let result = basin(graph, c, &state, None, None, &mut ties, cancel, evals)?.0;
+    *cache = Some((best.to_vec(), result.clone()));
+    Ok(Some(result))
 }
 fn measure_basins(
     graph: &Graph,
@@ -529,4 +590,107 @@ fn basin(
         },
         state,
     ))
+}
+
+#[cfg(test)]
+mod best_basin_tests {
+    use super::*;
+    use crate::experiment::config::{Budget, GraphKind, GraphSpec, Measurement, Schedule};
+
+    #[test]
+    fn cancelled_best_basin_does_not_populate_cache() {
+        let graph = Graph::from_edges(2, vec![[0, 1]]).unwrap();
+        let condition = Condition {
+            graph: GraphSpec {
+                kind: GraphKind::Random,
+                node_count: 2,
+                expected_degree: 1.0,
+                seed: 0,
+            },
+            neighborhood: Neighborhood::Flip,
+            alpha: 0.0,
+            solver: SolverSpec::Hc {
+                smoothing: SmoothingSpec::None,
+            },
+            budget: Budget { max_steps: 1 },
+            measurement: Measurement {
+                schedule: Schedule::Explicit,
+                steps: vec![],
+                basin: BasinMode::None,
+                max_basin_steps: 4,
+                diagnostics: true,
+                best_basin: true,
+            },
+        };
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let mut evaluations = 0;
+        let mut cache = None;
+        assert!(
+            measure_best_basin(
+                &graph,
+                &condition,
+                5,
+                &[true, false],
+                &cancel,
+                &mut evaluations,
+                &mut cache,
+            )
+            .is_err()
+        );
+        assert!(cache.is_none());
+    }
+
+    #[test]
+    fn real_basin_matches_exhaustive_optimum_on_complete_four_vertex_graph() {
+        let graph =
+            Graph::from_edges(4, vec![[0, 1], [0, 2], [0, 3], [1, 2], [1, 3], [2, 3]]).unwrap();
+        let condition = Condition {
+            graph: GraphSpec {
+                kind: GraphKind::Random,
+                node_count: 4,
+                expected_degree: 3.0,
+                seed: 0,
+            },
+            neighborhood: Neighborhood::Flip,
+            alpha: 1.0,
+            solver: SolverSpec::Hc {
+                smoothing: SmoothingSpec::None,
+            },
+            budget: Budget { max_steps: 1 },
+            measurement: Measurement {
+                schedule: Schedule::Explicit,
+                steps: vec![],
+                basin: BasinMode::None,
+                max_basin_steps: 8,
+                diagnostics: true,
+                best_basin: true,
+            },
+        };
+        let start = PartitionState::new(&graph, vec![false; 4]).unwrap();
+        let mut ties = rng_for(&[b"exhaustive-four"]);
+        let mut evaluations = 0;
+        let result = basin(
+            &graph,
+            &condition,
+            &start,
+            None,
+            None,
+            &mut ties,
+            &CancellationToken::new(),
+            &mut evaluations,
+        )
+        .unwrap()
+        .0;
+        let exhaustive = (0u8..16)
+            .map(|bits| {
+                let partition = (0..4).map(|i| bits & (1 << i) != 0).collect::<Vec<_>>();
+                graph.score(&partition, condition.alpha)
+            })
+            .min_by(f64::total_cmp)
+            .unwrap();
+        assert_eq!(result.real, exhaustive);
+        assert_eq!(result.real, 4.0);
+        assert_eq!(result.termination, BasinTermination::LocalOptimum);
+    }
 }

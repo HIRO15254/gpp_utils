@@ -41,6 +41,7 @@ fn condition(solver: SolverSpec, neighborhood: Neighborhood, diagnostics: bool) 
             basin: BasinMode::None,
             max_basin_steps: 20,
             diagnostics,
+            best_basin: false,
         },
     }
 }
@@ -358,6 +359,8 @@ fn failed_overwrite_preserves_completed_result_and_reports_latest_failure() {
         threads: 1,
         overwrite: false,
         recover_corrupt: false,
+        rounds: false,
+        round_deadline: None,
     };
     run_batch(
         &plan,
@@ -405,6 +408,8 @@ fn cancelled_partial_result_is_exported_only_when_requested() {
         threads: 1,
         overwrite: false,
         recover_corrupt: false,
+        rounds: false,
+        round_deadline: None,
     };
     let summary = run_batch(&plan, &options, &cancel, &registry, &|_| {}).unwrap();
     assert_eq!(summary.cancelled, 1);
@@ -442,6 +447,8 @@ fn batch_results_are_independent_of_worker_count() {
             threads,
             overwrite: false,
             recover_corrupt: false,
+            rounds: false,
+            round_deadline: None,
         };
         let summary = run_batch(
             &plan,
@@ -481,6 +488,8 @@ fn storage_reuses_valid_result_and_rejects_corruption_without_overwriting_it() {
         threads: 1,
         overwrite: false,
         recover_corrupt: false,
+        rounds: false,
+        round_deadline: None,
     };
     let first = run_batch(
         &plan,

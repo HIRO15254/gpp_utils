@@ -20,8 +20,8 @@ pub struct ExportSummary {
     pub trace_rows: usize,
     pub incomplete_included: bool,
 }
-const RUNS: &str = "batch_id condition_id seed status latest_attempt_status termination graph_id graph_kind node_count expected_degree graph_seed edge_count actual_average_degree alpha neighborhood solver temperature tau smoothing k fitness fitness_version fitness_params_json completed_steps best_step initial_real final_real best_real final_cut_edges final_size_a final_size_b final_balance_penalty best_cut_edges best_size_a best_size_b best_balance_penalty elapsed_ms final_basin_real_from_real final_basin_real_status final_basin_real_from_smoothed final_basin_smoothed_status applied_moves accepted_moves rejected_moves objective_evaluations_search objective_evaluations_measurement fitness_values_computed_search search_ms measurement_ms";
-const TRACES: &str = "condition_id seed status step current_real best_real search_evaluation current_smoothed basin_real_from_real basin_smoothed_from_real basin_real_status basin_real_steps basin_real_from_smoothed basin_smoothed_from_smoothed basin_smoothed_status basin_smoothed_steps";
+const RUNS: &str = "batch_id condition_id seed status latest_attempt_status termination graph_id graph_kind node_count expected_degree graph_seed edge_count actual_average_degree alpha neighborhood solver temperature tau smoothing k fitness fitness_version fitness_params_json max_steps completed_steps best_step initial_real final_real best_real final_cut_edges final_size_a final_size_b final_balance_penalty best_cut_edges best_size_a best_size_b best_balance_penalty elapsed_ms final_basin_real_from_real final_basin_real_status final_basin_real_from_smoothed final_basin_smoothed_status final_basin_real_from_best final_basin_best_status applied_moves accepted_moves rejected_moves objective_evaluations_search objective_evaluations_measurement fitness_values_computed_search search_ms measurement_ms";
+const TRACES: &str = "condition_id seed status step current_real best_real search_evaluation current_smoothed basin_real_from_real basin_smoothed_from_real basin_real_status basin_real_steps basin_real_from_smoothed basin_smoothed_from_smoothed basin_smoothed_status basin_smoothed_steps basin_real_from_best basin_best_status basin_best_steps";
 fn enum_text<T: Serialize>(v: &T) -> String {
     serde_json::to_value(v)
         .unwrap_or(Value::Null)
@@ -194,6 +194,7 @@ pub fn export_tsv(
                 .cloned()
                 .unwrap_or_default(),
             params,
+            c.budget.max_steps.to_string(),
             field(&v, "completed_steps"),
             field(&v, "best_step"),
         ]);
@@ -215,11 +216,14 @@ pub fn export_tsv(
             .unwrap_or(Value::Null);
         let br = basin(&last, c, false);
         let bs = basin(&last, c, true);
+        let bb = last["basin_best"].clone();
         cells.extend([
             field(&br, "real"),
             field(&br, "termination"),
             field(&bs, "real"),
             field(&bs, "termination"),
+            field(&bb, "real"),
+            field(&bb, "termination"),
         ]);
         let d = &v["diagnostics"];
         let applied = field(d, "applied_moves");
@@ -266,6 +270,7 @@ pub fn export_tsv(
                 };
                 let br = basin(rv, c, false);
                 let bs = basin(rv, c, true);
+                let bb = rv["basin_best"].clone();
                 row(
                     &mut traces,
                     vec![
@@ -285,6 +290,9 @@ pub fn export_tsv(
                         basin_smooth(&bs, c),
                         field(&bs, "termination"),
                         field(&bs, "steps"),
+                        field(&bb, "real"),
+                        field(&bb, "termination"),
+                        field(&bb, "steps"),
                     ],
                 );
                 trace_rows += 1;
@@ -326,6 +334,7 @@ fn column_type(name: &str) -> &'static str {
             | "step"
             | "best_step"
             | "completed_steps"
+            | "max_steps"
     ) || name.contains("moves")
         || name.contains("evaluations")
         || name.contains("computed")
@@ -339,5 +348,5 @@ fn column_type(name: &str) -> &'static str {
     }
 }
 fn column_meaning(name: &str) -> String {
-    match name {"current_real"=>"Real objective of current partition".into(),"best_real"=>"Real objective of incumbent partition across every visited step".into(),"search_evaluation"=>"Evaluation retained by the search; blank for EO or unavailable measurement".into(),"latest_attempt_status"=>"Latest unfinished attempt, separately from a reusable completed result".into(),"elapsed_ms"=>"Run initialization, search and measurement time; excludes graph generation and disk write".into(),"fitness"=>"Registered vertex fitness name".into(),"k"=>"Effective smoothing sample count".into(),_=>name.replace('_'," ")}
+    match name {"current_real"=>"Real objective of current partition".into(),"best_real"=>"Real objective of incumbent partition across every visited step".into(),"basin_real_from_best"|"final_basin_real_from_best"=>"Real objective reached by a real-objective basin descent from the incumbent partition".into(),"basin_best_status"|"final_basin_best_status"=>"Termination status of real-objective basin descent from the incumbent partition".into(),"basin_best_steps"=>"Scanned basin steps from the incumbent partition; present when diagnostics are enabled".into(),"search_evaluation"=>"Evaluation retained by the search; blank for EO or unavailable measurement".into(),"latest_attempt_status"=>"Latest unfinished attempt, separately from a reusable completed result".into(),"elapsed_ms"=>"Run initialization, search and measurement time; excludes graph generation and disk write".into(),"fitness"=>"Registered vertex fitness name".into(),"k"=>"Effective smoothing sample count".into(),_=>name.replace('_'," ")}
 }

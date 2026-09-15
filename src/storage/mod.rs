@@ -16,11 +16,11 @@ use anyhow::{Context, bail};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, OnceLock},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Debug, Clone)]
@@ -29,6 +29,8 @@ pub struct RuntimeOptions {
     pub threads: usize,
     pub overwrite: bool,
     pub recover_corrupt: bool,
+    pub rounds: bool,
+    pub round_deadline: Option<Duration>,
 }
 impl Default for RuntimeOptions {
     fn default() -> Self {
@@ -37,6 +39,8 @@ impl Default for RuntimeOptions {
             threads: std::thread::available_parallelism().map_or(1, usize::from),
             overwrite: false,
             recover_corrupt: false,
+            rounds: false,
+            round_deadline: None,
         }
     }
 }
@@ -48,6 +52,8 @@ pub struct BatchSummary {
     pub failed: usize,
     pub cancelled: usize,
     pub not_started: usize,
+    pub completed_rounds: usize,
+    pub deadline_reached: bool,
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct JobEvent {
@@ -278,8 +284,12 @@ pub fn run_batch(
     registry: &FitnessRegistry,
     event_sink: &(dyn Fn(JobEvent) + Sync),
 ) -> Result<BatchSummary> {
+    let started = Instant::now();
     if options.threads == 0 {
         bail!("threads must be >= 1");
+    }
+    if options.round_deadline.is_some() && !options.rounds {
+        bail!("round deadline requires rounds execution");
     }
     let compiled = compile_stored(plan.experiment.clone())?;
     if compiled.batch_id != plan.batch_id || compiled.jobs != plan.jobs {
@@ -309,30 +319,68 @@ pub fn run_batch(
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(options.threads)
         .build()?;
-    let statuses: Vec<String> = pool.install(|| {
-        plan.jobs
-            .par_iter()
-            .map(|job| {
-                if cancel.is_cancelled() {
-                    return "not_started".into();
-                }
-                let result = run_job(job, options, cancel, registry, &graphs[&job.graph_id]);
-                let (status, message) = match result {
-                    Ok(s) => (s, None),
-                    Err(e) => ("failed".into(), Some(format!("{e:#}"))),
-                };
-                event_sink(JobEvent {
-                    condition_id: job.condition_id.clone(),
-                    seed: job.seed,
-                    status: status.clone(),
-                    message,
-                });
-                status
-            })
-            .collect()
-    });
+    let execute = |job: &Job| {
+        if cancel.is_cancelled() {
+            return "not_started".into();
+        }
+        let result = run_job(job, options, cancel, registry, &graphs[&job.graph_id]);
+        let (status, message) = match result {
+            Ok(s) => (s, None),
+            Err(e) => ("failed".into(), Some(format!("{e:#}"))),
+        };
+        event_sink(JobEvent {
+            condition_id: job.condition_id.clone(),
+            seed: job.seed,
+            status: status.clone(),
+            message,
+        });
+        status
+    };
+    let mut completed_rounds = 0;
+    let mut deadline_reached = false;
+    let statuses: Vec<String> = if options.rounds {
+        let mut statuses = vec!["not_started".to_owned(); plan.jobs.len()];
+        let mut rounds: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
+        for (index, job) in plan.jobs.iter().enumerate() {
+            rounds.entry(job.seed).or_default().push(index);
+        }
+        for indices in rounds.values() {
+            if cancel.is_cancelled() {
+                break;
+            }
+            if options
+                .round_deadline
+                .is_some_and(|deadline| started.elapsed() >= deadline)
+            {
+                deadline_reached = true;
+                break;
+            }
+            let round: Vec<String> = pool.install(|| {
+                indices
+                    .par_iter()
+                    .map(|&index| execute(&plan.jobs[index]))
+                    .collect()
+            });
+            for (&index, status) in indices.iter().zip(round.iter()) {
+                statuses[index] = status.clone();
+            }
+            if round
+                .iter()
+                .all(|status| matches!(status.as_str(), "completed" | "reused"))
+            {
+                completed_rounds += 1;
+            } else {
+                break;
+            }
+        }
+        statuses
+    } else {
+        pool.install(|| plan.jobs.par_iter().map(execute).collect())
+    };
     let mut summary = BatchSummary {
         batch_id: plan.batch_id.clone(),
+        completed_rounds,
+        deadline_reached,
         ..Default::default()
     };
     for status in statuses {
