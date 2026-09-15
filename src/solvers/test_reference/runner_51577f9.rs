@@ -1,5 +1,4 @@
-#![allow(clippy::too_many_arguments, clippy::collapsible_if)]
-
+use super::{Engine, StepStatus};
 use crate::error::{Error, Result};
 use crate::experiment::config::{BasinMode, Condition, Neighborhood, SmoothingSpec, SolverSpec};
 use crate::experiment::measurement::checkpoints;
@@ -11,7 +10,6 @@ use crate::fitness::FitnessRegistry;
 use crate::graph_partition::{Graph, PartitionState};
 use crate::optimization::{CancellationToken, rng_for};
 use crate::smoothing;
-use crate::solvers::{Engine, StepStatus};
 use rand_mt::Mt19937GenRand64;
 use std::{
     collections::BTreeMap,
@@ -84,13 +82,6 @@ pub fn run_one(
     }
     let started = Instant::now();
     let mut engine = Engine::new(graph, condition, seed, registry, cancel)?;
-    let search_is_real = matches!(
-        condition.solver,
-        SolverSpec::Sa {
-            smoothing: SmoothingSpec::None | SmoothingSpec::WeightedAverage { k: 0 },
-            ..
-        }
-    );
     let initial = engine.state.partition().to_vec();
     let mut best = initial.clone();
     let mut best_score = engine.state.score(condition.alpha);
@@ -137,14 +128,10 @@ pub fn run_one(
             Err(e) => return Err(e),
         };
         completed += 1;
-        let real = if search_is_real {
-            engine.search_evaluation
-        } else {
-            engine.state.score(condition.alpha)
-        };
+        let real = engine.state.score(condition.alpha);
         if real < best_score {
             best_score = real;
-            best.copy_from_slice(engine.state.partition());
+            best = engine.state.partition().to_vec();
             best_step = completed
         }
         if let Err(error) = record_if_due(
@@ -479,9 +466,9 @@ fn basin(
             if i & 1023 == 0 {
                 cancel.check()?
             }
+            let mut candidate = state.clone();
+            smoothing::apply(&mut candidate, graph, mv);
             let x = if let Some(s) = spec {
-                let mut candidate = state.clone();
-                smoothing::apply(&mut candidate, graph, mv);
                 let mut evaluation_rng = fixed_rng.clone();
                 smoothing::evaluate(
                     &candidate,
@@ -495,9 +482,7 @@ fn basin(
                 )?
             } else {
                 *evals += 1;
-                // Evaluate the same resulting integer cut/size counts without
-                // cloning or applying a move that will usually be discarded.
-                smoothing::move_score(&state, graph, mv, c.alpha)
+                candidate.score(c.alpha)
             };
             if x < best {
                 best = x;

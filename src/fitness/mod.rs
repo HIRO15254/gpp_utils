@@ -88,11 +88,7 @@ impl VertexFitness for DefaultFitness {
                 if d == 0 {
                     1.0
                 } else {
-                    let good = g
-                        .neighbors(v)
-                        .iter()
-                        .filter(|&&u| s.partition()[u] == s.partition()[v])
-                        .count();
+                    let good = d as i64 - s.cuts_at()[v];
                     good as f64 / d as f64
                 }
             })

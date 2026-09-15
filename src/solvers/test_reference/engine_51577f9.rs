@@ -22,10 +22,6 @@ pub struct Engine<'a> {
     tie_rng: Mt19937GenRand64,
     smooth_rng: Mt19937GenRand64,
     fitness: Option<Box<dyn VertexFitness>>,
-    eo_ranked: Vec<usize>,
-    eo_first_weights: Vec<f64>,
-    eo_eligible: Vec<(usize, usize)>,
-    eo_conditional_weights: Vec<f64>,
     pub objective_evaluations: u64,
     pub fitness_values: u64,
     pub applied_moves: u64,
@@ -100,30 +96,12 @@ impl<'a> Engine<'a> {
                 b"smooth",
             ]),
             fitness: None,
-            eo_ranked: Vec::new(),
-            eo_first_weights: Vec::new(),
-            eo_eligible: Vec::new(),
-            eo_conditional_weights: Vec::new(),
             objective_evaluations: 0,
             fitness_values: 0,
             applied_moves: 0,
         };
-        if let SolverSpec::Eo { fitness, tau } = &condition.solver {
+        if let SolverSpec::Eo { fitness, .. } = &condition.solver {
             e.fitness = Some(registry.create(fitness)?);
-            e.eo_ranked = (0..graph.node_count).collect();
-            e.eo_first_weights = (1..=graph.node_count)
-                .map(|rank| {
-                    if rank == 1 {
-                        1.0
-                    } else {
-                        (-*tau * (rank as f64 / 1.0f64).ln()).exp()
-                    }
-                })
-                .collect();
-            if matches!(condition.neighborhood, Neighborhood::Swap) {
-                e.eo_eligible.reserve(graph.node_count);
-                e.eo_conditional_weights.reserve(graph.node_count);
-            }
             e.search_evaluation = e.state.score(condition.alpha);
             e.objective_evaluations += 1
         } else {
@@ -169,10 +147,6 @@ impl<'a> Engine<'a> {
                 &mut self.objective_evaluations,
             )?;
         }
-        let real_move_scores = matches!(
-            spec,
-            SmoothingSpec::None | SmoothingSpec::WeightedAverage { k: 0 }
-        );
         let mut best = self.search_evaluation;
         let mut choice = None;
         let mut ties = 0u64;
@@ -180,25 +154,19 @@ impl<'a> Engine<'a> {
             if i & 1023 == 0 {
                 cancel.check()?
             }
-            let x = if real_move_scores {
-                let x = smoothing::move_score(&self.state, self.graph, mv, self.condition.alpha);
-                self.objective_evaluations += 1;
-                x
-            } else {
-                smoothing::apply(&mut self.state, self.graph, mv);
-                let evaluated = smoothing::evaluate(
-                    &self.state,
-                    self.graph,
-                    self.condition.alpha,
-                    self.condition.neighborhood,
-                    &spec,
-                    Some(&mut self.smooth_rng),
-                    cancel,
-                    &mut self.objective_evaluations,
-                );
-                smoothing::apply(&mut self.state, self.graph, mv);
-                evaluated?
-            };
+            smoothing::apply(&mut self.state, self.graph, mv);
+            let evaluated = smoothing::evaluate(
+                &self.state,
+                self.graph,
+                self.condition.alpha,
+                self.condition.neighborhood,
+                &spec,
+                Some(&mut self.smooth_rng),
+                cancel,
+                &mut self.objective_evaluations,
+            );
+            smoothing::apply(&mut self.state, self.graph, mv);
+            let x = evaluated?;
             if !x.is_finite() {
                 return Err(Error::msg("non-finite search evaluation"));
             }
@@ -317,32 +285,20 @@ impl<'a> Engine<'a> {
         if fit.len() != self.graph.node_count || fit.iter().any(|x| !x.is_finite()) {
             return Err(Error::msg("fitness returned invalid values"));
         }
-        // Recreate vertex order before shuffling so buffer reuse cannot affect tie order or RNG use.
-        for (rank, vertex) in self.eo_ranked.iter_mut().enumerate() {
-            *vertex = rank;
-        }
-        self.eo_ranked.shuffle(&mut self.tie_rng);
-        self.eo_ranked.sort_by(|&a, &b| fit[a].total_cmp(&fit[b]));
-        if self.eo_ranked.is_empty() {
-            return Err(Error::msg("empty EO conditional rank distribution"));
-        }
-        let first = weighted_rank_precomputed(
-            &self.eo_ranked,
-            &self.eo_first_weights,
-            &mut self.select_rng,
-        );
+        let mut ranked: Vec<usize> = (0..fit.len()).collect();
+        ranked.shuffle(&mut self.tie_rng);
+        ranked.sort_by(|&a, &b| fit[a].total_cmp(&fit[b]));
+        let first = weighted_rank(&ranked, tau, &mut self.select_rng, None, &self.state)?;
         let mv = match self.condition.neighborhood {
             Neighborhood::Flip => Move::Flip(first),
             Neighborhood::Swap => Move::Swap(
                 first,
-                weighted_rank_conditional(
-                    &self.eo_ranked,
+                weighted_rank(
+                    &ranked,
                     tau,
                     &mut self.select_rng,
-                    !self.state.partition()[first],
+                    Some(!self.state.partition()[first]),
                     &self.state,
-                    &mut self.eo_eligible,
-                    &mut self.eo_conditional_weights,
                 )?,
             ),
         };
@@ -354,56 +310,34 @@ impl<'a> Engine<'a> {
         Ok(StepStatus::Continue)
     }
 }
-fn weighted_rank_precomputed(
-    ranked: &[usize],
-    weights: &[f64],
-    rng: &mut Mt19937GenRand64,
-) -> usize {
-    let total: f64 = weights.iter().sum();
-    let mut u = rng.r#gen::<f64>() * total;
-    for (&v, &weight) in ranked.iter().zip(weights) {
-        u -= weight;
-        if u <= 0.0 {
-            return v;
-        }
-    }
-    *ranked.last().unwrap()
-}
-
-fn weighted_rank_conditional(
+fn weighted_rank(
     ranked: &[usize],
     tau: f64,
     rng: &mut Mt19937GenRand64,
-    side: bool,
+    side: Option<bool>,
     state: &PartitionState,
-    eligible: &mut Vec<(usize, usize)>,
-    weights: &mut Vec<f64>,
 ) -> Result<usize> {
-    eligible.clear();
-    eligible.extend(
-        ranked
-            .iter()
-            .enumerate()
-            .filter(|(_, v)| state.partition()[**v] == side)
-            .map(|(i, &v)| (v, i + 1)),
-    );
+    let eligible: Vec<(usize, usize)> = ranked
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| side.is_none_or(|s| state.partition()[**v] == s))
+        .map(|(i, &v)| (v, i + 1))
+        .collect();
     if eligible.is_empty() {
         return Err(Error::msg("empty EO conditional rank distribution"));
     }
-    // Conditional EO weights are normalized by the best eligible global rank, not rank 1.
     let min_rank = eligible.iter().map(|x| x.1).min().unwrap();
-    weights.clear();
-    weights.extend(eligible.iter().map(|x| {
-        if x.1 == min_rank {
+    let weight = |rank: usize| {
+        if rank == min_rank {
             1.0
         } else {
-            (-tau * (x.1 as f64 / min_rank as f64).ln()).exp()
+            (-tau * (rank as f64 / min_rank as f64).ln()).exp()
         }
-    }));
-    let total: f64 = weights.iter().sum();
+    };
+    let total: f64 = eligible.iter().map(|x| weight(x.1)).sum();
     let mut u = rng.r#gen::<f64>() * total;
-    for (&(v, _), &weight) in eligible.iter().zip(weights.iter()) {
-        u -= weight;
+    for &(v, rank) in &eligible {
+        u -= weight(rank);
         if u <= 0.0 {
             return Ok(v);
         }
@@ -423,22 +357,9 @@ mod tests {
         for seed in 0..20 {
             let mut rng = Mt19937GenRand64::new(seed);
             assert_eq!(
-                weighted_rank_conditional(
-                    &ranked,
-                    1.0e308,
-                    &mut rng,
-                    false,
-                    &state,
-                    &mut Vec::new(),
-                    &mut Vec::new(),
-                )
-                .unwrap(),
+                weighted_rank(&ranked, 1.0e308, &mut rng, Some(false), &state).unwrap(),
                 2
             );
         }
     }
 }
-
-#[cfg(test)]
-#[path = "exact_tests.rs"]
-mod exact_tests;

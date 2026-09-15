@@ -37,6 +37,9 @@ impl PartitionState {
     pub fn cut_edges(&self) -> usize {
         self.cut_edges as usize
     }
+    pub(crate) fn cuts_at(&self) -> &[i64] {
+        &self.cuts_at
+    }
     pub fn size_a(&self) -> usize {
         self.size_a
     }

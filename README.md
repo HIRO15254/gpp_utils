@@ -14,6 +14,8 @@
 
 GUI、SQA、連続緩和、`k_average`は提供しません。詳細は [docs/application-plan.md](docs/application-plan.md)、保存形式は [docs/output-format.md](docs/output-format.md)、数式は [docs/algorithms.md](docs/algorithms.md)を参照してください。
 
+計算結果を維持する高速化と再測定方法は [docs/performance.md](docs/performance.md)に記載しています。
+
 ## ビルド
 
 ```text
