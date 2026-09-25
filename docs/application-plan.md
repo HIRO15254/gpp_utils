@@ -207,7 +207,7 @@ Ctrl+Cの1回目で新規ジョブの開始を止め、実行中ジョブに協�
 
 ```text
 gpp_utils/
-├── AGENTS.md                      # 並列分担・モデル選択・検証方針
+├── AGENTS.md                      # 並列分担・モデル選択・検証方針・実験のベースライン
 ├── Cargo.toml / Cargo.lock
 ├── README.md
 ├── src/
@@ -226,12 +226,14 @@ gpp_utils/
 │   ├── basic_usage.rs
 │   ├── custom_fitness.rs          # Registryを共有する保存・再開例
 │   └── bench_search.rs / bench_exact.rs
+├── experiments_sa_eo/             # ベースラインと復旧runの仕様・生成・実行（RECOVERY_PLAN_v1.md）
 ├── tests/                         # CLI・実験受入・独立参照計算
 ├── docs/
 │   ├── application-plan.md
 │   ├── output-format.md
 │   ├── algorithms.md
 │   ├── extending.md / performance.md
+│   ├── convert_v1.md              # 旧実験履歴の新形式への変換記録
 │   └── verification.md
 ├── rust-toolchain.toml
 ├── scripts/check.py              # ローカルとCIの共通検証入口

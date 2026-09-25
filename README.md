@@ -143,4 +143,4 @@ python scripts/check.py
 
 この入口はローカルとCIで共通です。固定された`Cargo.lock`を使い、fmt、clippy、通常・docテスト、release exact regression、release build、Rustdocを検証します。
 
-実装方針、サブエージェントの並列分担、GPT-5.6 Luna/Terra/Solの複雑さ別利用方針は [AGENTS.md](AGENTS.md)に記載しています。
+実装方針、サブエージェントの並列分担、GPT-5.6 Luna/Terra/Solの複雑さ別利用方針は [AGENTS.md](AGENTS.md)に記載しています。今後の計算は、同ファイルの[実験のベースライン](AGENTS.md#実験のベースライン)（2026-09-25決定）を基準とします。
