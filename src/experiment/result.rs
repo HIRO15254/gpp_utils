@@ -68,6 +68,19 @@ pub struct RunResult {
     pub termination: RunTermination,
     pub completed_steps: u64,
     pub elapsed_ms: f64,
+    /// Deduplicated partition pool in first-reference order, indexed by
+    /// [`SolutionId`]; `true` places a vertex in group A.
+    ///
+    /// JSON stores the pool compactly as `{"length": n, "hex": [...]}`, where
+    /// `length` is the vertex count shared by every partition (`0` for an
+    /// empty pool). Each string packs vertex `v` into bit `v % 8` of byte
+    /// `v / 8` (LSB first, `true` = 1) and writes every byte as two lowercase
+    /// hexadecimal digits, so it has exactly `2 * ceil(n / 8)` digits and zero
+    /// padding bits. Serialization fails if the partitions differ in length;
+    /// deserialization rejects missing or unknown keys, non-string items, a
+    /// wrong digit count, non-hexadecimal or uppercase digits, and non-zero
+    /// padding. [`Self::validate`] checks `n` against the graph.
+    #[serde(with = "crate::experiment::partition_codec")]
     pub partitions: Vec<Vec<bool>>,
     pub final_solution: SolutionId,
     pub best_solution: SolutionId,

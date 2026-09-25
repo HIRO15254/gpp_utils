@@ -81,8 +81,8 @@ pub fn run_one(
             smoothing::validate(smoothing, graph.node_count(), condition.neighborhood)?;
         }
         SolverSpec::Eo { tau, fitness } => {
-            if !tau.is_finite() || *tau <= 0.0 {
-                return Err(Error::msg("tau must be finite and positive"));
+            if !tau.is_finite() || *tau < 0.0 {
+                return Err(Error::msg("tau must be finite and non-negative"));
             }
             registry.validate(fitness)?;
         }

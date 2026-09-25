@@ -4,7 +4,7 @@
 
 ## 変更前に決めること
 
-1. solver または fitness の変更では、評価関数、乱数消費、同点処理、停止条件、適用できる近傍を定義する。`VertexFitness` は有限な頂点適応度を返し、小さい値が低適応度を意味する。登録名、意味バージョン、パラメータの正規化を決め、`FitnessRegistry` に登録する。
+1. solver または fitness の変更では、評価関数、乱数消費、同点処理、停止条件、適用できる近傍を定義する。`VertexFitness` は有限な頂点適応度を返し、小さい値が低適応度を意味する。登録名、意味バージョン、パラメータの正規化を決め、`FitnessRegistry` に登録する。組み込み名`default`・`multiplicative`・`additive`は予約済みで、`FitnessRegistry::default()`が登録した実体だけがEO専用の差分更新索引（`EngineFitness::Builtin`）で実行される。`register`でこれらの名前を置き換えると`EngineFitness::Custom`となり、毎ステップ`VertexFitness::values()`を呼ぶ汎用経路で実行される。新しい組み込み定義を追加する場合は、`FitnessFactory`の登録に加えて`src/solvers`に索引側の対応（λの式と多数派依存状態の遷移）を実装する。索引対応を追加しなければ、その定義は登録名によらず汎用経路で実行される（動作は正しいが差分更新の高速化を受けない）。
 2. 計測の変更では、探索に影響しない専用 RNG、保存する一次データ、`RunView` が生成する派生値、キャンセル時に省略する値を決める。計測や診断の有無が探索軌跡を変えてはならない。
 3. 保存形式の変更では、JSON schema version、ハッシュ／ID に含める条件、旧結果の読み取りまたは明示的な拒否を決める。`schema_version` を変える変更は、旧結果に対するユーザー操作を先に文書化する。
 4. TSV の変更では、`ColumnSpec` を唯一の列定義として更新する。列順、型、単位、空欄規則、`metadata.json` を同時に更新し、手書きのヘッダーや説明を別に持たない。
@@ -30,7 +30,7 @@
 |---|---|---|
 | ソルバー | `experiment/config.rs`のSweep/単一Spec、`plan.rs`の検証・展開、`solvers/engine.rs`の初期化・RNG・step | `runner.rs`の直接呼び出し検証、`result.rs`の適用条件、TSVの手法列、設定例 |
 | 平滑化・近傍 | config/plan、`smoothing/mod.rs`、必要時`graph_partition/state.rs` | K正規化、候補列挙順、Flip/Swap不変条件、キャンセル周期、EO禁止条件 |
-| 適応度 | `FitnessFactory`と`VertexFitness`を利用側で実装、Registry登録 | バージョン、params検証、全頂点の順序・有限性、再開時の登録一致 |
+| 適応度 | `FitnessFactory`と`VertexFitness`を利用側で実装、Registry登録。組み込みを追加する場合は`src/solvers`の索引実装も追加 | バージョン、params検証、全頂点の順序・有限性、再開時の登録一致。組み込みは索引経路と参照実装のビット一致 |
 | 計測 | config、`runner.rs`の計測・専用RNG・キャッシュ、`result.rs`の型・検証・RunView | 初期/終了/中断、JSON省略、暫定解への非干渉、TSV、出力仕様 |
 | 保存・再開 | `storage/mod.rs`の状態分類、`storage/atomic.rs`、`error.rs` | 完了結果優先、失敗記録、排他・原子的確定、破損と未対応版の区別 |
 | TSV | `export/columns.rs`の表別の型付き列定義、`export/mod.rs`の値選択 | 順序・空欄・型・単位が同じ定義から出ること、RunViewでの補完 |
@@ -43,7 +43,7 @@
 
 1. `FitnessFactory::validate`で未知キー、型、範囲を拒否する。検証は入力を正規化しないため、別表現を許す場合の同一性とIDを先に定義する。
 2. `VertexFitness::values`は頂点番号順に頂点数ちょうどの有限値を返す。同じgraph/state/paramsには同じビット列を返し、外部の可変状態や探索RNGへ依存させない。計算結果を変えないキャッシュは許容する。
-3. 独自登録名を使う。`register`は同名の旧Factoryを返して置換するAPIなので、重複を禁止する利用側は戻り値を確認する。`default`は固定された組み込み名として予約する。
+3. 独自登録名を使う。`register`は同名の旧Factoryを返して置換するAPIなので、重複を禁止する利用側は戻り値を確認する。`default`・`multiplicative`・`additive`は固定された組み込み名として予約する。
 4. `compile_experiment_with_versions(spec, &registry.versions())`の後、`storage::validate_registry`でFactoryのparamsも検証する。版の一覧だけではFactoryの検証処理は実行できない。
 5. `run_one`/`run_batch`、保存後の`load_plan_with_registry`または`compile_stored_with_registry`へ同じ意味・版のRegistryを渡す。再開のために保存済みversion文字列だけを現行値へ書き換えてはならない。
 

@@ -1,6 +1,7 @@
+use super::eo::Eo;
 use crate::error::{Error, Result};
 use crate::experiment::config::{Condition, Neighborhood, SmoothingSpec, SolverSpec};
-use crate::fitness::{FitnessRegistry, VertexFitness};
+use crate::fitness::FitnessRegistry;
 use crate::graph_partition::{Graph, Move, PartitionState};
 use crate::optimization::{CancellationToken, rng_for};
 use crate::smoothing;
@@ -21,11 +22,7 @@ pub struct Engine<'a> {
     select_rng: Mt19937GenRand64,
     tie_rng: Mt19937GenRand64,
     smooth_rng: Mt19937GenRand64,
-    fitness: Option<Box<dyn VertexFitness>>,
-    eo_ranked: Vec<usize>,
-    eo_first_weights: Vec<f64>,
-    eo_eligible: Vec<(usize, usize)>,
-    eo_conditional_weights: Vec<f64>,
+    eo: Option<Eo>,
     pub objective_evaluations: u64,
     pub fitness_values: u64,
     pub applied_moves: u64,
@@ -99,31 +96,20 @@ impl<'a> Engine<'a> {
                 b"algorithm-v1",
                 b"smooth",
             ]),
-            fitness: None,
-            eo_ranked: Vec::new(),
-            eo_first_weights: Vec::new(),
-            eo_eligible: Vec::new(),
-            eo_conditional_weights: Vec::new(),
+            eo: None,
             objective_evaluations: 0,
             fitness_values: 0,
             applied_moves: 0,
         };
         if let SolverSpec::Eo { fitness, tau } = &condition.solver {
-            e.fitness = Some(registry.create(fitness)?);
-            e.eo_ranked = (0..graph.node_count()).collect();
-            e.eo_first_weights = (1..=graph.node_count())
-                .map(|rank| {
-                    if rank == 1 {
-                        1.0
-                    } else {
-                        (-*tau * (rank as f64 / 1.0f64).ln()).exp()
-                    }
-                })
-                .collect();
-            if matches!(condition.neighborhood, Neighborhood::Swap) {
-                e.eo_eligible.reserve(graph.node_count());
-                e.eo_conditional_weights.reserve(graph.node_count());
-            }
+            e.eo = Some(Eo::new(
+                registry.create_engine_fitness(fitness)?,
+                graph,
+                &e.state,
+                condition.neighborhood,
+                *tau,
+                &mut e.fitness_values,
+            )?);
             e.search_evaluation = e.state.score(condition.alpha);
             e.objective_evaluations += 1
         } else {
@@ -151,7 +137,7 @@ impl<'a> Engine<'a> {
         match &self.condition.solver {
             SolverSpec::Hc { .. } => self.hc(cancel),
             SolverSpec::Sa { temperature, .. } => self.sa(*temperature, cancel),
-            SolverSpec::Eo { tau, .. } => self.eo(*tau, cancel),
+            SolverSpec::Eo { .. } => self.eo(cancel),
         }
     }
     fn hc(&mut self, cancel: &CancellationToken) -> Result<StepStatus> {
@@ -307,135 +293,26 @@ impl<'a> Engine<'a> {
         }
         Ok(StepStatus::Continue)
     }
-    fn eo(&mut self, tau: f64, cancel: &CancellationToken) -> Result<StepStatus> {
-        let fit = self
-            .fitness
-            .as_ref()
-            .unwrap()
-            .values(self.graph, &self.state)?;
-        self.fitness_values += fit.len() as u64;
-        if fit.len() != self.graph.node_count() || fit.iter().any(|x| !x.is_finite()) {
-            return Err(Error::msg("fitness returned invalid values"));
-        }
-        // Recreate vertex order before shuffling so buffer reuse cannot affect tie order or RNG use.
-        for (rank, vertex) in self.eo_ranked.iter_mut().enumerate() {
-            *vertex = rank;
-        }
-        self.eo_ranked.shuffle(&mut self.tie_rng);
-        self.eo_ranked.sort_by(|&a, &b| fit[a].total_cmp(&fit[b]));
-        if self.eo_ranked.is_empty() {
-            return Err(Error::msg("empty EO conditional rank distribution"));
-        }
-        let first = weighted_rank_precomputed(
-            &self.eo_ranked,
-            &self.eo_first_weights,
+    /// One EO move (algorithm v2, see [`super::eo`]); always accepted.
+    fn eo(&mut self, cancel: &CancellationToken) -> Result<StepStatus> {
+        let eo = self
+            .eo
+            .as_mut()
+            .expect("EO conditions initialize the EO selector");
+        let mv = eo.select(
+            self.graph,
+            &self.state,
+            self.condition.neighborhood,
             &mut self.select_rng,
-        );
-        let mv = match self.condition.neighborhood {
-            Neighborhood::Flip => Move::Flip(first),
-            Neighborhood::Swap => Move::Swap(
-                first,
-                weighted_rank_conditional(
-                    &self.eo_ranked,
-                    tau,
-                    &mut self.select_rng,
-                    !self.state.partition()[first],
-                    &self.state,
-                    &mut self.eo_eligible,
-                    &mut self.eo_conditional_weights,
-                )?,
-            ),
-        };
+            &mut self.fitness_values,
+        )?;
         cancel.check()?;
         smoothing::apply(&mut self.state, self.graph, mv);
+        eo.applied(self.graph, &self.state, mv, &mut self.fitness_values);
         self.applied_moves += 1;
         self.objective_evaluations += 1;
         self.search_evaluation = self.state.score(self.condition.alpha);
         Ok(StepStatus::Continue)
-    }
-}
-fn weighted_rank_precomputed(
-    ranked: &[usize],
-    weights: &[f64],
-    rng: &mut Mt19937GenRand64,
-) -> usize {
-    let total: f64 = weights.iter().sum();
-    let mut u = rng.r#gen::<f64>() * total;
-    for (&v, &weight) in ranked.iter().zip(weights) {
-        u -= weight;
-        if u <= 0.0 {
-            return v;
-        }
-    }
-    *ranked.last().unwrap()
-}
-
-fn weighted_rank_conditional(
-    ranked: &[usize],
-    tau: f64,
-    rng: &mut Mt19937GenRand64,
-    side: bool,
-    state: &PartitionState,
-    eligible: &mut Vec<(usize, usize)>,
-    weights: &mut Vec<f64>,
-) -> Result<usize> {
-    eligible.clear();
-    eligible.extend(
-        ranked
-            .iter()
-            .enumerate()
-            .filter(|(_, v)| state.partition()[**v] == side)
-            .map(|(i, &v)| (v, i + 1)),
-    );
-    if eligible.is_empty() {
-        return Err(Error::msg("empty EO conditional rank distribution"));
-    }
-    // Conditional EO weights are normalized by the best eligible global rank, not rank 1.
-    let min_rank = eligible.iter().map(|x| x.1).min().unwrap();
-    weights.clear();
-    weights.extend(eligible.iter().map(|x| {
-        if x.1 == min_rank {
-            1.0
-        } else {
-            (-tau * (x.1 as f64 / min_rank as f64).ln()).exp()
-        }
-    }));
-    let total: f64 = weights.iter().sum();
-    let mut u = rng.r#gen::<f64>() * total;
-    for (&(v, _), &weight) in eligible.iter().zip(weights.iter()) {
-        u -= weight;
-        if u <= 0.0 {
-            return Ok(v);
-        }
-    }
-    Ok(eligible.last().unwrap().0)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn huge_tau_selects_best_eligible_global_rank_without_nan() {
-        let graph = Graph::from_edges(4, vec![]).unwrap();
-        let state = PartitionState::new(&graph, vec![true, true, false, false]).unwrap();
-        let ranked = vec![0, 1, 2, 3];
-        for seed in 0..20 {
-            let mut rng = Mt19937GenRand64::new(seed);
-            assert_eq!(
-                weighted_rank_conditional(
-                    &ranked,
-                    1.0e308,
-                    &mut rng,
-                    false,
-                    &state,
-                    &mut Vec::new(),
-                    &mut Vec::new(),
-                )
-                .unwrap(),
-                2
-            );
-        }
     }
 }
 

@@ -121,15 +121,19 @@ pub fn minimal_sample_toml() -> &'static str {
     include_str!("../../examples/configs/minimal.toml")
 }
 
-/// Validate and expand settings using only the built-in fitness definition.
-/// Performs no I/O or graph generation. For custom fitness, use
-/// [`compile_experiment_with_versions`] and validate with the same registry
-/// passed to execution and resume.
+/// Validate and expand settings using only the built-in fitness definitions
+/// ([`crate::fitness::BUILTIN_FITNESSES`]). Performs no I/O or graph
+/// generation. For custom fitness, use [`compile_experiment_with_versions`] and
+/// validate with the same registry passed to execution and resume.
 pub fn compile_experiment(spec: ExperimentSpec) -> crate::error::Result<ExperimentPlan> {
-    compile_experiment_with_versions(
-        spec,
-        &BTreeMap::from([("default".to_owned(), "good_edge_fraction-v1".to_owned())]),
-    )
+    compile_experiment_with_versions(spec, &builtin_fitness_versions())
+}
+
+fn builtin_fitness_versions() -> BTreeMap<String, String> {
+    crate::fitness::BUILTIN_FITNESSES
+        .iter()
+        .map(|(name, version)| ((*name).to_owned(), (*version).to_owned()))
+        .collect()
 }
 
 /// Expand with available fitness versions. This checks names and versions,
@@ -189,7 +193,7 @@ pub fn compile_stored_with_registry(
 
 fn pinned_versions() -> BTreeMap<String, String> {
     [
-        ("algorithm", "v1"),
+        ("algorithm", "v2"),
         ("rng", "sha256-mt19937-64-v1"),
         ("generation", "v1"),
         ("measurement", "v1"),
@@ -326,10 +330,12 @@ fn validate_versions(stored: &StoredExperiment) -> crate::error::Result<()> {
             bail!("missing fitness version for {kind}");
         }
     }
-    if requested.contains("default")
-        && stored.versions.get("fitness:default") != Some(&"good_edge_fraction-v1".to_owned())
-    {
-        bail!("unsupported fitness:default version");
+    for (kind, version) in builtin_fitness_versions() {
+        if requested.contains(&kind)
+            && stored.versions.get(&format!("fitness:{kind}")) != Some(&version)
+        {
+            bail!("unsupported fitness:{kind} version");
+        }
     }
     for key in stored.versions.keys() {
         if let Some(kind) = key.strip_prefix("fitness:") {
@@ -620,8 +626,8 @@ fn expand_solvers(
                     bail!("eo.fitnesses must be non-empty when specified");
                 }
                 for &tau in taus {
-                    if !tau.is_finite() || tau <= 0.0 {
-                        bail!("tau must be finite and positive");
+                    if !tau.is_finite() || tau < 0.0 {
+                        bail!("tau must be finite and non-negative");
                     }
                     for fitness in fitnesses {
                         result.push(SolverSpec::Eo {
@@ -776,10 +782,8 @@ mod tests {
                 params: Value::Object(Default::default()),
             }]),
         });
-        let versions = BTreeMap::from([
-            ("default".into(), "good_edge_fraction-v1".into()),
-            ("custom".into(), "custom-v1".into()),
-        ]);
+        let mut versions = builtin_fitness_versions();
+        versions.insert("custom".into(), "custom-v1".into());
         let a = compile_experiment_with_versions(original, &versions).unwrap();
         let b = compile_experiment_with_versions(extended, &versions).unwrap();
         let ids = |plan: &ExperimentPlan| {
@@ -810,6 +814,65 @@ mod tests {
         assert!(compile_experiment(spec.clone()).is_ok());
         spec.measurement.steps.push(101);
         assert!(compile_experiment(spec).is_err());
+    }
+
+    #[test]
+    fn tau_zero_is_the_minimum_and_negative_zero_is_normalized() {
+        let with_taus = |taus: &str| {
+            toml::from_str::<ExperimentSpec>(
+                &sample_toml().replace("taus = [1.2, 1.5]", &format!("taus = [{taus}]")),
+            )
+            .unwrap()
+        };
+        let zero = compile_experiment(with_taus("0.0, 1.5")).unwrap();
+        assert!(zero.jobs.iter().any(|job| matches!(
+            &job.condition.solver,
+            SolverSpec::Eo { tau, .. } if *tau == 0.0 && tau.is_sign_positive()
+        )));
+        assert_eq!(
+            compile_experiment(with_taus("-0.0, 1.5")).unwrap().batch_id,
+            zero.batch_id
+        );
+        assert!(compile_experiment(with_taus("-0.5")).is_err());
+        assert!(compile_experiment(with_taus("inf")).is_err());
+    }
+
+    #[test]
+    fn builtin_fitnesses_compile_with_pinned_versions() {
+        let mut spec: ExperimentSpec = toml::from_str(sample_toml()).unwrap();
+        for solver in &mut spec.solvers {
+            if let SolverSweep::Eo { fitnesses, .. } = solver {
+                *fitnesses = Some(vec![
+                    FitnessSpec::default(),
+                    FitnessSpec {
+                        kind: "multiplicative".into(),
+                        params: serde_json::json!({"alpha": 0.5}),
+                    },
+                    FitnessSpec {
+                        kind: "additive".into(),
+                        params: serde_json::json!({"beta": 3.0}),
+                    },
+                ]);
+            }
+        }
+        let plan = compile_experiment(spec).unwrap();
+        assert_eq!(
+            plan.experiment.versions.get("fitness:multiplicative"),
+            Some(&"multiplicative-v1".to_owned())
+        );
+        assert_eq!(
+            plan.experiment.versions.get("fitness:additive"),
+            Some(&"additive-v1".to_owned())
+        );
+        assert_eq!(
+            plan.experiment.versions.get("algorithm"),
+            Some(&"v2".to_owned())
+        );
+        let mut stored = plan.experiment;
+        stored
+            .versions
+            .insert("fitness:additive".into(), "additive-v0".into());
+        assert!(compile_stored(stored).is_err());
     }
 
     #[test]

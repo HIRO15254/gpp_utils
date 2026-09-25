@@ -77,3 +77,21 @@ WindowsとUbuntuのCI定義を追加した。ローカルではWSLに通常のLi
 - 凍結した`2aae96a`のexportと128条件を比較し、完了結果、計測のない中断終了点、診断・ベイスンの有無を含めて全TSVバイトとmetadataの列名・型・単位が一致した。列説明文は改善を許容している。
 - 変更前のrelease CLIで保存した128件を、新しいCLIのラウンドresumeが再計算せずすべて再利用した。同じバッチIDを維持し、再生成した128実行行・357計測行の両TSVは変更前とSHA-256が一致した。比較用データは`target/`内に作成し、既存の実験データは変更していない。
 - CIのWindows/Ubuntuジョブも同じ検証スクリプトを呼ぶ構成にした。今回のLinux実行およびGitHub Actionsの成功は未確認。性能測定は実施しておらず、この修正による速度改善は主張しない。
+
+## 2026-09-25 の変更
+
+親エージェントが確定した契約に基づき、EOへ組み込み適応度`multiplicative`（`multiplicative-v1`、params`alpha`）と`additive`（`additive-v1`、params`beta`）を追加した。2026-09-15時点の完成履歴（上記）が除外した「追加の組み込みfitness」は、multiplicative・additiveに限りユーザー判断で復活させた。同時に、同じく除外していた「EOの別同点処理・抽選法」も見直し、EOの選択規則をアルゴリズムv2へ変更した。毎ステップのシャッフル+安定ソートによる同点処理を廃止し、標準順序（λ昇順・side・頂点id）上の同点ブロックへ重みを平均化して割り当てる規則（旧`select_eo_rank`の規則）を採用した。`tie_rng`はEOで使わなくなった（HCは従来どおり使用する）。組み込み適応度は差分更新索引でこの選択規則を実行し、索引を持たないカスタム適応度は毎ステップ全頂点を評価する汎用経路を使う。
+
+EOの`tau`は`0`以上（`tau >= 0`）を受け付けるよう変更し、`tau > 0`必須の制約を撤廃した。`pinned_versions`の`algorithm`は`v1`から`v2`へ変わり、全条件IDが変わる（SA・HCの探索軌跡はビット同一のまま、条件IDだけが変わる）。
+
+保存結果JSONの`partitions`は、`Vec<Vec<bool>>`のJSON表現を`{ "length": n, "hex": [...] }`という、頂点をビット詰めした小文字16進文字列の配列へ変更した（`schema_version`は1のまま）。`seed_<seed>.json`と`seed_<seed>.incomplete.json`は整形なしの1行JSON（+末尾改行）で書き込むようにした。`experiment.json`とグラフJSONの整形は変更していない。
+
+`serde_json`へ`float_roundtrip`機能を追加した。従来は保存JSONから読み戻した`f64`が1 ULPずれることがあり、`experiment.json`から再展開した条件IDが元のTOMLと食い違っていた（`10^(k/1000)`の温度624点を含む661条件で74条件の条件IDとバッチIDが不一致）。追加後は同じ確認で不一致0件となり、`Cargo.lock`は変わらない。
+
+検証（Windows、2026-09-25）:
+
+- `python scripts/check.py` がすべて成功した（fmt、locked clippy `-D warnings`、全ターゲット／docテスト、release exact regression、release build、警告をエラーにするdoc生成）。
+- EO v2 は独立に書いた素朴な参照実装（`src/solvers/test_reference/eo_v2_reference.rs`）と、組み込み7設定×Flip/Swap×tau 0〜1e308×複数シードの全ステップで、分割・`select_rng`の状態・評価値・診断カウンターがビット一致した。u の全格子（2^53）上の選択閾値も参照実装と一致し、演算を1 ulp だけ動かす変更も検出する。SA・HC・ベイスンは凍結した`51577f9`との比較を維持し、すべて一致した。
+- 実装担当とは別のエージェントが EO と保存形式をそれぞれレビューし、どちらも阻害要因なし。EO レビューは全2^53値の厳密確率と閉形式の一致、χ²検定、索引と再構築の一致、変異テスト（30件中27件検出。残る3件のうち2件は追加した閾値テストとEOキャンセルテストで検出し、1件は観測可能な差を生まない等価変異）を確認した。旧v1 との分布の違い（Flip は1ステップの分布が同一、Swap の2頂点目は異なり v2 は旧実装 `c0dd61f` と同じ）は [algorithms.md](algorithms.md) の「EOの選択規則v2」に記した。
+- 速度（release、n=500 ランダム、1e6 ステップの1ステップあたり時間、単独実行）: 3回の中央値で Flip default 10.43→0.43µs、Flip multiplicative 0.5 12.91→0.82µs、Swap default 18.14→0.71µs（期待次数5。変更前の実装に新しい適応度モジュールを入れて比較）。期待次数20では5〜8.5倍。12並列の10^7ステップ1 run は Flip default が52〜164秒から9〜12秒、Swap default が87〜282秒から19〜34秒（n=124〜500）。
+- 保存容量: 1 run（n=500、Flip SA、1e6 ステップ、対数計測56点、basin real + best_basin）が422,741→18,143バイト、n=124 は113,930→11,857バイト。10^7ステップでは n=124 で約15KB、n=500 で約22KB。

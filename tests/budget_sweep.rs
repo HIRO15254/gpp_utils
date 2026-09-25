@@ -24,9 +24,12 @@ seeds = [7]
 fn scalar_budget_keeps_the_existing_sample_identity() {
     let spec: ExperimentSpec = toml::from_str(gpp_utils::experiment::plan::sample_toml()).unwrap();
     let plan = compile_experiment(spec).unwrap();
+    // Pinned for `versions.algorithm = "v2"`; the v1 identity was
+    // e9bb99e4b662c118c11994b98e5d6a192843c112e39dae07521850beb0fb089a.
+    assert_eq!(plan.experiment.versions["algorithm"], "v2");
     assert_eq!(
         plan.batch_id,
-        "e9bb99e4b662c118c11994b98e5d6a192843c112e39dae07521850beb0fb089a"
+        "be59ca5ce69255699c2e8c99251c1f0338be5769938371d04f3e0702a3091449"
     );
     assert!(
         !serde_json::to_string(&plan.experiment.spec)

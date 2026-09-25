@@ -473,7 +473,7 @@ fn run_job(
             options,
             &marker.attempt_id,
         )?;
-        atomic::write_json(&marker_path, &marker, true)?;
+        atomic::write_json_compact(&marker_path, &marker, true)?;
         marker_written = true;
     }
     let graph = graph_cell.get_or_init(|| {
@@ -513,7 +513,7 @@ fn run_job(
                 options,
                 &marker.attempt_id,
             )?;
-            atomic::write_json(&marker_path, &marker, true)?;
+            atomic::write_json_compact(&marker_path, &marker, true)?;
             marker_written = true;
         }
         let mut result = run_one(graph, &job.condition, job.seed, cancel, registry)?;
@@ -521,11 +521,11 @@ fn run_job(
         if result.termination == RunTermination::Cancelled {
             marker.status = "cancelled".into();
             marker.partial_result = Some(partial(&result)?);
-            atomic::write_json(&marker_path, &marker, true)?;
+            atomic::write_json_compact(&marker_path, &marker, true)?;
             return Ok("cancelled".into());
         }
         result.validate(graph, &job.condition)?;
-        atomic::write_json(&path, &result, true)?;
+        atomic::write_json_compact(&path, &result, true)?;
         // A durable complete result wins even if marker cleanup is interrupted.
         // The next writer removes a matching stale marker.
         let _ = std::fs::remove_file(&marker_path);
@@ -550,7 +550,7 @@ fn run_job(
                 message: format!("{e:#}"),
             });
             if marker_written {
-                atomic::write_json(&marker_path, &marker, true)
+                atomic::write_json_compact(&marker_path, &marker, true)
                     .with_context(|| format!("original failure: {e:#}"))?;
             }
             if cancel.is_cancelled() {
@@ -587,4 +587,188 @@ pub fn load_plan_with_registry(
     let plan = load_plan(root, batch)?;
     validate_registry(&plan, registry)?;
     Ok(plan)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::experiment::config::{
+        BasinMode, Budget, GraphKind, GraphSpec, Measurement, Neighborhood, Schedule,
+        SmoothingSpec, SolverSpec,
+    };
+
+    fn condition(node_count: usize, neighborhood: Neighborhood) -> Condition {
+        Condition {
+            graph: GraphSpec {
+                kind: GraphKind::Random,
+                node_count,
+                expected_degree: 3.0_f64.min((node_count - 1) as f64),
+                seed: 17,
+            },
+            neighborhood,
+            alpha: 0.05,
+            solver: SolverSpec::Sa {
+                temperature: 1.0,
+                smoothing: SmoothingSpec::None,
+            },
+            budget: Budget { max_steps: 300 },
+            measurement: Measurement {
+                schedule: Schedule::Logarithmic,
+                steps: vec![],
+                basin: BasinMode::Real,
+                max_basin_steps: 50,
+                diagnostics: true,
+                best_basin: true,
+            },
+        }
+    }
+
+    fn without_marker_fields(mut value: serde_json::Value) -> serde_json::Value {
+        let map = value.as_object_mut().unwrap();
+        for key in ["schema_version", "attempt_id", "termination"] {
+            map.remove(key);
+        }
+        value
+    }
+
+    #[test]
+    fn compact_marker_partial_result_round_trips_through_restore_partial() {
+        let temp = tempfile::tempdir().unwrap();
+        for (node_count, neighborhood) in [
+            (2, Neighborhood::Flip),
+            (8, Neighborhood::Swap),
+            (13, Neighborhood::Flip),
+            (123, Neighborhood::Flip),
+            (124, Neighborhood::Swap),
+        ] {
+            let condition = condition(node_count, neighborhood);
+            let graph = Graph::generate(&condition.graph, &CancellationToken::new()).unwrap();
+            let result = run_one(
+                &graph,
+                &condition,
+                5,
+                &CancellationToken::new(),
+                &FitnessRegistry::default(),
+            )
+            .unwrap();
+            assert!(result.partitions.len() > 1);
+            let marker = Incomplete {
+                schema_version: 1,
+                attempt_id: "attempt-partial".into(),
+                status: "cancelled".into(),
+                error: None,
+                partial_result: Some(partial(&result).unwrap()),
+            };
+            let path = temp
+                .path()
+                .join(format!("seed_{node_count}.incomplete.json"));
+            atomic::write_json_compact(&path, &marker, true).unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            assert_eq!(bytes.iter().filter(|&&b| b == b'\n').count(), 1);
+            assert_eq!(bytes.last(), Some(&b'\n'));
+            assert_eq!(
+                &bytes[..bytes.len() - 1],
+                serde_json::to_vec(&marker).unwrap()
+            );
+
+            let MarkerState::Valid(read) = read_marker(&path).unwrap() else {
+                panic!("marker must stay valid");
+            };
+            let stored = read.partial_result.as_ref().unwrap();
+            assert_eq!(stored["partitions"]["length"], node_count);
+            let hex = stored["partitions"]["hex"].as_array().unwrap();
+            assert_eq!(hex.len(), result.partitions.len());
+            assert!(
+                hex.iter()
+                    .all(|s| s.as_str().unwrap().len() == 2 * node_count.div_ceil(8))
+            );
+
+            let restored = restore_partial(&read, &graph, &condition)
+                .unwrap()
+                .expect("partial result present");
+            assert_eq!(restored.termination, RunTermination::Cancelled);
+            assert_eq!(restored.attempt_id, "attempt-partial");
+            assert_eq!(restored.partitions, result.partitions);
+            assert_eq!(
+                (
+                    restored.completed_steps,
+                    restored.final_solution,
+                    restored.best_solution,
+                    restored.best_step
+                ),
+                (
+                    result.completed_steps,
+                    result.final_solution,
+                    result.best_solution,
+                    result.best_step
+                )
+            );
+            // Floats go through the same JSON text in both values, so this
+            // comparison is independent of serde_json's parsing precision.
+            let reparsed: serde_json::Value =
+                serde_json::from_slice(&serde_json::to_vec(&result).unwrap()).unwrap();
+            assert_eq!(
+                without_marker_fields(serde_json::to_value(&restored).unwrap()),
+                without_marker_fields(reparsed)
+            );
+            assert_eq!(partial(&restored).unwrap(), *stored);
+        }
+    }
+
+    #[test]
+    fn restore_partial_rejects_malformed_packed_partitions() {
+        let condition = condition(13, Neighborhood::Flip);
+        let graph = Graph::generate(&condition.graph, &CancellationToken::new()).unwrap();
+        let result = run_one(
+            &graph,
+            &condition,
+            9,
+            &CancellationToken::new(),
+            &FitnessRegistry::default(),
+        )
+        .unwrap();
+        let base = partial(&result).unwrap();
+        type Edit = fn(&mut serde_json::Value);
+        let edits: [(Edit, &str); 7] = [
+            (
+                |p| p["hex"][0] = "0A00".into(),
+                "uppercase hexadecimal digit",
+            ),
+            (
+                |p| p["hex"][0] = "0a1f00".into(),
+                "expected 4 hexadecimal digits for length 13, found 6",
+            ),
+            (|p| p["hex"][0] = "ffff".into(), "non-zero padding bits"),
+            // Every string stays a valid 14-vertex encoding, so only the
+            // graph-aware validation can reject the pool.
+            (|p| p["length"] = 14.into(), "invalid partition length"),
+            (
+                |p| p["bits"] = serde_json::json!([]),
+                "unknown field `bits`",
+            ),
+            (
+                |p| {
+                    p.as_object_mut().unwrap().remove("length");
+                },
+                "missing field `length`",
+            ),
+            (|p| *p = serde_json::json!([vec![true; 13]]), "invalid type"),
+        ];
+        for (edit, message) in edits {
+            let mut partial_result = base.clone();
+            edit(&mut partial_result["partitions"]);
+            let marker = Incomplete {
+                schema_version: 1,
+                attempt_id: "attempt".into(),
+                status: "cancelled".into(),
+                error: None,
+                partial_result: Some(partial_result),
+            };
+            let error = restore_partial(&marker, &graph, &condition).unwrap_err();
+            assert!(
+                format!("{error:#}").contains(message),
+                "{message}: {error:#}"
+            );
+        }
+    }
 }

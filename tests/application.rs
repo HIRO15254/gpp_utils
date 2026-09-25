@@ -587,10 +587,18 @@ fn completed_json_omits_derived_scores_and_redundant_condition_fields() {
 
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("bad.json");
-    let mut bad = value;
-    bad["partitions"][0] = json!([true]);
+    // One stored partition packs a different vertex count than the pool.
+    let mut bad = value.clone();
+    bad["partitions"]["hex"][0] = json!("0100");
     std::fs::write(&path, serde_json::to_vec(&bad).unwrap()).unwrap();
-    assert!(read_result(&path, &graph, &c).is_err());
+    let error = format!("{:#}", read_result(&path, &graph, &c).unwrap_err());
+    assert!(error.contains("hex[0]"), "{error}");
+    // A consistently packed pool whose vertex count differs from the graph.
+    let mut bad = value;
+    bad["partitions"]["length"] = json!(graph.node_count() + 1);
+    std::fs::write(&path, serde_json::to_vec(&bad).unwrap()).unwrap();
+    let error = format!("{:#}", read_result(&path, &graph, &c).unwrap_err());
+    assert!(error.contains("invalid partition length"), "{error}");
 
     let mut wrong_final = result.clone();
     wrong_final.final_solution = wrong_final.records[0].current_solution;

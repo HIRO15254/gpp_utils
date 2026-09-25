@@ -12,7 +12,7 @@
 
 - GUIとSQAは不要。
 - 全手法でFlipと等分割Swapを選択できるようにする。EOのtausは必須。
-- EOの組み込み適応度は`default`一つで、定義は`good_edge_fraction`。Rustで定義を追加・登録し、設定から選択する拡張性は維持する。
+- EOの組み込み適応度は`default`・`multiplicative`・`additive`の3種（定義は`good_edge_fraction-v1`・`multiplicative-v1`・`additive-v1`）。Rustで定義を追加・登録し、設定から選択する拡張性は維持する。
 - 平滑化はHC・SAのみ。`k_average`は削除する。
 - 旧Rust API、CLI、設定、保存形式との互換性は不要。既存データ自体は削除しない。
 - 完成形の構成と実際に使える機能をこの文書にまとめ、実装時も更新する。
@@ -26,7 +26,7 @@
 
 ## 2. 対象の問題と探索機能
 
-無向・重みなしのRandom／Geometricグラフを2群へ分割し、カット数と群サイズ差のペナルティを最小化する。Flipは任意分割、Swapは偶数頂点の等分割を扱う。HC、固定温度SA、EOを提供し、HC・SAにはnone／all_average／random_k_average／weighted_averageを組み合わせる。EOのtauは必須で、組み込み適応度はdefaultのみ。独自適応度はRustで登録する。
+無向・重みなしのRandom／Geometricグラフを2群へ分割し、カット数と群サイズ差のペナルティを最小化する。Flipは任意分割、Swapは偶数頂点の等分割を扱う。HC、固定温度SA、EOを提供し、HC・SAにはnone／all_average／random_k_average／weighted_averageを組み合わせる。EOのtauは必須（`tau >= 0`）で、組み込み適応度はdefault・multiplicative・additiveの3種。独自適応度はRustで登録する。
 
 目的関数、受理・同点規則、EO順位抽選、孤立頂点、平滑化Kと距離2の境界・正規化、差分評価・生成式の正本は[algorithms.md](algorithms.md)。設定検証はその規則に従い、第4節の形式を展開する。ここでは計算仕様を重複管理しない。
 
@@ -279,7 +279,7 @@ CLIは引数と表示、experimentは実験の進行、solversは探索規則、
 - 現在解と最良解の区別、受理・棄却・走査数、初期・最終計測、ベイスン打ち切りの意味を検証する。
 
 - Swapの等分割維持、交換頂点同士に辺がある場合の差分評価、距離1/2近傍の個数と重複除去を検証する。
-- EOのdefault適応度・孤立頂点・順位抽選・Swapの条件付き抽選、配布CLIの登録がdefault一つであること、テスト用独自定義の注入から再開・出力までを検証する。
+- EOのdefault・multiplicative・additive適応度・孤立頂点・順位抽選・Swapの条件付き抽選、配布CLIの組み込み登録が3種であること、テスト用独自定義の注入から再開・出力までを検証する。
 
 ### 再現性と実験機能
 
@@ -289,7 +289,7 @@ CLIは引数と表示、experimentは実験の進行、solversは探索規則、
 - TOMLとJSONの等価設定は同じ解決済み計画と識別子になる。例の展開件数が54になる。
 - 重複、未知キー、非有限値、負値、桁あふれ、無効な手法パラメータを実験開始前に拒否する。
 
-- taus欠落・空配列・非正値、EOへのsmoothing、削除したk_average、未登録適応度、奇数頂点のSwapを拒否する。
+- taus欠落・空配列・負値または非有限値、EOへのsmoothing、削除したk_average、未登録適応度、奇数頂点のSwapを拒否する。
 
 ### 運用と出力
 

@@ -69,14 +69,18 @@ struct Options {
     hc_steps: u64,
     basin_steps: u64,
     phases: Phases,
+    eo_tau: f64,
+    eo_fitness: FitnessSpec,
 }
 
 fn usage() -> &'static str {
     "bench_exact [--mode hc|sa|eo|all] [--neighborhood flip|swap|all] \
 --case n500-d5-g42[-s42] [--repeats N] [--warmup N] [--steps N] \
-[--hc-steps N] [--sa-steps N] [--eo-steps N] [--basin-steps N] [--phases compute|all|basin]\n\
+[--hc-steps N] [--sa-steps N] [--eo-steps N] [--basin-steps N] [--phases compute|all|basin] \
+[--tau X] [--eo-fitness default|multiplicative:ALPHA|additive:BETA]\n\
 Defaults: mode=all, neighborhood=all, repeats=5, warmup=1, \
-hc-steps=20, sa-steps=100000, eo-steps=250, basin-steps=3, phases=compute.\n\
+hc-steps=20, sa-steps=100000, eo-steps=250, basin-steps=3, phases=compute, \
+tau=1.5, eo-fitness=default.\n\
 `--basin` is an alias for `--phases all`; `--basin-only` is an alias for\n\
 `--phases basin`. Each row is TSV. `compute` is run_one with basin=none;\n\
 `basin_total` includes search and measurement, while `basin_measurement`\n\
@@ -112,6 +116,19 @@ fn parse_positive(value: String, flag: &str) -> anyhow::Result<u64> {
     }
     Ok(n)
 }
+/// `default`, `multiplicative:ALPHA` or `additive:BETA` (built-in EO fitness).
+fn parse_fitness(value: &str) -> anyhow::Result<FitnessSpec> {
+    let (kind, key, parameter) = match value.split_once(':') {
+        None if value == "default" => return Ok(FitnessSpec::default()),
+        Some(("multiplicative", x)) => ("multiplicative", "alpha", x.parse::<f64>()?),
+        Some(("additive", x)) => ("additive", "beta", x.parse::<f64>()?),
+        _ => anyhow::bail!("--eo-fitness must be default, multiplicative:ALPHA or additive:BETA"),
+    };
+    Ok(FitnessSpec {
+        kind: kind.into(),
+        params: serde_json::json!({ key: parameter }),
+    })
+}
 fn options() -> anyhow::Result<Options> {
     let mut out = Options {
         modes: vec![Mode::Sa, Mode::Eo],
@@ -124,6 +141,8 @@ fn options() -> anyhow::Result<Options> {
         hc_steps: 20,
         basin_steps: 3,
         phases: Phases::Compute,
+        eo_tau: 1.5,
+        eo_fitness: FitnessSpec::default(),
     };
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -162,6 +181,15 @@ fn options() -> anyhow::Result<Options> {
             "--basin-steps" => {
                 out.basin_steps =
                     parse_positive(take_value(&mut args, "--basin-steps")?, "--basin-steps")?
+            }
+            "--tau" => {
+                out.eo_tau = take_value(&mut args, "--tau")?.parse()?;
+                if !out.eo_tau.is_finite() || out.eo_tau < 0.0 {
+                    anyhow::bail!("--tau must be finite and non-negative");
+                }
+            }
+            "--eo-fitness" => {
+                out.eo_fitness = parse_fitness(&take_value(&mut args, "--eo-fitness")?)?
             }
             "--basin" => out.phases = Phases::All,
             "--basin-only" => out.phases = Phases::Basin,
@@ -202,9 +230,25 @@ fn matches_case(filter: Option<&str>, name: &str) -> bool {
     filter.is_none_or(|needle| name.contains(needle))
 }
 
+fn solver(mode: Mode, options: &Options) -> SolverSpec {
+    match mode {
+        Mode::Hc => SolverSpec::Hc {
+            smoothing: SmoothingSpec::None,
+        },
+        Mode::Sa => SolverSpec::Sa {
+            temperature: 1.0,
+            smoothing: SmoothingSpec::None,
+        },
+        Mode::Eo => SolverSpec::Eo {
+            tau: options.eo_tau,
+            fitness: options.eo_fitness.clone(),
+        },
+    }
+}
+
 fn condition(
     graph: GraphSpec,
-    mode: Mode,
+    solver: SolverSpec,
     neighborhood: Neighborhood,
     steps: u64,
     basin: BasinMode,
@@ -215,19 +259,7 @@ fn condition(
         graph,
         neighborhood,
         alpha: 0.05,
-        solver: match mode {
-            Mode::Hc => SolverSpec::Hc {
-                smoothing: SmoothingSpec::None,
-            },
-            Mode::Sa => SolverSpec::Sa {
-                temperature: 1.0,
-                smoothing: SmoothingSpec::None,
-            },
-            Mode::Eo => SolverSpec::Eo {
-                tau: 1.5,
-                fitness: FitnessSpec::default(),
-            },
-        },
+        solver,
         budget: Budget { max_steps: steps },
         measurement: Measurement {
             schedule: Schedule::Explicit,
@@ -259,6 +291,9 @@ fn normalize(value: &mut Value) {
 }
 fn signature(result: &gpp_utils::RunResult) -> anyhow::Result<String> {
     let mut value = serde_json::to_value(result)?;
+    // Hash the in-memory partitions as plain bool arrays so the signature does
+    // not depend on the stored JSON layout and matches older builds.
+    value["partitions"] = serde_json::to_value(&result.partitions)?;
     normalize(&mut value);
     let bytes = serde_json::to_vec(&value)?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
@@ -354,7 +389,7 @@ fn main() -> anyhow::Result<()> {
                 for &neighborhood in &options.neighborhoods {
                     let compute = condition(
                         graph_spec.clone(),
-                        mode,
+                        solver(mode, &options),
                         neighborhood,
                         steps,
                         BasinMode::None,
@@ -363,7 +398,7 @@ fn main() -> anyhow::Result<()> {
                     );
                     let basin = condition(
                         graph_spec.clone(),
-                        mode,
+                        solver(mode, &options),
                         neighborhood,
                         steps,
                         BasinMode::Real,

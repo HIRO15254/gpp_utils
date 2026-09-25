@@ -3,4 +3,5 @@
 //! 新フレームワーク用の様々なソルバー（探索戦略）を提供。
 
 mod engine;
+mod eo;
 pub(crate) use engine::{Engine, StepStatus};

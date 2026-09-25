@@ -36,6 +36,8 @@ export/                            # gpp exportを実行したときだけ作成
 └── metadata.json
 ```
 
+`runs/<condition_id>/seed_<seed>.json`と`seed_<seed>.incomplete.json`は整形せず1行+末尾改行（`serde_json::to_vec`相当）で書き込む。`batches/<batch_id>/experiment.json`と`graphs/<graph_id>.json`は従来どおり整形して書き込む。
+
 ### experiment.json：条件の唯一の正本
 
 schema_version、versions、specを保存する。specは入力時の既定値を明示した未展開のExperimentSpecで、グラフ生成条件、近傍方式、手法パラメータの配列、探索シードの配列、予算、計測設定を持つ。元のTOML/JSONそのものと別の展開済み設定を二重保存しない。
@@ -44,7 +46,7 @@ schema_version、versions、specを保存する。specは入力時の既定値�
 
 追加計測`measurement.best_basin`の既定値falseと空の`conditions`は保存時に省略する。この省略により既存のスカラー予算・追加計測なしの条件IDとバッチIDを維持する。trueは条件IDに含め、未計測の結果を計測済みとして再利用しない。ラウンド実行の有無・期限・スレッド数は実行オプションであり、保存条件やIDに含めない。
 
-versionsはアルゴリズム、RNG導出、グラフ生成、計測、設定展開・正規化、および使用する適応度定義のバージョンを固定する。適応度の登録名はdefault、定義はgood_edge_fraction。名前とバージョンから決まる定義の説明文字列は結果へ複製しない。k_averageは設定として受け付けない。
+versionsはアルゴリズム（現在v2）、RNG導出、グラフ生成、計測、設定展開・正規化、および使用する適応度定義のバージョンを固定する。適応度の登録名はdefault（定義good_edge_fraction-v1）・multiplicative（定義multiplicative-v1、paramsはalpha）・additive（定義additive-v1、paramsはbeta）の3種。名前とバージョンから決まる定義の説明文字列は結果へ複製しない。k_averageは設定として受け付けない。
 
 入力のグラフサイズや近傍方式から有効なKなどを算出する。展開・正規化のバージョンが未対応なら再開を拒否する。展開済みジョブ一覧、設定ID一覧、job_keyから結果への対応表は保存しない。
 
@@ -68,21 +70,21 @@ seed_<seed>.jsonは次の項目だけを持つ。
 
 | キー | 内容 |
 |---|---|
-| schema_version | 結果形式の版。初版1 |
+| schema_version | 結果形式の版。初版1。2026-09-25の`partitions`表現変更は新形式の成果物が存在しない段階で行い、旧表現の結果はアルゴリズムv1の条件IDにしか存在せず新コードから到達しないため、版は1のまま |
 | attempt_id | 今回の試行識別子。未完了マーカーとの整合性確認に使う |
 | termination | step_limit、local_optimum、no_sampled_improvement |
 | completed_steps | 完了した探索ステップ数 |
 | elapsed_ms | 単一実験の開始から結果組立までの実測時間。グラフ生成・ディスク保存を除く |
-| partitions | 頂点番号順の真偽値配列を重複排除した配列。true=群A、false=群B |
-| final_solution | `partitions`を参照するSolutionId。終了時の現行解 |
-| best_solution | `partitions`を参照するSolutionId。終了時の暫定解 |
+| partitions | `{ length, hex }`。頂点番号順の分割を重複排除し、各分割を頂点vをバイトv/8のビットv%8（LSB first）へ詰めた小文字16進文字列の配列として保持する。true=群A、false=群B。`length`は全分割共通の頂点数（空プールは0）で、各文字列はちょうど`2*ceil(length/8)`桁の小文字16進、最終バイトの未使用ビットは0。これ以外の表記は読み込み時に拒否する |
+| final_solution | `partitions.hex`を参照するSolutionId。終了時の現行解 |
+| best_solution | `partitions.hex`を参照するSolutionId。終了時の暫定解 |
 | best_step | 最良分割を最初に訪問したステップ |
 | records | 次節で定義する疎な計測系列 |
 | diagnostics | 有効化した場合だけ追加する最終累積診断値 |
 
 完了専用ファイルなのでstatus=completedは保存しない。最終・最良スコア、カット数、群サイズ、ペナルティ、手法・設定・シードの本文複製、派生ID、終了件数、環境情報の大きなコピーは保存しない。初期分割は初期レコードからpartitionsを参照し、初期スコアはその分割から算出する。
 
-各レコードの`current_solution`と`best_solution`も`partitions`のSolutionIdとする。同じ分割は同じIDを再利用する。最終・最良スコアは保存済みグラフと参照分割から算出する。最良値が同点なら最初の解を保持し、best_stepは後から復元できないため保存する。
+各レコードの`current_solution`と`best_solution`も`partitions.hex`のSolutionIdとする。同じ分割は同じIDを再利用する。最終・最良スコアは保存済みグラフと参照分割から算出する。最良値が同点なら最初の解を保持し、best_stepは後から復元できないため保存する。
 
 ## 4. records：復元できない計測だけを保存する
 
@@ -129,7 +131,7 @@ measurement.diagnosticsの既定値はfalse。trueの実行だけ、結果のdia
 
 - applied_moves（探索で適用した移動数。Swapは1移動）。
 - objective_evaluations_search、objective_evaluations_measurement（実際に計算した目的関数値の数）。
-- fitness_values_computed_search（EOのみ。キャッシュ参照を除く頂点適応度計算数）。
+- fitness_values_computed_search（EOのみ。組み込み適応度の差分更新索引経路は初期構築のn回に、ステップごとの更新頂点数（Flip: 1+deg(v)、Swap: 2+deg(a)+deg(b)）を加えた数。カスタム適応度の汎用経路は毎ステップn。いずれもキャッシュ参照は含まない）。
 - search_ms、measurement_ms（時間内訳）。
 
 各recordにカウンターや時間の累積値を繰り返し保存しない。accepted_movesは現在の全手法でapplied_movesと同じ、SAのrejected_movesはcompleted_steps-applied_movesなので保存しない。時間合計はelapsed_msを使い、other_msは必要時に差から算出する。無効時の診断値を0として扱わず、表示時は空欄とする。
@@ -138,7 +140,7 @@ measurement.diagnosticsの既定値はfalse。trueの実行だけ、結果のdia
 
 保存先の例はruns/<condition_id>/seed_0.json。条件はexperiment.jsonに一度だけ置く。以下はEO、Swap、tau=1.5、fitness=default、最大3ステップ、診断なしの説明用結果であり、省略表記のない完全な結果JSON例。
 
-グラフは4頂点のサイクル（辺0-1、1-2、2-3、3-0）。初期状態は[true,false,true,false]、最初の移動で[true,true,false,false]へ到達する。説明用の完全な結果であり、特定の生成シードの実測結果ではない。
+グラフは4頂点のサイクル（辺0-1、1-2、2-3、3-0）。初期状態は[true,false,true,false]、最初の移動で[true,true,false,false]へ到達する。説明用の完全な結果であり、特定の生成シードの実測結果ではない。JSON上はこの2分割を`length=4`のhex文字列（頂点vをバイトv/8のビットv%8、LSB firstへ詰めた値）としてそれぞれ`"05"`・`"03"`で保持する。
 
 ```json
 {
@@ -147,10 +149,7 @@ measurement.diagnosticsの既定値はfalse。trueの実行だけ、結果のdia
   "termination": "step_limit",
   "completed_steps": 3,
   "elapsed_ms": 12.4,
-  "partitions": [
-    [true, false, true, false],
-    [true, true, false, false]
-  ],
+  "partitions": { "length": 4, "hex": ["05", "03"] },
   "final_solution": 1,
   "best_solution": 1,
   "best_step": 1,
@@ -180,7 +179,7 @@ measurement.diagnosticsの既定値はfalse。trueの実行だけ、結果のdia
 }
 ```
 
-この例の計測設定はexplicitのsteps=[1]、basin=real、best_basin=true。0と終了点3を自動追加する。step=0のベイスン値は2だが、探索の現行解・暫定解はともにpartitions[0]から復元する。終了点の現行解・暫定解はpartitions[1]を共有参照し、step=3のbasin_bestはstep=1の完了計測を再利用する。
+この例の計測設定はexplicitのsteps=[1]、basin=real、best_basin=true。0と終了点3を自動追加する。step=0のベイスン値は2だが、探索の現行解・暫定解はともに`partitions.hex[0]`（"05"）から復元する。終了点の現行解・暫定解は`partitions.hex[1]`（"03"）を共有参照し、step=3のbasin_bestはstep=1の完了計測を再利用する。
 
 ## 6. 再開・失敗を扱う最小の運用データ
 

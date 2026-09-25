@@ -62,8 +62,18 @@ pub fn write_bytes(path: &Path, bytes: &[u8], overwrite: bool) -> Result<()> {
     File::open(parent)?.sync_all()?;
     Ok(())
 }
+/// Atomically writes pretty-printed JSON followed by a newline. Experiment,
+/// graph and export metadata files use this human-readable form.
 pub fn write_json<T: Serialize>(path: &Path, data: &T, overwrite: bool) -> Result<()> {
     let mut bytes = serde_json::to_vec_pretty(data)?;
+    bytes.push(b'\n');
+    write_bytes(path, &bytes, overwrite)
+}
+/// Atomically writes compact JSON (a single line without insignificant
+/// whitespace) followed by a newline. Per-run result files and incomplete
+/// markers use this form; [`read_json`] reads both forms.
+pub fn write_json_compact<T: Serialize>(path: &Path, data: &T, overwrite: bool) -> Result<()> {
+    let mut bytes = serde_json::to_vec(data)?;
     bytes.push(b'\n');
     write_bytes(path, &bytes, overwrite)
 }

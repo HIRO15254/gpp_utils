@@ -5,7 +5,9 @@ use crate::experiment::config::{
 use rand::Rng;
 use std::sync::Arc;
 
-// Executable oracle: production engine at 51577f9, with Graph getter adapters.
+// Executable oracle for SA, HC, smoothing and the runner: production engine at
+// 51577f9, with Graph getter adapters. EO changed intentionally in algorithm v2
+// and is compared with `eo_v2` below instead.
 mod reference {
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -33,6 +35,14 @@ mod reference {
             "/src/solvers/test_reference/runner_51577f9.rs"
         ));
     }
+}
+
+// Naive executable specification of EO algorithm v2, independent of `../eo.rs`.
+mod eo_v2 {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/solvers/test_reference/eo_v2_reference.rs"
+    ));
 }
 
 fn rng_probe(engine: &Engine<'_>, count: usize) -> (Vec<u64>, Vec<u64>, Vec<u64>) {
@@ -209,48 +219,343 @@ fn assert_engine_exact_on(g: &Graph, c: &Condition, seed: u64, steps: usize) {
     }
 }
 
-#[test]
-fn eo_ties_cross_mt_state_boundaries_exactly() {
-    let isolated = Graph::from_edges(8, vec![]).unwrap();
-    let complete = Graph::from_edges(
+fn isolated_graph() -> Graph {
+    Graph::from_edges(8, vec![]).unwrap()
+}
+
+fn complete_graph() -> Graph {
+    Graph::from_edges(
         8,
         (0..8)
             .flat_map(|a| (a + 1..8).map(move |b| [a, b]))
             .collect(),
     )
-    .unwrap();
-    for g in [&isolated, &complete] {
-        for neighborhood in [Neighborhood::Flip, Neighborhood::Swap] {
-            for seed in [0, u64::MAX - 17] {
-                let c = condition_for(
-                    g,
-                    neighborhood,
-                    SolverSpec::Eo {
-                        tau: 1.5,
-                        fitness: FitnessSpec::default(),
-                    },
-                    0.05,
-                );
-                assert_engine_exact_on(g, &c, seed, 340);
+    .unwrap()
+}
+
+/// Heterogeneous degrees (0 to 10), many ties and three isolated vertices.
+fn eo_graph() -> Graph {
+    let mut edges: Vec<[usize; 2]> = (1..=10).map(|v| [0, v]).collect();
+    for a in 11..=15 {
+        for b in a + 1..=15 {
+            edges.push([a, b]);
+        }
+    }
+    edges.extend((16..21).map(|v| [v, v + 1]));
+    edges.extend([
+        [1, 11],
+        [2, 16],
+        [3, 21],
+        [4, 5],
+        [6, 7],
+        [8, 9],
+        [12, 17],
+        [13, 22],
+        [22, 23],
+        [23, 24],
+        [22, 24],
+        [25, 26],
+    ]);
+    Graph::from_edges(30, edges).unwrap()
+}
+
+fn builtin_fitness_specs() -> Vec<FitnessSpec> {
+    let mut specs = vec![FitnessSpec::default()];
+    for alpha in [0.0, 0.5, 1.0] {
+        specs.push(FitnessSpec {
+            kind: "multiplicative".into(),
+            params: serde_json::json!({ "alpha": alpha }),
+        });
+    }
+    for beta in [0.0, 0.5, 3.0] {
+        specs.push(FitnessSpec {
+            kind: "additive".into(),
+            params: serde_json::json!({ "beta": beta }),
+        });
+    }
+    specs
+}
+
+const EO_TAUS: [f64; 6] = [0.0, 1.0e-300, 0.5, 1.5, 3.0, 1.0e308];
+
+fn eo_condition(
+    g: &Graph,
+    neighborhood: Neighborhood,
+    tau: f64,
+    fitness: FitnessSpec,
+) -> Condition {
+    condition_for(g, neighborhood, SolverSpec::Eo { tau, fitness }, 0.05)
+}
+
+fn size_state_of(state: &PartitionState) -> usize {
+    match state.size_a().cmp(&state.size_b()) {
+        std::cmp::Ordering::Greater => 0,
+        std::cmp::Ordering::Less => 1,
+        std::cmp::Ordering::Equal => 2,
+    }
+}
+
+fn probe(mut rng: Mt19937GenRand64, count: usize) -> Vec<u64> {
+    (0..count).map(|_| rng.r#gen()).collect()
+}
+
+/// Compare the engine with the naive v2 reference after every step: partition,
+/// select RNG state, evaluation bits and counters. `indexed` selects the
+/// expected fitness path and diagnostics formula. Returns the size states in
+/// which selections were made.
+fn assert_eo_matches_reference(
+    g: &Graph,
+    c: &Condition,
+    seed: u64,
+    steps: usize,
+    registry: &FitnessRegistry,
+    indexed: bool,
+) -> [bool; 3] {
+    let cancel = CancellationToken::new();
+    let mut actual = Engine::new(g, c, seed, registry, &cancel).unwrap();
+    let mut expected = eo_v2::ReferenceEo::new(g, c, seed, registry).unwrap();
+    assert_eq!(actual.eo.as_ref().unwrap().is_indexed(), indexed);
+    let n = g.node_count() as u64;
+    let mut fitness_values = if indexed { n } else { 0 };
+    let mut visited = [false; 3];
+    for step in 0..=steps {
+        let context = format!("{:?} seed {seed} step {step}", c.solver);
+        assert_eq!(
+            actual.state.partition(),
+            expected.state.partition(),
+            "partition: {context}"
+        );
+        assert!(
+            actual.select_rng == expected.select_rng,
+            "select RNG: {context}"
+        );
+        assert_eq!(
+            actual.search_evaluation.to_bits(),
+            g.score(expected.state.partition(), c.alpha).to_bits(),
+            "search evaluation: {context}"
+        );
+        assert_eq!(actual.objective_evaluations, step as u64 + 1, "{context}");
+        assert_eq!(actual.applied_moves, step as u64, "{context}");
+        assert_eq!(actual.fitness_values, fitness_values, "{context}");
+        actual
+            .eo
+            .as_ref()
+            .unwrap()
+            .assert_index_consistent(g, &actual.state, c.neighborhood);
+        if step == steps {
+            break;
+        }
+        visited[size_state_of(&actual.state)] = true;
+        assert_eq!(actual.step(&cancel).unwrap(), StepStatus::Continue);
+        fitness_values += match expected.step().unwrap() {
+            _ if !indexed => n,
+            Move::Flip(v) => 1 + g.degree(v) as u64,
+            Move::Swap(a, b) => 2 + (g.degree(a) + g.degree(b)) as u64,
+        };
+    }
+    // 624 outputs cover two MT19937-64 state blocks; EO never draws from the
+    // tie or smoothing streams.
+    assert_eq!(
+        rng_probe(&actual, 624),
+        (
+            probe(expected.select_rng.clone(), 624),
+            probe(expected.tie_rng.clone(), 624),
+            probe(expected.smooth_rng.clone(), 624),
+        )
+    );
+    visited
+}
+
+#[test]
+fn eo_v2_builtin_index_matches_naive_reference_on_every_step() {
+    let registry = FitnessRegistry::default_registry();
+    let graphs = [graph(), eo_graph(), isolated_graph(), complete_graph()];
+    for spec in builtin_fitness_specs() {
+        for g in &graphs {
+            // Majority-dependent flips keep three size-state rankings; count the
+            // runs whose selections used all of them.
+            let mut flip_runs = 0;
+            let mut switching_runs = 0;
+            for neighborhood in [Neighborhood::Flip, Neighborhood::Swap] {
+                for tau in EO_TAUS {
+                    for seed in [0, 0x5eed, u64::MAX - 17] {
+                        let c = eo_condition(g, neighborhood, tau, spec.clone());
+                        let visited =
+                            assert_eo_matches_reference(g, &c, seed, 400, &registry, true);
+                        if neighborhood == Neighborhood::Flip {
+                            flip_runs += 1;
+                            switching_runs += usize::from(visited == [true; 3]);
+                        } else {
+                            assert_eq!(visited, [false, false, true], "swap stays balanced");
+                        }
+                    }
+                }
+            }
+            assert!(
+                2 * switching_runs >= flip_runs,
+                "{spec:?}: only {switching_runs} of {flip_runs} flip runs switch between \
+                 all size states"
+            );
+        }
+    }
+}
+
+/// A caller-supplied definition that wraps a built-in one, forcing the sorted path.
+struct SortedPathFactory(String);
+
+impl crate::fitness::FitnessFactory for SortedPathFactory {
+    fn version(&self) -> &str {
+        crate::fitness::BUILTIN_FITNESSES
+            .iter()
+            .find(|(name, _)| *name == self.0)
+            .unwrap()
+            .1
+    }
+
+    fn validate(&self, params: &serde_json::Value) -> crate::error::Result<()> {
+        FitnessRegistry::default().validate(&FitnessSpec {
+            kind: self.0.clone(),
+            params: params.clone(),
+        })
+    }
+
+    fn create(
+        &self,
+        params: &serde_json::Value,
+    ) -> crate::error::Result<Box<dyn crate::fitness::VertexFitness>> {
+        FitnessRegistry::default().create(&FitnessSpec {
+            kind: self.0.clone(),
+            params: params.clone(),
+        })
+    }
+}
+
+/// Many ties, negative values and both signed zeros (`-0.0 == 0.0`).
+struct TieHeavyFactory;
+struct TieHeavyFitness;
+
+impl crate::fitness::FitnessFactory for TieHeavyFactory {
+    fn version(&self) -> &str {
+        "tie-heavy-v1"
+    }
+
+    fn validate(&self, _: &serde_json::Value) -> crate::error::Result<()> {
+        Ok(())
+    }
+
+    fn create(
+        &self,
+        _: &serde_json::Value,
+    ) -> crate::error::Result<Box<dyn crate::fitness::VertexFitness>> {
+        Ok(Box::new(TieHeavyFitness))
+    }
+}
+
+impl crate::fitness::VertexFitness for TieHeavyFitness {
+    fn values(&self, graph: &Graph, state: &PartitionState) -> crate::error::Result<Vec<f64>> {
+        let side = state.partition();
+        Ok((0..graph.node_count())
+            .map(|v| {
+                let same = graph
+                    .neighbors(v)
+                    .iter()
+                    .filter(|&&u| side[u] == side[v])
+                    .count();
+                match (graph.degree(v) + same) % 4 {
+                    0 => -0.0,
+                    1 => 0.0,
+                    2 => -1.5,
+                    _ => same as f64,
+                }
+            })
+            .collect())
+    }
+}
+
+#[test]
+fn eo_v2_custom_fitness_uses_sorted_path_matching_reference() {
+    let mut registry = FitnessRegistry::default_registry();
+    for (name, _) in crate::fitness::BUILTIN_FITNESSES {
+        registry.register(name, Arc::new(SortedPathFactory(name.into())));
+    }
+    registry.register("tie_heavy", Arc::new(TieHeavyFactory));
+    let builtin = FitnessRegistry::default_registry();
+    let mut specs = builtin_fitness_specs();
+    specs.push(FitnessSpec {
+        kind: "tie_heavy".into(),
+        params: serde_json::json!({}),
+    });
+    for spec in specs {
+        let wraps_builtin = spec.kind != "tie_heavy";
+        for g in [eo_graph(), graph()] {
+            for neighborhood in [Neighborhood::Flip, Neighborhood::Swap] {
+                for tau in EO_TAUS {
+                    for seed in [7, u64::MAX] {
+                        let c = eo_condition(&g, neighborhood, tau, spec.clone());
+                        assert_eo_matches_reference(&g, &c, seed, 300, &registry, false);
+                        if wraps_builtin {
+                            // Same values and RNG streams: identical to the index path.
+                            let cancel = CancellationToken::new();
+                            let mut sorted = Engine::new(&g, &c, seed, &registry, &cancel).unwrap();
+                            let mut indexed = Engine::new(&g, &c, seed, &builtin, &cancel).unwrap();
+                            for _ in 0..300 {
+                                sorted.step(&cancel).unwrap();
+                                indexed.step(&cancel).unwrap();
+                            }
+                            assert_eq!(sorted.state.partition(), indexed.state.partition());
+                            assert!(sorted.select_rng == indexed.select_rng);
+                        }
+                    }
+                }
             }
         }
     }
 }
 
 #[test]
-fn eo_all_steps_match_frozen_engine() {
-    for neighborhood in [Neighborhood::Flip, Neighborhood::Swap] {
-        for tau in [1.0e-300, 0.5, 1.5, 1.0e308] {
-            let c = condition(
-                neighborhood,
-                SolverSpec::Eo {
-                    tau,
-                    fitness: FitnessSpec::default(),
-                },
-                0.05,
-            );
-            assert_engine_exact(&c, 0x0515_77f9, 40);
+fn eo_v2_runner_reports_fitness_values_of_the_selected_path() {
+    let g = eo_graph();
+    let cancel = CancellationToken::new();
+    let mut custom = FitnessRegistry::default_registry();
+    custom.register("tie_heavy", Arc::new(TieHeavyFactory));
+    let additive = FitnessSpec {
+        kind: "additive".into(),
+        params: serde_json::json!({ "beta": 3.0 }),
+    };
+    let tie_heavy = FitnessSpec {
+        kind: "tie_heavy".into(),
+        params: serde_json::json!({}),
+    };
+    for (neighborhood, spec, indexed) in [
+        (Neighborhood::Flip, additive.clone(), true),
+        (Neighborhood::Swap, additive, true),
+        (Neighborhood::Flip, FitnessSpec::default(), true),
+        (Neighborhood::Swap, tie_heavy, false),
+    ] {
+        let mut c = eo_condition(&g, neighborhood, 1.5, spec);
+        c.budget.max_steps = 250;
+        c.measurement.steps = vec![0, 17, 250];
+        c.measurement.basin = BasinMode::None;
+        c.measurement.diagnostics = true;
+        let result = crate::experiment::runner::run_one(&g, &c, 99, &cancel, &custom).unwrap();
+        let mut reference = eo_v2::ReferenceEo::new(&g, &c, 99, &custom).unwrap();
+        let n = g.node_count() as u64;
+        let mut count = if indexed { n } else { 0 };
+        for _ in 0..250 {
+            count += match reference.step().unwrap() {
+                _ if !indexed => n,
+                Move::Flip(v) => 1 + g.degree(v) as u64,
+                Move::Swap(a, b) => 2 + (g.degree(a) + g.degree(b)) as u64,
+            };
         }
+        assert_eq!(
+            result.partitions[result.final_solution.0],
+            reference.state.partition()
+        );
+        let diagnostics = result.diagnostics.unwrap();
+        assert_eq!(diagnostics.fitness_values_computed_search, Some(count));
+        assert_eq!(diagnostics.applied_moves, 250);
+        assert_eq!(diagnostics.objective_evaluations_search, 251);
     }
 }
 
@@ -391,14 +696,6 @@ fn complete_runner_output_matches_frozen_runner_with_measurements_and_basins() {
             1.0e300,
         ),
         condition(
-            Neighborhood::Swap,
-            SolverSpec::Eo {
-                tau: 1.5,
-                fitness: FitnessSpec::default(),
-            },
-            0.05,
-        ),
-        condition(
             Neighborhood::Flip,
             SolverSpec::Hc {
                 smoothing: SmoothingSpec::AllAverage,
@@ -428,6 +725,54 @@ fn complete_runner_output_matches_frozen_runner_with_measurements_and_basins() {
                     assert_eq!(actual.records.len(), c.budget.max_steps as usize + 1);
                 }
                 assert_eq!(exact_json(actual), exact_json(expected));
+            }
+        }
+    }
+}
+
+/// Cancellation after an EO selection consumes exactly the selection draws
+/// (1 for Flip, 2 for Swap) and changes neither the state nor the index, so
+/// the interrupted engine continues like one that only skipped those draws.
+#[test]
+fn eo_cancellation_consumes_selection_draws_and_changes_nothing_else() {
+    let g = graph();
+    let registry = FitnessRegistry::default_registry();
+    let live = CancellationToken::new();
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    for (neighborhood, draws) in [(Neighborhood::Flip, 1), (Neighborhood::Swap, 2)] {
+        for fitness in [
+            FitnessSpec::default(),
+            FitnessSpec {
+                kind: "additive".into(),
+                params: serde_json::json!({ "beta": 3.0 }),
+            },
+        ] {
+            let c = condition(neighborhood, SolverSpec::Eo { tau: 1.5, fitness }, 0.05);
+            let mut interrupted = Engine::new(&g, &c, 5, &registry, &live).unwrap();
+            let mut expected = Engine::new(&g, &c, 5, &registry, &live).unwrap();
+            for _ in 0..7 {
+                interrupted.step(&live).unwrap();
+                expected.step(&live).unwrap();
+            }
+            let partition = interrupted.state.partition().to_vec();
+            let (moves, values) = (interrupted.applied_moves, interrupted.fitness_values);
+            assert!(interrupted.step(&cancelled).is_err(), "{c:?}");
+            assert_eq!(interrupted.state.partition(), partition.as_slice());
+            assert_eq!(interrupted.applied_moves, moves);
+            assert_eq!(interrupted.fitness_values, values);
+            for _ in 0..draws {
+                let _: f64 = expected.select_rng.r#gen();
+            }
+            assert!(interrupted.select_rng == expected.select_rng, "{c:?}");
+            for step in 0..50 {
+                interrupted.step(&live).unwrap();
+                expected.step(&live).unwrap();
+                assert_eq!(
+                    interrupted.state.partition(),
+                    expected.state.partition(),
+                    "step {step} after cancellation: {c:?}"
+                );
             }
         }
     }

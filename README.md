@@ -8,7 +8,7 @@
 - 近傍: Flip（任意分割）/ Swap（偶数頂点・等分割）
 - 探索: Hill Climbing、固定温度 Simulated Annealing、Extremal Optimization
 - 平滑化: `none`、`all_average`、`random_k_average`、`weighted_average`（HC/SAのみ）
-- EO: 必須の `taus` と適応度 `default`（`good_edge_fraction`）。Rustの登録機構で拡張可能
+- EO: 必須の `taus`（`tau >= 0`）と適応度 `default`（`good_edge_fraction-v1`）・`multiplicative`（`multiplicative-v1`、`alpha`）・`additive`（`additive-v1`、`beta`）。paramsは`1.0`のような浮動小数点のJSON数値で指定する。Rustの登録機構でさらに拡張可能
 - TOML/JSON設定、直積スイープ、CPU並列、キャンセル、ジョブ単位の再開
 - 計算予算のスイープ・条件別指定、探索シードごとのラウンド実行、暫定解からの実評価ベイスン計測
 - 結果はJSON正本、必要時にTSVを生成。集計・作図は外部ツールで行う
@@ -67,6 +67,20 @@ kind = "none"
 
 比較実験では配列を増やして全組み合わせを実行します。例えば近傍、SAの温度、平滑化、EOの`taus`、`run_seeds`を列挙します。Swapを使うグラフの頂点数は偶数にしてください。EOの`taus`は必須です。
 
+EOで複数の組み込み適応度を比較する設定例です。
+
+```toml
+[[solvers]]
+kind = "eo"
+taus = [0.0, 1.2]
+[[solvers.fitnesses]]
+kind = "multiplicative"
+params = { alpha = 0.5 }
+[[solvers.fitnesses]]
+kind = "additive"
+params = { beta = 3.0 }
+```
+
 `budget.max_steps = [100, 1000]`で計算予算もスイープできます。手法・近傍によって予算を変える場合は、ルートの`neighborhoods`・`solvers`を`[[conditions]]`へ移し、各グループに`neighborhoods`・`solvers`と任意の`budget`を設定します。グループに予算がなければ全体から継承します。明示した計測ステップはすべての有効予算以下にしてください。
 
 [rounds.toml](examples/configs/rounds.toml)は、SAとEOに異なる予算を割り当て、暫定解ベイスンも計測する24ジョブの例です。
@@ -91,7 +105,7 @@ data/v1/
     └── seed_<seed>.incomplete.json
 ```
 
-各実行JSONは、重複排除した`partitions`配列と、終了時の現行解`final_solution`、終了時の暫定解`best_solution`、各計測点の`current_solution` / `best_solution`参照を保存します。暫定解はそのステップまでに実評価値が最小だった現行解です。同点では先に得た解を維持します。実評価値、カット数、群サイズ、ペナルティなど分割から求められる値は保存せず、読み込み時または`export`時に算出します。
+各実行JSONは整形なしの1行で、重複排除した分割を頂点ごとの1ビットに詰めた16進文字列で持つ`partitions`（`{"length": n, "hex": [...]}`）と、終了時の現行解`final_solution`、終了時の暫定解`best_solution`、各計測点の`current_solution` / `best_solution`参照を保存します。暫定解はそのステップまでに実評価値が最小だった現行解です。同点では先に得た解を維持します。実評価値、カット数、群サイズ、ペナルティなど分割から求められる値は保存せず、読み込み時または`export`時に算出します。
 
 `measurement.best_basin = true`で、暫定解から実目的関数による山登りを行い、各計測点に`basin_best`を追加します。現行解からの`measurement.basin`とは独立に選べます。同じ暫定分割が続く間は完了済みの計測を再利用し、探索には影響させません。ベイスン終点の分割は保存しません。既定値はfalseで、従来設定のIDと探索結果を維持します。
 
