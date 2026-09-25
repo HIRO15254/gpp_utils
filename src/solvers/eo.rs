@@ -288,7 +288,7 @@ impl Eo {
         let block = self.eligible[i];
         match &self.ranker {
             Ranker::Index(index) => {
-                index.ranking(state).members[2 * block.block + usize::from(opposite)][j] as usize
+                index.ranking(state).members[2 * block.block + usize::from(opposite)].select(j)
             }
             Ranker::Sorted(sorted) => {
                 // Inside a block the `false` side precedes the `true` side.
@@ -442,13 +442,122 @@ struct Ranking {
     /// `bucket_of[side * slots + slot]`.
     bucket_of: Vec<u32>,
     /// `members[2 * bucket + side]`, ascending vertex IDs.
-    members: Vec<Vec<u32>>,
+    members: Vec<MemberSet>,
     /// `counts[bucket][side]`.
     counts: Vec<[u32; 2]>,
     /// 1-indexed Fenwick tree of bucket sizes.
     fenwick: Vec<u32>,
     /// Highest power of two not above the bucket count (at least 1).
     top_bit: usize,
+    vertex_count: usize,
+}
+
+const BITSET_MEMBER_THRESHOLD: usize = 32;
+/// Avoid one graph-sized allocation per populated bucket on large graphs.
+const MAX_BITSET_VERTICES: usize = 4096;
+
+/// Ordered bucket membership. Small buckets retain the compact vector path;
+/// larger buckets use a bitset so relocation never shifts a long vector.
+#[derive(Clone, Debug, PartialEq)]
+enum MemberSet {
+    Small(Vec<u32>),
+    Bits { words: Vec<u64>, len: usize },
+}
+
+impl MemberSet {
+    fn new() -> Self {
+        Self::Small(Vec::new())
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Small(values) => values.len(),
+            Self::Bits { len, .. } => *len,
+        }
+    }
+
+    fn select(&self, mut rank: usize) -> usize {
+        match self {
+            Self::Small(values) => values[rank] as usize,
+            Self::Bits { words, .. } => {
+                for (wi, &word) in words.iter().enumerate() {
+                    let count = word.count_ones() as usize;
+                    if rank < count {
+                        let mut remaining = word;
+                        for _ in 0..rank {
+                            remaining &= remaining - 1;
+                        }
+                        return wi * 64 + remaining.trailing_zeros() as usize;
+                    }
+                    rank -= count;
+                }
+                unreachable!("member rank is within the recorded length")
+            }
+        }
+    }
+
+    fn insert(&mut self, v: u32, vertex_count: usize) {
+        match self {
+            Self::Small(values) => {
+                let at = values.partition_point(|&x| x < v);
+                values.insert(at, v);
+                if values.len() > BITSET_MEMBER_THRESHOLD && vertex_count <= MAX_BITSET_VERTICES {
+                    let mut words = vec![0u64; vertex_count.div_ceil(64)];
+                    for &member in values.iter() {
+                        words[member as usize / 64] |= 1 << (member as usize % 64);
+                    }
+                    let len = values.len();
+                    *self = Self::Bits { words, len };
+                }
+            }
+            Self::Bits { words, len } => {
+                let bit = 1u64 << (v as usize % 64);
+                let word = &mut words[v as usize / 64];
+                debug_assert_eq!(*word & bit, 0);
+                *word |= bit;
+                *len += 1;
+            }
+        }
+    }
+
+    fn remove(&mut self, v: u32) {
+        match self {
+            Self::Small(values) => {
+                let at = values
+                    .binary_search(&v)
+                    .expect("an indexed vertex is ranked in its recorded bucket");
+                values.remove(at);
+            }
+            Self::Bits { words, len } => {
+                let bit = 1u64 << (v as usize % 64);
+                let word = &mut words[v as usize / 64];
+                debug_assert_ne!(*word & bit, 0);
+                *word &= !bit;
+                *len -= 1;
+                if *len <= BITSET_MEMBER_THRESHOLD {
+                    let new_len = *len;
+                    let values = (0..new_len)
+                        .map(|rank| {
+                            let mut rest = rank;
+                            for (wi, &word) in words.iter().enumerate() {
+                                let count = word.count_ones() as usize;
+                                if rest < count {
+                                    let mut remaining = word;
+                                    for _ in 0..rest {
+                                        remaining &= remaining - 1;
+                                    }
+                                    return (wi * 64 + remaining.trailing_zeros() as usize) as u32;
+                                }
+                                rest -= count;
+                            }
+                            unreachable!()
+                        })
+                        .collect();
+                    *self = Self::Small(values);
+                }
+            }
+        }
+    }
 }
 
 impl BuiltinIndex {
@@ -585,12 +694,14 @@ impl Ranking {
             .map(|&x| distinct.partition_point(|&y| y < x) as u32)
             .collect();
         let buckets = distinct.len();
-        let mut members = vec![Vec::new(); 2 * buckets];
+        let mut members = (0..2 * buckets)
+            .map(|_| MemberSet::new())
+            .collect::<Vec<_>>();
         let mut counts = vec![[0u32; 2]; buckets];
         for (v, (&slot, &side)) in slot_of.iter().zip(side_of).enumerate() {
             let side = usize::from(side);
             let bucket = bucket_of[side * slots + slot as usize] as usize;
-            members[2 * bucket + side].push(v as u32);
+            members[2 * bucket + side].insert(v as u32, slot_of.len());
             counts[bucket][side] += 1;
         }
         let mut fenwick = vec![0u32; buckets + 1];
@@ -613,6 +724,7 @@ impl Ranking {
             counts,
             fenwick,
             top_bit,
+            vertex_count: slot_of.len(),
         }
     }
 
@@ -644,9 +756,9 @@ impl Ranking {
     fn member(&self, bucket: usize, offset: usize) -> usize {
         let low = &self.members[2 * bucket];
         if offset < low.len() {
-            low[offset] as usize
+            low.select(offset)
         } else {
-            self.members[2 * bucket + 1][offset - low.len()] as usize
+            self.members[2 * bucket + 1].select(offset - low.len())
         }
     }
 
@@ -656,15 +768,11 @@ impl Ranking {
         if old_bucket == bucket && old_side == side {
             return;
         }
-        let list = &mut self.members[2 * old_bucket + usize::from(old_side)];
-        let at = list
-            .binary_search(&v)
-            .expect("an indexed vertex is ranked in its recorded bucket");
-        list.remove(at);
+        let old_side_index = usize::from(old_side);
+        self.members[2 * old_bucket + old_side_index].remove(v);
         self.counts[old_bucket][usize::from(old_side)] -= 1;
-        let list = &mut self.members[2 * bucket + usize::from(side)];
-        let at = list.partition_point(|&x| x < v);
-        list.insert(at, v);
+        let side_index = usize::from(side);
+        self.members[2 * bucket + side_index].insert(v, self.vertex_count);
         self.counts[bucket][usize::from(side)] += 1;
         if old_bucket != bucket {
             self.fenwick_move(old_bucket, bucket);

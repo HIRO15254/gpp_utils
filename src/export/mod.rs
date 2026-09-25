@@ -15,7 +15,10 @@ use anyhow::bail;
 use serde::Serialize;
 use serde_json::json;
 use std::{
+    collections::HashMap,
+    io::{BufWriter, Write},
     path::Path,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -323,26 +326,38 @@ fn trace_value(c: &TraceCtx<'_>, f: TraceField) -> String {
         }
     }
 }
-fn quote(s: &str) -> String {
+fn write_cell(out: &mut impl Write, s: &str) -> std::io::Result<()> {
     if s.contains(['\t', '\n', '\r', '"']) {
-        format!("\"{}\"", s.replace('"', "\"\""))
+        out.write_all(b"\"")?;
+        for part in s.split_inclusive('"') {
+            if let Some(prefix) = part.strip_suffix('"') {
+                out.write_all(prefix.as_bytes())?;
+                out.write_all(b"\"\"")?;
+            } else {
+                out.write_all(part.as_bytes())?;
+            }
+        }
+        out.write_all(b"\"")
     } else {
-        s.into()
+        out.write_all(s.as_bytes())
     }
 }
-fn write_row(buf: &mut String, cells: impl Iterator<Item = String>) {
-    buf.push_str(&cells.map(|s| quote(&s)).collect::<Vec<_>>().join("\t"));
-    buf.push('\n')
+fn write_row(out: &mut impl Write, cells: impl Iterator<Item = String>) -> std::io::Result<()> {
+    for (index, cell) in cells.enumerate() {
+        if index != 0 {
+            out.write_all(b"\t")?;
+        }
+        write_cell(out, &cell)?;
+    }
+    out.write_all(b"\n")
 }
 fn describe<F>(cols: &[ColumnSpec<F>]) -> Vec<serde_json::Value> {
     cols.iter()
         .map(|c| json!({"name":c.name,"type":c.kind,"unit":c.unit,"meaning":c.meaning}))
         .collect()
 }
-fn header<F>(columns: &[ColumnSpec<F>]) -> String {
-    let mut r = String::new();
-    write_row(&mut r, columns.iter().map(|c| c.name.into()));
-    r
+fn write_header<F>(out: &mut impl Write, columns: &[ColumnSpec<F>]) -> std::io::Result<()> {
+    write_row(out, columns.iter().map(|c| c.name.into()))
 }
 pub fn export_tsv(
     plan: &ExperimentPlan,
@@ -360,64 +375,84 @@ pub fn export_tsv(
     sorted
         .jobs
         .sort_by(|a, b| (&a.condition_id, a.seed).cmp(&(&b.condition_id, b.seed)));
-    let inspections = storage::inspect(&sorted, root, include_incomplete)?;
-    let mut runs = header(RUN_COLUMNS);
-    let mut traces = header(TRACE_COLUMNS);
+    std::fs::create_dir_all(out)?;
+    let mut runs_tmp = tempfile::NamedTempFile::new_in(out)?;
+    let mut traces_tmp = tempfile::NamedTempFile::new_in(out)?;
+    let metadata_tmp = tempfile::NamedTempFile::new_in(out)?;
     let mut trace_rows = 0;
-    for (job, inspection) in sorted.jobs.iter().zip(&inspections) {
-        let view = inspection
-            .result
-            .as_ref()
-            .zip(inspection.graph.as_deref())
-            .map(|(r, g)| RunView::new(g, &job.condition, r))
-            .transpose()?;
-        let initial = view.as_ref().map(|view| {
-            view.measurement(&view.result().records[0])
-                .current_breakdown()
-        });
-        let final_breakdown = view
-            .as_ref()
-            .map(|view| view.breakdown(view.result().final_solution));
-        let best_breakdown = view
-            .as_ref()
-            .map(|view| view.breakdown(view.result().best_solution));
-        let context = RunCtx {
-            plan,
-            job,
-            inspection,
-            view,
-            initial,
-            final_breakdown,
-            best_breakdown,
-        };
-        write_row(
-            &mut runs,
-            RUN_COLUMNS.iter().map(|col| run_value(&context, col.field)),
-        );
-        if let Some(view) = context.view.as_ref() {
-            for measurement in view.records() {
-                let trace = TraceCtx {
-                    run: &context,
-                    current: measurement.current_breakdown(),
-                    best: measurement.best_breakdown(),
-                    measurement,
-                };
-                write_row(
-                    &mut traces,
-                    TRACE_COLUMNS
-                        .iter()
-                        .map(|col| trace_value(&trace, col.field)),
-                );
-                trace_rows += 1
+    let active = atomic::writer_active(root)?;
+    let mut graphs = HashMap::<String, Arc<crate::graph_partition::Graph>>::new();
+    {
+        let mut runs = BufWriter::new(runs_tmp.as_file_mut());
+        let mut traces = BufWriter::new(traces_tmp.as_file_mut());
+        write_header(&mut runs, RUN_COLUMNS)?;
+        write_header(&mut traces, TRACE_COLUMNS)?;
+        for job in &sorted.jobs {
+            let inspection =
+                storage::inspect_job(job, root, include_incomplete, active, &mut graphs)?;
+            let view = inspection
+                .result
+                .as_ref()
+                .zip(inspection.graph.as_deref())
+                .map(|(r, g)| RunView::from_validated(g, &job.condition, r));
+            let initial = view.as_ref().map(|view| {
+                view.measurement(&view.result().records[0])
+                    .current_breakdown()
+            });
+            let final_breakdown = view
+                .as_ref()
+                .map(|view| view.breakdown(view.result().final_solution));
+            let best_breakdown = view
+                .as_ref()
+                .map(|view| view.breakdown(view.result().best_solution));
+            let context = RunCtx {
+                plan,
+                job,
+                inspection: &inspection,
+                view,
+                initial,
+                final_breakdown,
+                best_breakdown,
+            };
+            write_row(
+                &mut runs,
+                RUN_COLUMNS.iter().map(|col| run_value(&context, col.field)),
+            )?;
+            if let Some(view) = context.view.as_ref() {
+                for measurement in view.records() {
+                    let trace = TraceCtx {
+                        run: &context,
+                        current: measurement.current_breakdown(),
+                        best: measurement.best_breakdown(),
+                        measurement,
+                    };
+                    write_row(
+                        &mut traces,
+                        TRACE_COLUMNS
+                            .iter()
+                            .map(|col| trace_value(&trace, col.field)),
+                    )?;
+                    trace_rows += 1
+                }
             }
         }
+        runs.flush()?;
+        traces.flush()?;
     }
     let metadata = json!({"schema_version":1,"created_unix_ms":SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),"batch_id":plan.batch_id,"include_incomplete":include_incomplete,"selection":if plan.jobs.len()==1{Some(json!({"condition_id":plan.jobs[0].condition_id,"seed":plan.jobs[0].seed}))}else{None},"columns":{"runs":describe(RUN_COLUMNS),"traces":describe(TRACE_COLUMNS)}});
-    atomic::write_bytes(&out.join("runs.tsv"), runs.as_bytes(), overwrite)?;
-    atomic::write_bytes(&out.join("traces.tsv"), traces.as_bytes(), overwrite)?;
-    atomic::write_json(&out.join("metadata.json"), &metadata, overwrite)?;
+    {
+        let mut metadata_writer = BufWriter::new(metadata_tmp.as_file());
+        serde_json::to_writer_pretty(&mut metadata_writer, &metadata)?;
+        metadata_writer.write_all(b"\n")?;
+        metadata_writer.flush()?;
+    }
+    // No destination is touched until every source result has been read,
+    // validated, and all three complete temporary outputs have been written.
+    atomic::persist_temp(runs_tmp, &out.join("runs.tsv"), overwrite)?;
+    atomic::persist_temp(traces_tmp, &out.join("traces.tsv"), overwrite)?;
+    atomic::persist_temp(metadata_tmp, &out.join("metadata.json"), overwrite)?;
     Ok(ExportSummary {
-        jobs: inspections.len(),
+        jobs: sorted.jobs.len(),
         trace_rows,
         incomplete_included: include_incomplete,
     })

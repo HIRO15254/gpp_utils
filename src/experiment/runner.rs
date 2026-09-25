@@ -240,15 +240,19 @@ pub fn run_one(
     };
     let records = raw
         .into_iter()
-        .map(|r| MeasurementRecord {
-            step: r.step,
-            current_solution: intern(r.current),
-            best_solution: intern(r.best),
-            current_smoothed: r.current_smoothed,
-            search_evaluation: r.search_evaluation,
-            basin_real: r.basin_real,
-            basin_smoothed: r.basin_smoothed,
-            basin_best: r.basin_best,
+        .map(|r| {
+            let current_solution = intern(r.current);
+            let best_solution = intern(r.best);
+            MeasurementRecord {
+                step: r.step,
+                current_solution,
+                best_solution,
+                current_smoothed: r.current_smoothed,
+                search_evaluation: r.search_evaluation,
+                basin_real: r.basin_real,
+                basin_smoothed: r.basin_smoothed,
+                basin_best: r.basin_best,
+            }
         })
         .collect();
     let final_solution = intern(engine.state.partition().to_vec());
@@ -518,15 +522,18 @@ fn basin(
     let mut state = start.clone();
     let mut steps = 0;
     let fixed_rng = rng.as_ref().map(|source| (**source).clone());
+    let mut plan_rng = fixed_rng.clone();
+    let fixed_plan = spec
+        .map(|s| smoothing::plan(&state, graph, c.neighborhood, s, plan_rng.as_mut(), cancel))
+        .transpose()?;
     let mut current = if let Some(s) = spec {
-        let mut evaluation_rng = fixed_rng.clone();
-        smoothing::evaluate(
+        smoothing::evaluate_with_plan(
             &state,
             graph,
             c.alpha,
             c.neighborhood,
             s,
-            evaluation_rng.as_mut(),
+            fixed_plan.as_ref().expect("smoothing plan exists"),
             cancel,
             evals,
         )?
@@ -542,24 +549,20 @@ fn basin(
         let mut choice = None;
         let mut best = current;
         let mut ties = 0u64;
-        for (i, mv) in smoothing::moves_cancellable(&state, c.neighborhood, cancel)?
-            .into_iter()
-            .enumerate()
-        {
+        let moves = smoothing::MoveSequence::new(&state, c.neighborhood, cancel)?;
+        for (i, mv) in moves.iter().enumerate() {
             if i & 1023 == 0 {
                 cancel.check()?
             }
             let x = if let Some(s) = spec {
-                let mut candidate = state.clone();
-                smoothing::apply(&mut candidate, graph, mv);
-                let mut evaluation_rng = fixed_rng.clone();
-                smoothing::evaluate(
-                    &candidate,
+                evaluate_smoothed_candidate_with_undo(
+                    &mut state,
                     graph,
                     c.alpha,
                     c.neighborhood,
                     s,
-                    evaluation_rng.as_mut(),
+                    fixed_plan.as_ref().expect("smoothing plan exists"),
+                    mv,
                     cancel,
                     evals,
                 )?
@@ -601,10 +604,77 @@ fn basin(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn evaluate_smoothed_candidate_with_undo(
+    state: &mut PartitionState,
+    graph: &Graph,
+    alpha: f64,
+    neighborhood: Neighborhood,
+    spec: &SmoothingSpec,
+    plan: &smoothing::SmoothingPlan,
+    mv: crate::graph_partition::Move,
+    cancel: &CancellationToken,
+    evals: &mut u64,
+) -> Result<f64> {
+    smoothing::apply(state, graph, mv);
+    let evaluated =
+        smoothing::evaluate_with_plan(state, graph, alpha, neighborhood, spec, plan, cancel, evals);
+    // Every move is its own inverse. Undo before propagating an evaluation
+    // error so cancellation leaves the last committed basin state intact.
+    smoothing::apply(state, graph, mv);
+    evaluated
+}
+
 #[cfg(test)]
 mod best_basin_tests {
     use super::*;
     use crate::experiment::config::{Budget, GraphKind, GraphSpec, Measurement, Schedule};
+
+    #[test]
+    fn candidate_evaluation_error_restores_last_committed_state() {
+        let graph = Graph::from_edges(
+            6,
+            vec![[0, 1], [0, 4], [1, 2], [1, 5], [2, 3], [3, 4], [4, 5]],
+        )
+        .unwrap();
+        for neighborhood in [Neighborhood::Flip, Neighborhood::Swap] {
+            let partition = match neighborhood {
+                Neighborhood::Flip => vec![true, false, true, false, false, true],
+                Neighborhood::Swap => vec![true, true, true, false, false, false],
+            };
+            let mut state = PartitionState::new(&graph, partition).unwrap();
+            let before = state.clone();
+            let spec = SmoothingSpec::WeightedAverage { k: 1 };
+            let active = CancellationToken::new();
+            let plan = smoothing::plan(&state, &graph, neighborhood, &spec, None, &active).unwrap();
+            let mv = smoothing::MoveSequence::new(&state, neighborhood, &active)
+                .unwrap()
+                .get(0);
+            let cancelled = CancellationToken::new();
+            cancelled.cancel();
+            let mut evaluations = 0;
+            assert!(
+                evaluate_smoothed_candidate_with_undo(
+                    &mut state,
+                    &graph,
+                    0.05,
+                    neighborhood,
+                    &spec,
+                    &plan,
+                    mv,
+                    &cancelled,
+                    &mut evaluations,
+                )
+                .is_err()
+            );
+            assert_eq!(state.partition(), before.partition());
+            assert_eq!(state.cut_edges(), before.cut_edges());
+            assert_eq!(state.size_a(), before.size_a());
+            assert_eq!(state.cuts_at(), before.cuts_at());
+            assert_eq!(state.score(0.05).to_bits(), before.score(0.05).to_bits());
+            assert_eq!(evaluations, 0);
+        }
+    }
 
     #[test]
     fn cancelled_best_basin_does_not_populate_cache() {
@@ -703,3 +773,7 @@ mod best_basin_tests {
         assert_eq!(result.termination, BasinTermination::LocalOptimum);
     }
 }
+
+#[cfg(test)]
+#[path = "performance_probe.rs"]
+mod performance_probe;

@@ -777,3 +777,65 @@ fn eo_cancellation_consumes_selection_draws_and_changes_nothing_else() {
         }
     }
 }
+
+#[test]
+fn sa_exp_cache_preserves_rng_shortcuts_bits_and_collisions() {
+    let g = graph();
+    let c = condition(
+        Neighborhood::Flip,
+        SolverSpec::Sa {
+            temperature: 1.0,
+            smoothing: SmoothingSpec::None,
+        },
+        0.05,
+    );
+    let cancel = CancellationToken::new();
+    let registry = FitnessRegistry::default_registry();
+    let mut engine = Engine::new(&g, &c, 123, &registry, &cancel).unwrap();
+
+    let untouched = engine.select_rng.clone();
+    assert!(engine.sa_accept(-1.0, 1.0));
+    assert!(engine.select_rng == untouched, "improvement must not draw");
+    assert!(!engine.sa_accept(1.0, 0.0));
+    assert!(
+        engine.select_rng == untouched,
+        "temperature zero must not draw"
+    );
+
+    let check = |engine: &mut Engine<'_>, delta: f64, temperature: f64| {
+        let mut expected_rng = engine.select_rng.clone();
+        let draw: f64 = expected_rng.r#gen();
+        let threshold = (-delta / temperature).exp();
+        assert_eq!(engine.sa_accept(delta, temperature), draw < threshold);
+        assert!(engine.select_rng == expected_rng, "Metropolis draw count");
+        threshold
+    };
+
+    let tiny = check(&mut engine, f64::MIN_POSITIVE, f64::MIN_POSITIVE);
+    assert_eq!(tiny.to_bits(), (-1.0f64).exp().to_bits());
+
+    for zero in [0.0, -0.0] {
+        let threshold = check(&mut engine, zero, 1.0);
+        let stored = engine
+            .sa_exp_cache
+            .iter()
+            .flatten()
+            .find(|(key, _)| *key == zero.to_bits())
+            .expect("each signed-zero bit pattern has an exact cache tag");
+        assert_eq!(stored.1.to_bits(), threshold.to_bits());
+    }
+    check(&mut engine, 0.0, 1.0); // exact-tag hit, with one draw as before
+
+    // Integer deltas 15 and 79 map to the same slot with the production mix.
+    // Replacing either tag must only turn the next lookup into an exact miss.
+    const COLLISION_SLOT: usize = 202;
+    for delta in [15.0, 15.0, 79.0, 15.0] {
+        let threshold = check(&mut engine, delta, 1.0);
+        let (tag, stored) = engine.sa_exp_cache[COLLISION_SLOT].unwrap();
+        assert_eq!(tag, delta.to_bits());
+        assert_eq!(stored.to_bits(), threshold.to_bits());
+    }
+
+    let underflow = check(&mut engine, f64::MAX, f64::MIN_POSITIVE);
+    assert_eq!(underflow.to_bits(), 0.0f64.to_bits());
+}

@@ -90,7 +90,7 @@ impl PartitionState {
         if self.partition[a] == self.partition[b] || a == b {
             return self.score(alpha);
         }
-        let adjacent = graph.neighbors(a).binary_search(&b).is_ok() as i64;
+        let adjacent = graph.adjacent(a, b) as i64;
         let delta = graph.degree(a) as i64 - 2 * self.cuts_at[a] + graph.degree(b) as i64
             - 2 * self.cuts_at[b]
             + 2 * adjacent;

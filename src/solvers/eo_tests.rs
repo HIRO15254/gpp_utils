@@ -36,6 +36,52 @@ fn builtin_kind(spec: &FitnessSpec) -> BuiltinFitness {
     }
 }
 
+#[test]
+fn member_set_preserves_rank_order_across_bitset_threshold() {
+    let mut members = MemberSet::new();
+    for v in (0..=BITSET_MEMBER_THRESHOLD as u32).rev() {
+        members.insert(v, 128);
+    }
+    assert!(matches!(members, MemberSet::Bits { len: 33, .. }));
+    assert_eq!(
+        (0..members.len())
+            .map(|rank| members.select(rank))
+            .collect::<Vec<_>>(),
+        (0..=BITSET_MEMBER_THRESHOLD).collect::<Vec<_>>()
+    );
+
+    members.remove(7);
+    assert!(matches!(members, MemberSet::Small(_)));
+    let expected = (0..=BITSET_MEMBER_THRESHOLD)
+        .filter(|&v| v != 7)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        (0..members.len())
+            .map(|rank| members.select(rank))
+            .collect::<Vec<_>>(),
+        expected
+    );
+
+    members.insert(96, 128);
+    assert!(matches!(members, MemberSet::Bits { len: 33, .. }));
+    assert_eq!(members.select(32), 96);
+}
+
+#[test]
+fn member_set_keeps_vector_storage_above_bitset_graph_limit() {
+    let mut members = MemberSet::new();
+    for v in (0..=BITSET_MEMBER_THRESHOLD as u32).rev() {
+        members.insert(v, MAX_BITSET_VERTICES + 1);
+    }
+    assert!(matches!(members, MemberSet::Small(_)));
+    assert_eq!(
+        (0..members.len())
+            .map(|rank| members.select(rank))
+            .collect::<Vec<_>>(),
+        (0..=BITSET_MEMBER_THRESHOLD).collect::<Vec<_>>()
+    );
+}
+
 /// Degrees 0 to 6, a triangle, a path and six isolated vertices.
 fn tie_graph() -> Graph {
     let mut edges: Vec<[usize; 2]> = (1..=6).map(|v| [0, v]).collect();
@@ -587,11 +633,8 @@ fn ranking_order(ranking: &Ranking) -> (Vec<usize>, Vec<(usize, usize)>) {
     for bucket in 0..ranking.counts.len() {
         let start = order.len();
         for side in 0..2 {
-            order.extend(
-                ranking.members[2 * bucket + side]
-                    .iter()
-                    .map(|&v| v as usize),
-            );
+            let members = &ranking.members[2 * bucket + side];
+            order.extend((0..members.len()).map(|rank| members.select(rank)));
         }
         if order.len() > start {
             blocks.push((start, order.len()));
@@ -646,7 +689,9 @@ fn assert_rankings_match_values(
             for (side, &side_count) in count.iter().enumerate() {
                 let members = &ranking.members[2 * bucket + side];
                 assert_eq!(members.len(), side_count as usize);
-                assert!(members.windows(2).all(|w| w[0] < w[1]));
+                assert!(
+                    (1..members.len()).all(|rank| members.select(rank - 1) < members.select(rank))
+                );
             }
             let size = ranking.size(bucket);
             for position in start..start + size {

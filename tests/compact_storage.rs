@@ -6,7 +6,9 @@ use gpp_utils::{
     fitness::{FitnessFactory, FitnessRegistry, VertexFitness},
     graph_partition::{Graph, PartitionState},
     optimization::CancellationToken,
-    storage::{RuntimeOptions, incomplete_path, inspect, read_result, result_path, run_batch},
+    storage::{
+        RuntimeOptions, atomic, incomplete_path, inspect, read_result, result_path, run_batch,
+    },
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -359,4 +361,78 @@ fn malformed_packed_partitions_are_rejected_when_reading_results() {
     let recomputed = read_result(&path, &graph, &job.condition).unwrap();
     let before: gpp_utils::RunResult = serde_json::from_slice(&original).unwrap();
     assert_eq!(recomputed.partitions, before.partitions);
+}
+
+#[test]
+fn fast_result_reader_preserves_duplicate_key_last_wins_semantics() {
+    let plan = compile_experiment(spec(&["flip"], &[8], sa())).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    run_batch(
+        &plan,
+        &options(temp.path()),
+        &CancellationToken::new(),
+        &FitnessRegistry::default(),
+        &|_| {},
+    )
+    .unwrap();
+    let job = &plan.jobs[0];
+    let graph = Graph::generate(&job.condition.graph, &CancellationToken::new()).unwrap();
+    let path = result_path(temp.path(), job);
+    let original = read_result(&path, &graph, &job.condition).unwrap();
+    let value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let mut text = serde_json::to_string(&value).unwrap();
+    text.pop();
+    text.push_str(",\"attempt_id\":");
+    text.push_str(&serde_json::to_string(&value["attempt_id"]).unwrap());
+    text.push_str(",\"partitions\":");
+    text.push_str(&serde_json::to_string(&value["partitions"]).unwrap());
+    text.push('}');
+    std::fs::write(&path, text).unwrap();
+
+    let duplicate = read_result(&path, &graph, &job.condition).unwrap();
+    assert_eq!(duplicate.attempt_id, original.attempt_id);
+    assert_eq!(duplicate.partitions, original.partitions);
+    assert_eq!(duplicate.final_solution, original.final_solution);
+    assert_eq!(duplicate.best_solution, original.best_solution);
+}
+
+#[test]
+fn fast_result_reader_preserves_schema_and_json_error_precedence() {
+    let plan = compile_experiment(spec(&["flip"], &[8], sa())).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    run_batch(
+        &plan,
+        &options(temp.path()),
+        &CancellationToken::new(),
+        &FitnessRegistry::default(),
+        &|_| {},
+    )
+    .unwrap();
+    let job = &plan.jobs[0];
+    let graph = Graph::generate(&job.condition.graph, &CancellationToken::new()).unwrap();
+    let path = result_path(temp.path(), job);
+    let value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let canonical = serde_json::to_string(&value).unwrap();
+
+    let compare_errors = |text: &str| {
+        std::fs::write(&path, text).unwrap();
+        let generic = atomic::read_json::<gpp_utils::RunResult>(&path).unwrap_err();
+        let fast = read_result(&path, &graph, &job.condition).unwrap_err();
+        assert_eq!(format!("{generic:#}"), format!("{fast:#}"));
+    };
+
+    compare_errors(r#"{"schema_version":999,"extra":1e999}"#);
+    compare_errors(&format!("{canonical} trailing"));
+
+    let mut duplicate_future = canonical.clone();
+    duplicate_future.pop();
+    duplicate_future.push_str(",\"schema_version\":999}");
+    compare_errors(&duplicate_future);
+
+    let duplicate_current = format!("{{\"schema_version\":999,{}", &canonical[1..]);
+    std::fs::write(&path, duplicate_current).unwrap();
+    let generic: gpp_utils::RunResult = atomic::read_json(&path).unwrap();
+    let fast = read_result(&path, &graph, &job.condition).unwrap();
+    assert_eq!(generic.partitions, fast.partitions);
+    assert_eq!(generic.attempt_id, fast.attempt_id);
 }

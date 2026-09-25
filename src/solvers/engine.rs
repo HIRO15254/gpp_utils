@@ -7,6 +7,8 @@ use crate::optimization::{CancellationToken, rng_for};
 use crate::smoothing;
 use rand::{Rng, seq::SliceRandom};
 use rand_mt::Mt19937GenRand64;
+const SA_EXP_CACHE_CAPACITY: usize = 256;
+const _: () = assert!(SA_EXP_CACHE_CAPACITY == 256);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StepStatus {
@@ -23,6 +25,9 @@ pub struct Engine<'a> {
     tie_rng: Mt19937GenRand64,
     smooth_rng: Mt19937GenRand64,
     eo: Option<Eo>,
+    /// Exact Metropolis thresholds keyed by the observed delta bits. The
+    /// temperature is fixed for an Engine, so it is intentionally not in the key.
+    sa_exp_cache: [Option<(u64, f64)>; SA_EXP_CACHE_CAPACITY],
     pub objective_evaluations: u64,
     pub fitness_values: u64,
     pub applied_moves: u64,
@@ -97,6 +102,7 @@ impl<'a> Engine<'a> {
                 b"smooth",
             ]),
             eo: None,
+            sa_exp_cache: [None; SA_EXP_CACHE_CAPACITY],
             objective_evaluations: 0,
             fitness_values: 0,
             applied_moves: 0,
@@ -141,7 +147,7 @@ impl<'a> Engine<'a> {
         }
     }
     fn hc(&mut self, cancel: &CancellationToken) -> Result<StepStatus> {
-        let list = smoothing::moves_cancellable(&self.state, self.condition.neighborhood, cancel)?;
+        let list = smoothing::MoveSequence::new(&self.state, self.condition.neighborhood, cancel)?;
         let spec = self.smoothing_spec().clone();
         if matches!(spec, SmoothingSpec::RandomKAverage { .. }) {
             self.search_evaluation = smoothing::evaluate(
@@ -162,7 +168,7 @@ impl<'a> Engine<'a> {
         let mut best = self.search_evaluation;
         let mut choice = None;
         let mut ties = 0u64;
-        for (i, mv) in list.into_iter().enumerate() {
+        for (i, mv) in list.iter().enumerate() {
             if i & 1023 == 0 {
                 cancel.check()?
             }
@@ -252,8 +258,7 @@ impl<'a> Engine<'a> {
                 return Err(Error::msg("non-finite search evaluation"));
             }
             let delta = next - self.search_evaluation;
-            let accept =
-                delta < 0.0 || (t > 0.0 && self.select_rng.r#gen::<f64>() < (-delta / t).exp());
+            let accept = self.sa_accept(delta, t);
             if accept {
                 smoothing::apply(&mut self.state, self.graph, mv);
                 self.search_evaluation = next;
@@ -283,8 +288,7 @@ impl<'a> Engine<'a> {
             return Err(Error::msg("non-finite search evaluation"));
         }
         let delta = next - self.search_evaluation;
-        let accept =
-            delta < 0.0 || (t > 0.0 && self.select_rng.r#gen::<f64>() < (-delta / t).exp());
+        let accept = self.sa_accept(delta, t);
         if accept {
             self.search_evaluation = next;
             self.applied_moves += 1
@@ -292,6 +296,36 @@ impl<'a> Engine<'a> {
             smoothing::apply(&mut self.state, self.graph, mv);
         }
         Ok(StepStatus::Continue)
+    }
+
+    /// Preserve the original short-circuit and RNG order exactly: improving
+    /// moves draw nothing; non-improving positive-temperature moves draw before
+    /// looking up or computing the threshold.
+    #[inline]
+    fn sa_accept(&mut self, delta: f64, temperature: f64) -> bool {
+        if delta < 0.0 {
+            return true;
+        }
+        if temperature <= 0.0 {
+            return false;
+        }
+        let draw = self.select_rng.r#gen::<f64>();
+        let key = delta.to_bits();
+        // Fold high IEEE-754 bits into the low half, multiply to diffuse the
+        // common zero mantissa suffix of integer deltas, then use the high byte.
+        // The table is fixed at 256 slots by the compile-time assertion above.
+        let mixed = (key ^ (key >> 32)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let slot = (mixed >> 56) as usize;
+        let threshold = if let Some((cached_key, cached)) = self.sa_exp_cache[slot]
+            && cached_key == key
+        {
+            cached
+        } else {
+            let computed = (-delta / temperature).exp();
+            self.sa_exp_cache[slot] = Some((key, computed));
+            computed
+        };
+        draw < threshold
     }
     /// One EO move (algorithm v2, see [`super::eo`]); always accepted.
     fn eo(&mut self, cancel: &CancellationToken) -> Result<StepStatus> {
