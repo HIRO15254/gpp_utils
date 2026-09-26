@@ -129,6 +129,9 @@ pub(super) struct Eo {
     ranker: Ranker,
 }
 
+// One per job and built once, so the size gap between the variants costs
+// nothing, while boxing the index would add an indirection to every step.
+#[allow(clippy::large_enum_variant)]
 enum Ranker {
     Index(BuiltinIndex),
     Sorted(SortedRanker),
@@ -482,6 +485,13 @@ fn majority_flags(size_state: usize) -> [bool; 2] {
 /// Buckets per [`Group`].
 const GROUP: usize = 64;
 
+/// Mark bit of a row during [`Rerank::swap_overlapping`]; every row is below
+/// it.
+const MARK: u32 = 1 << 31;
+
+/// Words of a closed-neighborhood signature (see [`BuiltinIndex::closed`]).
+const SIGNATURE_WORDS: usize = 8;
+
 /// Dense cell bitsets up to this many bytes are always used. Dense updates
 /// are cheaper while the bitsets stay cache-friendly; far larger dense
 /// bitsets (degrees in the hundreds or thousands) are slower than pooled ones.
@@ -505,6 +515,8 @@ fn pooled_layout(buckets: usize, n: usize, count: usize) -> bool {
 thread_local! {
     /// Test override of [`pooled_layout`] for the indexes built on this thread.
     static FORCE_POOLED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// Test count of the rows [`Rerank::move_to`] moved on this thread.
+    static MOVED_ROWS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Incremental canonical ranking of a built-in fitness.
@@ -520,9 +532,10 @@ thread_local! {
 /// holds its cell in every maintained ranking. The rows of one degree are
 /// consecutive, `first + 2 * cuts + side`, so a flip of `v` moves the row of
 /// `v` to `2 * first + 2 * degree + 1 - row` and the row of each neighbor by
-/// two, exactly as [`PartitionState`] updates the cut counts. Moves re-rank
-/// only the moved vertices and their neighbors, in O(1) per vertex and
-/// maintained state.
+/// two, exactly as [`PartitionState`] updates the cut counts. A swap moves
+/// every vertex it touches once, straight to its final row. Moves re-rank only
+/// the moved vertices and their neighbors, in O(1) per vertex and maintained
+/// state.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct BuiltinIndex {
     kind: BuiltinFitness,
@@ -537,6 +550,11 @@ pub(super) struct BuiltinIndex {
     rankings: Rankings,
     /// Ranking used for each size state.
     ranking_of_state: [usize; SIZE_STATES],
+    /// Swap jobs (empty for flip): the signature of the closed neighborhood
+    /// `{v} ∪ N(v)` of each vertex `v`, 64 bytes with bit `u % 512` set for
+    /// each member `u`. Disjoint signatures imply disjoint closed
+    /// neighborhoods (and are exactly that for `n <= 512`).
+    closed: Vec<[u64; SIGNATURE_WORDS]>,
 }
 
 /// Canonical rankings of the maintained size states, in shared arrays.
@@ -677,7 +695,7 @@ impl BuiltinIndex {
                 }
             }
         }
-        if u32::try_from(cell_lut.len() / count).is_err() {
+        if cell_lut.len() / count > MARK as usize {
             return Err(too_large());
         }
         let first_row: Vec<u32> = (0..n).map(|v| degree_row[graph.degree(v)] as u32).collect();
@@ -696,6 +714,19 @@ impl BuiltinIndex {
         } else {
             [0; SIZE_STATES]
         };
+        let closed = match neighborhood {
+            Neighborhood::Flip => Vec::new(),
+            Neighborhood::Swap => (0..n)
+                .map(|v| {
+                    let mut signature = [0; SIGNATURE_WORDS];
+                    for u in std::iter::once(v).chain(graph.neighbors(v).iter().copied()) {
+                        let bit = u % (64 * SIGNATURE_WORDS);
+                        signature[bit / 64] |= 1 << (bit % 64);
+                    }
+                    signature
+                })
+                .collect(),
+        };
         Ok(Self {
             kind,
             first_row,
@@ -703,6 +734,7 @@ impl BuiltinIndex {
             cell_lut,
             rankings,
             ranking_of_state,
+            closed,
         })
     }
 
@@ -732,18 +764,61 @@ impl BuiltinIndex {
         touched
     }
 
-    /// [`Self::refresh_move`] with `R` maintained rankings. A swap applies as
-    /// the flip of `a` followed by the flip of `b`, like
-    /// [`PartitionState::apply_swap`].
+    /// [`Self::refresh_move`] with `R` maintained rankings.
+    #[inline(always)]
     fn refresh_move_in<const R: usize, const POOLED: bool>(
         &mut self,
         graph: &Graph,
         mv: Move,
     ) -> u64 {
-        let touched = match mv {
-            Move::Flip(v) => 1 + graph.degree(v),
-            Move::Swap(a, b) => 2 + graph.degree(a) + graph.degree(b),
-        };
+        match mv {
+            Move::Flip(v) => self.refresh_flip::<R, POOLED>(graph, v),
+            Move::Swap(a, b) => self.refresh_swap::<R, POOLED>(graph, a, b),
+        }
+    }
+
+    /// Re-rank after `v` flipped. Flips and swaps have functions of their own,
+    /// so that neither weighs on the register use of the other.
+    #[inline(never)]
+    fn refresh_flip<const R: usize, const POOLED: bool>(&mut self, graph: &Graph, v: usize) -> u64 {
+        let touched = 1 + graph.degree(v);
+        self.pass::<R, POOLED>(touched).flip(graph, v);
+        touched as u64
+    }
+
+    /// Re-rank after `a` and `b` swapped, moving every touched vertex once.
+    /// When the closed neighborhoods of `a` and `b` are disjoint (their
+    /// signatures are), the flip of `a` and the flip of `b` touch disjoint
+    /// vertex sets; otherwise [`Rerank::swap_overlapping`] merges them.
+    #[inline(never)]
+    fn refresh_swap<const R: usize, const POOLED: bool>(
+        &mut self,
+        graph: &Graph,
+        a: usize,
+        b: usize,
+    ) -> u64 {
+        let touched = 2 + graph.degree(a) + graph.degree(b);
+        let (closed_a, closed_b) = (self.closed[a], self.closed[b]);
+        let overlap = closed_a
+            .iter()
+            .zip(&closed_b)
+            .fold(0, |acc, (x, y)| acc | (x & y));
+        let mut pass = self.pass::<R, POOLED>(touched);
+        if overlap == 0 {
+            pass.flip(graph, a);
+            pass.flip(graph, b);
+        } else {
+            pass.swap_overlapping(graph, a, b);
+        }
+        touched as u64
+    }
+
+    /// A re-ranking pass that relocates up to `touched` vertices.
+    #[inline(always)]
+    fn pass<const R: usize, const POOLED: bool>(
+        &mut self,
+        touched: usize,
+    ) -> Rerank<'_, R, POOLED> {
         let Self {
             first_row,
             row_of,
@@ -751,20 +826,12 @@ impl BuiltinIndex {
             rankings,
             ..
         } = self;
-        let mut pass = Rerank::<R, POOLED> {
+        Rerank {
             first_row,
             row_of,
             lut: cell_lut.as_chunks().0,
             cells: rankings.relocator(touched),
-        };
-        match mv {
-            Move::Flip(v) => pass.flip(graph, v),
-            Move::Swap(a, b) => {
-                pass.flip(graph, a);
-                pass.flip(graph, b);
-            }
         }
-        touched as u64
     }
 
     /// Whether the rows of the vertices `mv` touched match `state`.
@@ -810,9 +877,71 @@ impl<const R: usize, const POOLED: bool> Rerank<'_, R, POOLED> {
         }
     }
 
+    /// Re-rank after `a` and `b` (on opposite sides) swapped, when their
+    /// closed neighborhoods may overlap, moving every touched vertex once, to
+    /// its final row as [`PartitionState::apply_swap`] leaves it: `a` and `b`
+    /// to their flipped rows, two further when they are adjacent (their edge
+    /// stays cut), a neighbor of only one of them as in that flip, and a
+    /// common neighbor not at all (it loses one cut edge and gains another).
+    /// Exact for disjoint closed neighborhoods too.
+    ///
+    /// Of `x` and `y`, the endpoints with `deg(x) >= deg(y)`, the neighbors
+    /// of `y` and `y` itself are marked in the [`MARK`] bit of their rows
+    /// first. The pass over the neighbors of `x` unmarks and keeps the marked
+    /// ones (the common neighbors, and `y` when adjacent) and moves the
+    /// others; the pass over the neighbors of `y` then moves the ones still
+    /// marked. `x` is marked only when adjacent and is unmarked before that
+    /// pass. Graphs are simple ([`Graph::from_edges`]), so a pass meets each
+    /// vertex at most once.
+    #[inline(always)]
+    fn swap_overlapping(&mut self, graph: &Graph, a: usize, b: usize) {
+        let (x, y) = if graph.degree(a) >= graph.degree(b) {
+            (a, b)
+        } else {
+            (b, a)
+        };
+        let (neighbors_x, neighbors_y) = (graph.neighbors(x), graph.neighbors(y));
+        let (row_x, row_y) = (self.row_of[x] as usize, self.row_of[y] as usize);
+        // The sides `x` and `y` move to.
+        let (side_x, side_y) = ((row_x & 1) ^ 1, (row_y & 1) ^ 1);
+        for &u in neighbors_y {
+            self.row_of[u] |= MARK;
+        }
+        self.row_of[y] |= MARK;
+        for &u in neighbors_x {
+            let row = self.row_of[u];
+            if row & MARK != 0 {
+                self.row_of[u] = row ^ MARK;
+                continue;
+            }
+            let row = row as usize;
+            self.move_to(u, row, row + 4 * ((row ^ side_x) & 1) - 2);
+        }
+        let adjacent = self.row_of[y] & MARK == 0;
+        self.row_of[y] &= !MARK;
+        if adjacent {
+            self.row_of[x] ^= MARK;
+        }
+        for &u in neighbors_y {
+            let row = self.row_of[u];
+            if row & MARK == 0 {
+                continue;
+            }
+            let row = (row ^ MARK) as usize;
+            self.move_to(u, row, row + 4 * ((row ^ side_y) & 1) - 2);
+        }
+        let cut = 2 * usize::from(adjacent);
+        for (v, row, degree) in [(x, row_x, neighbors_x.len()), (y, row_y, neighbors_y.len())] {
+            let new = 2 * self.first_row[v] as usize + 2 * degree + 1 - row + cut;
+            self.move_to(v, row, new);
+        }
+    }
+
     /// Move `u` from `row` to `new`.
     #[inline(always)]
     fn move_to(&mut self, u: usize, row: usize, new: usize) {
+        #[cfg(test)]
+        MOVED_ROWS.with(|moved| moved.set(moved.get() + 1));
         self.row_of[u] = new as u32;
         self.cells
             .relocate::<R, POOLED>(u, self.lut[row], self.lut[new]);
@@ -1327,6 +1456,7 @@ impl BuiltinIndex {
             cell_lut: self.cell_lut.clone(),
             rankings,
             ranking_of_state: self.ranking_of_state,
+            closed: self.closed.clone(),
         }
     }
 }

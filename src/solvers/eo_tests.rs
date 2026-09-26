@@ -1184,3 +1184,263 @@ fn selection_thresholds_match_the_reference_on_the_whole_draw_grid() {
         }
     }
 }
+
+/// Swaps move every touched vertex at most once, on each path of
+/// `BuiltinIndex::refresh_swap`: two flips when the closed-neighborhood
+/// signatures of `a` and `b` are disjoint, otherwise the marked pass, for
+/// adjacent endpoints, common neighbors, and disjoint neighborhoods whose
+/// signatures collide (`n > 512` folds `v` and `v + 512` onto one bit). The
+/// rows moved are exactly those of the vertices whose cut count or side
+/// changed (common neighbors keep theirs), the index equals a rebuild after
+/// every swap, and the rows match the state (a debug assertion of
+/// `refresh_move`).
+#[test]
+fn swaps_rerank_every_touched_vertex_once_on_every_path() {
+    let n = 700;
+    let mut rng = Mt19937GenRand64::new(0x5a9);
+    let mut edges = std::collections::BTreeSet::new();
+    while edges.len() < 2 * n {
+        let (a, b) = (rng.gen_range(0..n), rng.gen_range(0..n));
+        if a != b {
+            edges.insert([a.min(b), a.max(b)]);
+        }
+    }
+    let graph = Graph::from_edges(n, edges.into_iter().collect()).unwrap();
+    let closed = |v: usize| {
+        let mut set: Vec<usize> = graph.neighbors(v).to_vec();
+        set.push(v);
+        set
+    };
+    let fold = |set: &[usize]| {
+        let mut bits = [0u64; 8];
+        for &u in set {
+            bits[u % 512 / 64] |= 1 << (u % 64);
+        }
+        bits
+    };
+    for spec in [
+        FitnessSpec::default(),
+        spec("additive", serde_json::json!({ "beta": 3.0 })),
+    ] {
+        for pooled in [false, true] {
+            with_layout(pooled, || {
+                let mut partition: Vec<bool> = (0..n).map(|v| v < n / 2).collect();
+                partition.shuffle(&mut rng);
+                let mut state = PartitionState::new(&graph, partition).unwrap();
+                let mut eo = Eo::new(
+                    EngineFitness::Builtin(builtin_kind(&spec)),
+                    &graph,
+                    &state,
+                    Neighborhood::Swap,
+                    1.0,
+                    &mut 0,
+                )
+                .unwrap();
+                // [disjoint, adjacent, common neighbor, colliding signatures]
+                let mut paths = [0; 4];
+                for step in 0..400 {
+                    let side = state.partition().to_vec();
+                    let a = loop {
+                        let a = rng.gen_range(0..n);
+                        if side[a] {
+                            break a;
+                        }
+                    };
+                    let opposite = |v: &usize| !side[*v];
+                    let neighbors = graph.neighbors(a);
+                    let second: Vec<usize> = neighbors
+                        .iter()
+                        .flat_map(|&u| graph.neighbors(u).iter().copied())
+                        .collect();
+                    let partner: Vec<usize> = [a.checked_add(512), a.checked_sub(512)]
+                        .into_iter()
+                        .flatten()
+                        .filter(|&v| v < n)
+                        .collect();
+                    let pick = |list: &[usize], rng: &mut Mt19937GenRand64| {
+                        let list: Vec<usize> = list.iter().copied().filter(opposite).collect();
+                        list.choose(rng).copied()
+                    };
+                    let b = match step % 4 {
+                        1 => pick(neighbors, &mut rng),
+                        2 => pick(&second, &mut rng),
+                        3 => pick(&partner, &mut rng),
+                        _ => None,
+                    }
+                    .unwrap_or_else(|| {
+                        loop {
+                            let b = rng.gen_range(0..n);
+                            if !side[b] {
+                                break b;
+                            }
+                        }
+                    });
+                    let (closed_a, closed_b) = (closed(a), closed(b));
+                    let collide = fold(&closed_a)
+                        .iter()
+                        .zip(&fold(&closed_b))
+                        .any(|(x, y)| x & y != 0);
+                    let adjacent = closed_a.contains(&b);
+                    let common = closed_a.iter().any(|u| *u != a && closed_b.contains(u));
+                    let path = match (collide, adjacent, common) {
+                        (false, ..) => 0,
+                        (true, true, _) => 1,
+                        (true, false, true) => 2,
+                        (true, false, false) => 3,
+                    };
+                    paths[path] += 1;
+                    let mv = Move::Swap(a, b);
+                    let mut touched: Vec<usize> =
+                        closed_a.iter().chain(&closed_b).copied().collect();
+                    touched.sort_unstable();
+                    touched.dedup();
+                    let vertex_state = |state: &PartitionState, u: usize| {
+                        (state.cuts_at()[u], state.partition()[u])
+                    };
+                    let before: Vec<_> = touched.iter().map(|&u| vertex_state(&state, u)).collect();
+                    crate::smoothing::apply(&mut state, &graph, mv);
+                    let changed = touched
+                        .iter()
+                        .zip(&before)
+                        .filter(|&(&u, &old)| vertex_state(&state, u) != old)
+                        .count() as u64;
+                    let mut count = 0;
+                    let moved = MOVED_ROWS.with(std::cell::Cell::get);
+                    eo.applied(&graph, &state, mv, &mut count);
+                    let moved = MOVED_ROWS.with(std::cell::Cell::get) - moved;
+                    assert_eq!(moved, changed, "rows moved by swapping {a} and {b}");
+                    assert_eq!(count, 2 + (graph.degree(a) + graph.degree(b)) as u64);
+                    eo.assert_index_consistent(&graph, &state, Neighborhood::Swap);
+                }
+                assert!(
+                    paths.iter().all(|&p| p > 0),
+                    "{spec:?} pooled {pooled}: {paths:?}"
+                );
+            });
+        }
+    }
+}
+
+/// Independent review (round 2): one relocation pass in which every relocated
+/// vertex leaves a cell that stays non-empty for a cell that was empty, in
+/// every ranking, so the pass takes `R` new pool slots per vertex. The pool
+/// before the pass holds `R * pairs` non-empty cells in as many slots as the
+/// build grew to, so the free stack is below, at and above what passes of
+/// 1 to `pairs` vertices take; the reservation of `Rankings::relocator` must
+/// cover each pass, and it may not grow the pool beyond `min(R * n, cells)`.
+#[test]
+fn review_pool_reserves_a_new_slot_per_relocated_vertex_and_ranking() {
+    fn check<const R: usize>(kind: BuiltinFitness, relations: [usize; R]) {
+        // Distinct values: every key of side `false` has its own cell in
+        // every ranking.
+        let slot_value: Vec<f64> = (0..300).map(|i| i as f64 / 299.0).collect();
+        let majority = relations.map(majority_flags);
+        for pairs in [1usize, 5, 6, 8, 11, 16, 21, 22, 32, 43, 48, 64] {
+            let n = 2 * pairs;
+            for moved in 0..=pairs {
+                let (mut rankings, cells) = Rankings::new(kind, &slot_value, &majority, n).unwrap();
+                let row = |key: usize| -> [u32; R] { std::array::from_fn(|r| cells[key * R + r]) };
+                // Vertices 2i and 2i + 1 share key i; vertex 2i of the first
+                // `moved` pairs moves to the unused key 150 + i.
+                let mut key_of: Vec<usize> = (0..n).map(|v| v / 2).collect();
+                let build = |key_of: &[usize]| {
+                    let (mut rankings, _) = Rankings::new(kind, &slot_value, &majority, n).unwrap();
+                    for (v, &key) in key_of.iter().enumerate() {
+                        for cell in row(key) {
+                            rankings.insert(v, cell);
+                        }
+                    }
+                    rankings
+                };
+                for (v, &key) in key_of.iter().enumerate() {
+                    for cell in row(key) {
+                        rankings.insert(v, cell);
+                    }
+                }
+                let before = rankings.pool.free.len() - 2 - rankings.pool.top;
+                assert_eq!(before, R * pairs);
+                {
+                    let mut relocator = rankings.relocator(moved);
+                    for i in 0..moved {
+                        relocator.relocate::<R, true>(2 * i, row(i), row(150 + i));
+                    }
+                }
+                for i in 0..moved {
+                    key_of[2 * i] = 150 + i;
+                }
+                let context = format!("{kind:?} pairs {pairs} moved {moved}");
+                rankings.assert_pool_consistent();
+                assert_eq!(
+                    rankings.pool.free.len() - 2 - rankings.pool.top,
+                    R * (pairs + moved),
+                    "{context}"
+                );
+                assert!(rankings == build(&key_of), "{context}");
+                // The largest possible reservation stays within the bound.
+                drop(rankings.relocator(n));
+                rankings.assert_pool_consistent();
+            }
+        }
+    }
+    with_layout(true, || {
+        check(BuiltinFitness::Default, [2]);
+        check(BuiltinFitness::Multiplicative { alpha: 0.5 }, [0, 1, 2]);
+    });
+}
+
+/// Independent review (round 2): the layout an index chooses by itself (no
+/// [`with_layout`]): dense for a baseline graph, pooled once majority-dependent
+/// rankings of a random graph with n = 2000 and d = 400 would need about
+/// 89 MiB of dense bitsets, where the pooled bitsets stay within `R * n` and
+/// the index follows a few EO moves exactly.
+#[test]
+fn review_indexes_choose_their_layout_without_override() {
+    use crate::experiment::config::{GraphKind, GraphSpec};
+    use crate::optimization::CancellationToken;
+    let generate = |node_count, expected_degree| {
+        let spec = GraphSpec {
+            kind: GraphKind::Random,
+            node_count,
+            expected_degree,
+            seed: 0,
+        };
+        Graph::generate(&spec, &CancellationToken::new()).unwrap()
+    };
+    let registry = FitnessRegistry::default();
+    let build = |spec: &FitnessSpec, graph: &Graph, state: &PartitionState| {
+        Eo::new(
+            registry.create_engine_fitness(spec).unwrap(),
+            graph,
+            state,
+            Neighborhood::Flip,
+            1.5,
+            &mut 0,
+        )
+        .unwrap()
+    };
+    let baseline = generate(500, 20.0);
+    let state = random_state(&baseline, 2);
+    for spec in builtin_specs() {
+        assert!(!build(&spec, &baseline, &state).is_pooled(), "{spec:?}");
+    }
+    let graph = generate(2000, 400.0);
+    let mut state = random_state(&graph, 3);
+    assert!(!build(&FitnessSpec::default(), &graph, &state).is_pooled());
+    let multiplicative = spec("multiplicative", serde_json::json!({ "alpha": 0.5 }));
+    let mut eo = build(&multiplicative, &graph, &state);
+    assert!(eo.is_pooled());
+    let mut rng = Mt19937GenRand64::new(9);
+    for _ in 0..3 {
+        let mv = eo
+            .select(&graph, &state, Neighborhood::Flip, &mut rng, &mut 0)
+            .unwrap();
+        crate::smoothing::apply(&mut state, &graph, mv);
+        eo.applied(&graph, &state, mv, &mut 0);
+    }
+    eo.assert_index_consistent(&graph, &state, Neighborhood::Flip);
+    let Ranker::Index(index) = &eo.ranker else {
+        unreachable!()
+    };
+    let pool = &index.rankings.pool;
+    assert!(pool.bits.len() <= 3 * 2000 * pool.words);
+}
