@@ -748,3 +748,9 @@ mod tests {
         }
     }
 }
+
+// Independent-review tests: an oracle that recomputes `Graph::score` on copied
+// partitions, adversarial alphas and starts, n > CHECK_INTERVAL, cancellation.
+#[cfg(test)]
+#[path = "descent_review_tests.rs"]
+mod review_tests;

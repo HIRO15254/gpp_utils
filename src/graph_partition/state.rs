@@ -57,6 +57,8 @@ impl PartitionState {
         let d = self.size_a as i64 - self.size_b() as i64;
         self.cut_edges as f64 + alpha * d as f64 * d as f64
     }
+    /// Score after flipping `v`. `super::descent` relies on this exact
+    /// expression `(cut + gain) as f64 + alpha * d as f64 * d as f64`.
     pub fn flip_score(&self, graph: &Graph, v: usize, alpha: f64) -> f64 {
         let cut = self.cut_edges + graph.degree(v) as i64 - 2 * self.cuts_at[v];
         let a = if self.partition[v] {
@@ -86,6 +88,8 @@ impl PartitionState {
             self.size_a += 1
         }
     }
+    /// Score after swapping `a` and `b`; `super::descent` bounds it with the
+    /// same expression without the adjacency term.
     pub fn swap_score(&self, graph: &Graph, a: usize, b: usize, alpha: f64) -> f64 {
         if self.partition[a] == self.partition[b] || a == b {
             return self.score(alpha);

@@ -31,7 +31,7 @@
 | 拡張 | 主な変更箇所 | 確認する連携 |
 |---|---|---|
 | ソルバー | `experiment/config.rs`のSweep/単一Spec、`plan.rs`の検証・展開、`solvers/engine.rs`の初期化・RNG・step | `runner.rs`の直接呼び出し検証、`result.rs`の適用条件、TSVの手法列、設定例 |
-| 平滑化・近傍 | config/plan、`smoothing/mod.rs`、必要時`graph_partition/state.rs` | K正規化、候補列挙順、Flip/Swap不変条件、キャンセル周期、EO禁止条件 |
+| 平滑化・近傍 | config/plan、`smoothing/mod.rs`、必要時`graph_partition/state.rs`。目的関数の式を変えるときは、その式に依存する下界（`graph_partition/descent.rs`）も直す | K正規化、候補列挙順、Flip/Swap不変条件、キャンセル周期、EO禁止条件 |
 | 適応度 | `FitnessFactory`と`VertexFitness`を利用側で実装、Registry登録。組み込みを追加する場合は`src/solvers`の索引実装も追加 | バージョン、params検証、全頂点の順序・有限性、再開時の登録一致。組み込みは索引経路と参照実装のビット一致 |
 | 計測 | config、`runner.rs`の計測・専用RNG・キャッシュ、`result.rs`の型・検証・RunView | 初期/終了/中断、JSON省略、暫定解への非干渉、TSV、出力仕様 |
 | 保存・再開 | `storage/mod.rs`の状態分類、`storage/atomic.rs`、`error.rs` | 完了結果優先、失敗記録、排他・原子的確定、破損と未対応版の区別 |
