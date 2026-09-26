@@ -656,6 +656,12 @@ pub(crate) fn scratch_status() -> (usize, bool, bool) {
     })
 }
 
+// The smoothing module as of 2fc65d9, frozen for the comparisons below (the
+// same code as `solvers::test_reference::smoothing_e4b6a1c`).
+#[cfg(test)]
+#[allow(dead_code)]
+mod test_reference;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -798,6 +804,215 @@ mod tests {
             let ordinals = (0..500).map(|_| rng.gen_range(0..pairs));
             for ordinal in ordinals.chain([0, 1, n - 2, n - 1, pairs - 2, pairs - 1]) {
                 assert_eq!(nth_pair(n, ordinal), nth_pair_by_rows(n, ordinal));
+            }
+        }
+    }
+
+    #[test]
+    fn all_smoothing_matches_frozen_full_reference() {
+        let isolated_64 = Graph::from_edges(64, vec![]).unwrap();
+        let complete_8 = Graph::from_edges(
+            8,
+            (0..8)
+                .flat_map(|a| (a + 1..8).map(move |b| [a, b]))
+                .collect(),
+        )
+        .unwrap();
+        for graph in [&isolated_64, &complete_8] {
+            let n = graph.node_count();
+            for neighborhood in [Neighborhood::Flip, Neighborhood::Swap] {
+                let partition = match neighborhood {
+                    Neighborhood::Flip => (0..n).map(|v| v % 3 == 0 || v % 7 == 0).collect(),
+                    Neighborhood::Swap => (0..n).map(|v| v < n / 2).collect(),
+                };
+                let state = PartitionState::new(graph, partition).unwrap();
+                let first_count = match neighborhood {
+                    Neighborhood::Flip => n,
+                    Neighborhood::Swap => n * n / 4,
+                };
+                let maximum = max_random_k(n, neighborhood) as usize;
+                let mut specs = vec![
+                    SmoothingSpec::None,
+                    SmoothingSpec::WeightedAverage { k: 0 },
+                    SmoothingSpec::WeightedAverage { k: 3 },
+                    SmoothingSpec::RandomKAverage { k: 1 },
+                    SmoothingSpec::RandomKAverage {
+                        k: (first_count + 3).min(maximum),
+                    },
+                ];
+                // Exercise full distance-one + distance-two enumeration without
+                // making the n=64 Swap case dominate the unit-test runtime.
+                if n == 8 {
+                    specs.push(SmoothingSpec::RandomKAverage { k: maximum });
+                }
+                for spec in specs {
+                    for seed in [0, 1, 0x9e37_79b9_7f4a_7c15] {
+                        let mut actual_rng = Mt19937GenRand64::new(seed);
+                        let mut frozen_rng = Mt19937GenRand64::new(seed);
+                        let mut actual_evals = 0;
+                        let mut frozen_evals = 0;
+                        let actual = evaluate(
+                            &state,
+                            graph,
+                            0.05,
+                            neighborhood,
+                            &spec,
+                            Some(&mut actual_rng),
+                            &CancellationToken::default(),
+                            &mut actual_evals,
+                        )
+                        .unwrap();
+                        let frozen = super::test_reference::evaluate(
+                            &state,
+                            graph,
+                            0.05,
+                            neighborhood,
+                            &spec,
+                            Some(&mut frozen_rng),
+                            &CancellationToken::default(),
+                            &mut frozen_evals,
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            actual.to_bits(),
+                            frozen.to_bits(),
+                            "bits: n={n} neighborhood={neighborhood:?} spec={spec:?} seed={seed}"
+                        );
+                        assert_eq!(
+                            actual_evals, frozen_evals,
+                            "evaluations: n={n} neighborhood={neighborhood:?} spec={spec:?} seed={seed}"
+                        );
+                        for draw in 0..624 {
+                            assert_eq!(
+                                actual_rng.next_u64(),
+                                frozen_rng.next_u64(),
+                                "rng draw {draw}: n={n} neighborhood={neighborhood:?} spec={spec:?} seed={seed}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Frozen, deliberately independent distance-one evaluator from 2fc65d9.
+    // Keep the materialized nested-loop order here when production changes.
+    fn frozen_distance_one(
+        state: &PartitionState,
+        graph: &Graph,
+        alpha: f64,
+        neighborhood: Neighborhood,
+        spec: &SmoothingSpec,
+        rng: Option<&mut Mt19937GenRand64>,
+        evaluations: &mut u64,
+    ) -> f64 {
+        let first: Vec<Move> = match neighborhood {
+            Neighborhood::Flip => (0..state.partition().len()).map(Move::Flip).collect(),
+            Neighborhood::Swap => {
+                let side_a = state
+                    .partition()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(v, &x)| x.then_some(v))
+                    .collect::<Vec<_>>();
+                let side_b = state
+                    .partition()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(v, &x)| (!x).then_some(v))
+                    .collect::<Vec<_>>();
+                side_a
+                    .iter()
+                    .flat_map(|&a| side_b.iter().map(move |&b| Move::Swap(a, b)))
+                    .collect()
+            }
+        };
+        let k = match spec {
+            SmoothingSpec::RandomKAverage { k } => Some(*k),
+            _ => None,
+        };
+        let take = k.map_or(first.len(), |x| x.min(first.len()));
+        let mut indices = (0..first.len()).collect::<Vec<_>>();
+        if k.is_some() {
+            let rng = rng.unwrap();
+            for i in 0..take {
+                let j = rng.gen_range(i..indices.len());
+                indices.swap(i, j);
+            }
+        }
+        let mut total = 0.0;
+        for &i in &indices[..take] {
+            total += move_score(state, graph, first[i], alpha);
+        }
+        *evaluations += take as u64;
+        let average = total / take as f64;
+        match spec {
+            SmoothingSpec::WeightedAverage { k } => {
+                let w = (*k).min(first.len()) as f64 / first.len() as f64;
+                w * average + (1.0 - w) * state.score(alpha)
+            }
+            _ => average,
+        }
+    }
+
+    #[test]
+    fn optimized_distance_one_matches_frozen_bits_rng_and_counters() {
+        let graph = Graph::from_edges(
+            8,
+            vec![
+                [0, 1],
+                [0, 4],
+                [1, 2],
+                [1, 6],
+                [2, 3],
+                [2, 5],
+                [3, 4],
+                [3, 7],
+                [4, 5],
+                [5, 6],
+                [6, 7],
+            ],
+        )
+        .unwrap();
+        let state = PartitionState::new(
+            &graph,
+            vec![true, false, true, false, true, false, false, true],
+        )
+        .unwrap();
+        for neighborhood in [Neighborhood::Flip, Neighborhood::Swap] {
+            for spec in [
+                SmoothingSpec::WeightedAverage { k: 3 },
+                SmoothingSpec::RandomKAverage { k: 3 },
+            ] {
+                let mut actual_rng = Mt19937GenRand64::new(0x1020_3040_5060_7080);
+                let mut frozen_rng = actual_rng.clone();
+                let mut actual_evals = 0;
+                let mut frozen_evals = 0;
+                let actual = evaluate(
+                    &state,
+                    &graph,
+                    0.05,
+                    neighborhood,
+                    &spec,
+                    Some(&mut actual_rng),
+                    &CancellationToken::default(),
+                    &mut actual_evals,
+                )
+                .unwrap();
+                let frozen = frozen_distance_one(
+                    &state,
+                    &graph,
+                    0.05,
+                    neighborhood,
+                    &spec,
+                    Some(&mut frozen_rng),
+                    &mut frozen_evals,
+                );
+                assert_eq!(actual.to_bits(), frozen.to_bits());
+                assert_eq!(actual_evals, frozen_evals);
+                for _ in 0..624 {
+                    assert_eq!(actual_rng.next_u64(), frozen_rng.next_u64());
+                }
             }
         }
     }

@@ -118,3 +118,49 @@ fn typed_export_preserves_complete_and_partial_output_bytes() {
         compare(&plan, root.path(), false);
     }
 }
+
+#[test]
+fn export_validates_all_sources_before_replacing_any_destination() {
+    let plan = compile_experiment(
+        serde_json::from_value(json!({
+            "schema_version":1,
+            "run_seeds":[1,2],
+            "neighborhoods":["flip"],
+            "budget":{"max_steps":1},
+            "measurement":{"schedule":"explicit","steps":[1],"basin":"none","diagnostics":false},
+            "graphs":[{"kind":"random","node_counts":[4],"expected_degrees":[1.0],"seeds":[3]}],
+            "solvers":[{"kind":"sa","temperatures":[1.0],"smoothing":[{"kind":"none"}]}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let options = RuntimeOptions {
+        root: root.path().into(),
+        threads: 1,
+        ..Default::default()
+    };
+    run_batch(
+        &plan,
+        &options,
+        &CancellationToken::new(),
+        &FitnessRegistry::default(),
+        &|_| {},
+    )
+    .unwrap();
+    let mut jobs = plan.jobs.iter().collect::<Vec<_>>();
+    jobs.sort_by_key(|job| (&job.condition_id, job.seed));
+    std::fs::write(result_path(root.path(), jobs[1]), b"{broken").unwrap();
+
+    let out = tempfile::tempdir().unwrap();
+    for name in ["runs.tsv", "traces.tsv", "metadata.json"] {
+        std::fs::write(out.path().join(name), format!("old-{name}")).unwrap();
+    }
+    assert!(export_tsv(&plan, root.path(), out.path(), false, true).is_err());
+    for name in ["runs.tsv", "traces.tsv", "metadata.json"] {
+        assert_eq!(
+            std::fs::read_to_string(out.path().join(name)).unwrap(),
+            format!("old-{name}")
+        );
+    }
+}

@@ -161,7 +161,7 @@ fn prepare_graph(root: &Path, job: &Job, cancel: &CancellationToken) -> Result<G
     Ok(graph)
 }
 pub fn read_result(path: &Path, graph: &Graph, condition: &Condition) -> Result<RunResult> {
-    let result: RunResult = atomic::read_json(path)?;
+    let result: RunResult = atomic::read_run_result(path)?;
     result.validate(graph, condition)?;
     if result.termination == RunTermination::Cancelled {
         bail!("incomplete result in completed result file");
@@ -268,66 +268,84 @@ pub fn inspect(
     let mut graphs: HashMap<String, Arc<Graph>> = HashMap::new();
     let mut rows = Vec::with_capacity(plan.jobs.len());
     for job in &plan.jobs {
-        let marker = read_marker(&incomplete_path(root, job))?;
-        let path = result_path(root, job);
-        let mut row = JobInspection {
-            condition_id: job.condition_id.clone(),
-            seed: job.seed,
-            status: "not_started".into(),
-            latest_attempt_status: None,
-            error: None,
-            result: None,
-            graph: None,
-        };
-        if file_exists(&path)?
-            || (include_incomplete
-                && matches!(&marker, MarkerState::Valid(m) if m.partial_result.is_some()))
-        {
-            let graph = if let Some(g) = graphs.get(&job.graph_id) {
-                g.clone()
-            } else {
-                let g = Arc::new(read_graph(root, job)?);
-                graphs.insert(job.graph_id.clone(), g.clone());
-                g
-            };
-            if file_exists(&path)? {
-                row.result = Some(read_result(&path, &graph, &job.condition)?);
-                row.status = "completed".into();
-            } else if let MarkerState::Valid(m) = &marker {
-                row.result = restore_partial(m, &graph, &job.condition)?;
-            }
-            row.graph = Some(graph);
-        }
-        if let MarkerState::Valid(m) = marker {
-            let stale = row
-                .result
-                .as_ref()
-                .is_some_and(|r| row.status == "completed" && r.attempt_id == m.attempt_id);
-            if !stale {
-                let status = if m.status == "running" && !active {
-                    "interrupted".to_owned()
-                } else {
-                    m.status
-                };
-                if row.status != "completed" {
-                    row.status = status.clone();
-                }
-                row.latest_attempt_status = Some(status);
-                row.error = m.error;
-            }
-        } else if let MarkerState::Invalid(e) | MarkerState::Unsupported(e) = marker {
-            row.latest_attempt_status = Some("invalid_marker".into());
-            if row.status != "completed" {
-                row.status = "invalid_marker".into();
-            }
-            row.error = Some(Failure {
-                code: "marker_issue".into(),
-                message: format!("{e:#}"),
-            });
-        }
-        rows.push(row);
+        rows.push(inspect_job(
+            job,
+            root,
+            include_incomplete,
+            active,
+            &mut graphs,
+        )?);
     }
     Ok(rows)
+}
+
+/// Inspect one job while reusing graph instances. Results are validated before
+/// return, allowing streaming consumers to drop each result after writing it.
+pub(crate) fn inspect_job(
+    job: &Job,
+    root: &Path,
+    include_incomplete: bool,
+    active: bool,
+    graphs: &mut HashMap<String, Arc<Graph>>,
+) -> Result<JobInspection> {
+    let marker = read_marker(&incomplete_path(root, job))?;
+    let path = result_path(root, job);
+    let mut row = JobInspection {
+        condition_id: job.condition_id.clone(),
+        seed: job.seed,
+        status: "not_started".into(),
+        latest_attempt_status: None,
+        error: None,
+        result: None,
+        graph: None,
+    };
+    if file_exists(&path)?
+        || (include_incomplete
+            && matches!(&marker, MarkerState::Valid(m) if m.partial_result.is_some()))
+    {
+        let graph = if let Some(g) = graphs.get(&job.graph_id) {
+            g.clone()
+        } else {
+            let g = Arc::new(read_graph(root, job)?);
+            graphs.insert(job.graph_id.clone(), g.clone());
+            g
+        };
+        if file_exists(&path)? {
+            row.result = Some(read_result(&path, &graph, &job.condition)?);
+            row.status = "completed".into();
+        } else if let MarkerState::Valid(m) = &marker {
+            row.result = restore_partial(m, &graph, &job.condition)?;
+        }
+        row.graph = Some(graph);
+    }
+    if let MarkerState::Valid(m) = marker {
+        let stale = row
+            .result
+            .as_ref()
+            .is_some_and(|r| row.status == "completed" && r.attempt_id == m.attempt_id);
+        if !stale {
+            let status = if m.status == "running" && !active {
+                "interrupted".to_owned()
+            } else {
+                m.status
+            };
+            if row.status != "completed" {
+                row.status = status.clone();
+            }
+            row.latest_attempt_status = Some(status);
+            row.error = m.error;
+        }
+    } else if let MarkerState::Invalid(e) | MarkerState::Unsupported(e) = marker {
+        row.latest_attempt_status = Some("invalid_marker".into());
+        if row.status != "completed" {
+            row.status = "invalid_marker".into();
+        }
+        row.error = Some(Failure {
+            code: "marker_issue".into(),
+            message: format!("{e:#}"),
+        });
+    }
+    Ok(row)
 }
 
 pub fn run_batch(
@@ -364,11 +382,12 @@ pub fn run_batch(
         atomic::write_json(&path, &plan.experiment, false)?;
     }
     type GraphCell = Arc<OnceLock<std::result::Result<Arc<Graph>, String>>>;
-    let graphs: HashMap<String, GraphCell> = plan
-        .jobs
-        .iter()
-        .map(|j| (j.graph_id.clone(), Arc::new(OnceLock::new())))
-        .collect();
+    let mut graphs: HashMap<String, GraphCell> = HashMap::new();
+    for job in &plan.jobs {
+        graphs
+            .entry(job.graph_id.clone())
+            .or_insert_with(|| Arc::new(OnceLock::new()));
+    }
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(options.threads)
         .build()?;
@@ -524,7 +543,9 @@ fn run_job(
             atomic::write_json_compact(&marker_path, &marker, true)?;
             return Ok("cancelled".into());
         }
-        result.validate(graph, &job.condition)?;
+        // `run_one` validates before returning. Replacing `attempt_id` preserves
+        // every validated invariant and the generated ID is always non-empty.
+        debug_assert!(!result.attempt_id.is_empty());
         atomic::write_json_compact(&path, &result, true)?;
         // A durable complete result wins even if marker cleanup is interrupted.
         // The next writer removes a matching stale marker.

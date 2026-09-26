@@ -794,6 +794,71 @@ fn eo_cancellation_consumes_selection_draws_and_changes_nothing_else() {
     }
 }
 
+/// The Metropolis rule of real-objective SA through the memo of
+/// `(-delta / t).exp()`: improvements and temperature zero draw nothing, every
+/// other judgement draws exactly once, and the threshold has the bits of the
+/// expression on misses, hits, signed zeros, keys sharing a memo slot and
+/// underflow. The memo is fixed to the job's temperature, so each temperature
+/// has its own engine.
+#[test]
+fn sa_metropolis_memo_preserves_rng_shortcuts_bits_and_collisions() {
+    let g = graph();
+    let cancel = CancellationToken::new();
+    let registry = FitnessRegistry::default_registry();
+    let conditions = [1.0, 0.0, f64::MIN_POSITIVE].map(|temperature| {
+        condition(
+            Neighborhood::Flip,
+            SolverSpec::Sa {
+                temperature,
+                smoothing: SmoothingSpec::None,
+            },
+            0.05,
+        )
+    });
+    let [warm, cold, tiny] = &conditions;
+    let mut engine = Engine::new(&g, warm, 123, &registry, &cancel).unwrap();
+    let untouched = engine.select_rng.clone();
+    assert!(engine.sa_accept(-1.0, 1.0));
+    assert!(engine.select_rng == untouched, "improvement must not draw");
+    let mut frozen = Engine::new(&g, cold, 123, &registry, &cancel).unwrap();
+    let untouched = frozen.select_rng.clone();
+    assert!(!frozen.sa_accept(1.0, 0.0));
+    assert!(
+        frozen.select_rng == untouched,
+        "temperature zero must not draw"
+    );
+
+    let check = |engine: &mut Engine<'_>, delta: f64, temperature: f64| {
+        let mut expected_rng = engine.select_rng.clone();
+        let draw: f64 = expected_rng.r#gen();
+        let threshold = (-delta / temperature).exp();
+        assert_eq!(engine.sa_accept(delta, temperature), draw < threshold);
+        assert!(engine.select_rng == expected_rng, "Metropolis draw count");
+        threshold
+    };
+
+    let mut minute = Engine::new(&g, tiny, 123, &registry, &cancel).unwrap();
+    let threshold = check(&mut minute, f64::MIN_POSITIVE, f64::MIN_POSITIVE);
+    assert_eq!(threshold.to_bits(), (-1.0f64).exp().to_bits());
+    let underflow = check(&mut minute, f64::MAX, f64::MIN_POSITIVE);
+    assert_eq!(underflow.to_bits(), 0.0f64.to_bits());
+
+    for zero in [0.0, -0.0, 0.0] {
+        check(&mut engine, zero, 1.0);
+    }
+    // Two integer deltas in one memo slot: replacing either key only turns
+    // the next lookup into an exact miss.
+    let slot = |x: f64| crate::solvers::metropolis::slot(x.to_bits());
+    let first = 15.0f64;
+    let second = (16..100_000u32)
+        .map(f64::from)
+        .find(|&x| slot(x) == slot(first))
+        .expect("an integer delta sharing the slot of 15");
+    for delta in [first, first, second, first, second, second] {
+        check(&mut engine, delta, 1.0);
+    }
+}
+
 // EO-SA (`eo_sa`): EO proposals judged by the Metropolis rule. Compared with an
 // independent naive reference built on the `eo_v2` selection oracle.
 #[path = "eo_sa_exact_tests.rs"]

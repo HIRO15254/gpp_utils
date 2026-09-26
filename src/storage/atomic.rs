@@ -1,7 +1,7 @@
 use crate::error::{Result, UnsupportedSchema};
 use anyhow::Context;
 use fs2::FileExt;
-use serde::Serialize;
+use serde::{Deserialize, Deserializer, Serialize, de};
 use std::{
     fs::{File, OpenOptions},
     io::Write,
@@ -62,6 +62,27 @@ pub fn write_bytes(path: &Path, bytes: &[u8], overwrite: bool) -> Result<()> {
     File::open(parent)?.sync_all()?;
     Ok(())
 }
+
+/// Durably commits a completed temporary file to one destination. Callers may
+/// prepare several files first, but each destination is committed atomically
+/// on its own; this does not claim directory-wide transactionality.
+pub(crate) fn persist_temp(
+    tmp: tempfile::NamedTempFile,
+    path: &Path,
+    overwrite: bool,
+) -> Result<()> {
+    tmp.as_file().sync_all()?;
+    if overwrite {
+        tmp.persist(path).map_err(|e| e.error)?;
+    } else {
+        tmp.persist_noclobber(path).map_err(|e| e.error)?;
+    }
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
 /// Atomically writes pretty-printed JSON followed by a newline. Experiment,
 /// graph and export metadata files use this human-readable form.
 pub fn write_json<T: Serialize>(path: &Path, data: &T, overwrite: bool) -> Result<()> {
@@ -79,7 +100,11 @@ pub fn write_json_compact<T: Serialize>(path: &Path, data: &T, overwrite: bool) 
 }
 pub fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes)
+    read_json_bytes(path, &bytes)
+}
+
+fn read_json_bytes<T: serde::de::DeserializeOwned>(path: &Path, bytes: &[u8]) -> Result<T> {
+    let value: serde_json::Value = serde_json::from_slice(bytes)
         .with_context(|| format!("invalid JSON: {}", path.display()))?;
     if let Some(version) = value.get("schema_version")
         && version.as_u64() != Some(1)
@@ -87,6 +112,62 @@ pub fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
         return Err(UnsupportedSchema { path: path.into() }.into());
     }
     serde_json::from_value(value).with_context(|| format!("invalid data: {}", path.display()))
+}
+
+/// Fast typed path for large, known schemas. Any input for which typed
+/// deserialization differs from the historical `Value` path (notably duplicate
+/// struct fields) falls back using the same already-read bytes.
+pub(crate) fn read_run_result(path: &Path) -> Result<crate::experiment::result::RunResult> {
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let header: SchemaHeader = match serde_json::from_slice(&bytes) {
+        Ok(header) => header,
+        Err(_) => return read_json_bytes(path, &bytes),
+    };
+    if header
+        .schema_version
+        .as_ref()
+        .is_some_and(|version| version.as_u64() != Some(1))
+    {
+        // `IgnoredAny` validates JSON grammar but intentionally skips numeric
+        // range checks. Preserve the historical `Value` parser's error
+        // precedence for future schemas containing values such as `1e999`.
+        return read_json_bytes(path, &bytes);
+    }
+    match serde_json::from_slice(&bytes) {
+        Ok(value) => Ok(value),
+        Err(_) => read_json_bytes(path, &bytes),
+    }
+}
+
+struct SchemaHeader {
+    schema_version: Option<serde_json::Value>,
+}
+
+impl<'de> Deserialize<'de> for SchemaHeader {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> de::Visitor<'de> for Visitor {
+            type Value = SchemaHeader;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON object")
+            }
+            fn visit_map<A: de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut schema_version = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    if key == "schema_version" {
+                        schema_version = Some(map.next_value()?);
+                    } else {
+                        map.next_value::<de::IgnoredAny>()?;
+                    }
+                }
+                Ok(SchemaHeader { schema_version })
+            }
+        }
+        deserializer.deserialize_map(Visitor)
+    }
 }
 
 fn lock_contended(error: &std::io::Error) -> bool {

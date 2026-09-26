@@ -4,6 +4,7 @@ use crate::graph_partition::Graph;
 use anyhow::ensure;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use std::sync::OnceLock;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -402,6 +403,7 @@ pub struct RunView<'a> {
     graph: &'a Graph,
     condition: &'a Condition,
     result: &'a RunResult,
+    breakdowns: Vec<OnceLock<ScoreBreakdown>>,
 }
 
 /// A real-objective score together with the terms used to derive it for TSV
@@ -451,11 +453,23 @@ pub struct MeasurementView<'view, 'result> {
 impl<'a> RunView<'a> {
     pub fn new(graph: &'a Graph, condition: &'a Condition, result: &'a RunResult) -> Result<Self> {
         result.validate(graph, condition)?;
-        Ok(Self {
+        Ok(Self::from_validated(graph, condition, result))
+    }
+    /// Constructs a view for a result already checked by the storage or runner
+    /// boundary. Keep this internal so arbitrary callers cannot bypass validation.
+    pub(crate) fn from_validated(
+        graph: &'a Graph,
+        condition: &'a Condition,
+        result: &'a RunResult,
+    ) -> Self {
+        Self {
             graph,
             condition,
             result,
-        })
+            breakdowns: (0..result.partitions.len())
+                .map(|_| OnceLock::new())
+                .collect(),
+        }
     }
     pub fn graph(&self) -> &'a Graph {
         self.graph
@@ -487,22 +501,26 @@ impl<'a> RunView<'a> {
         self.score(self.result.best_solution)
     }
     pub fn breakdown(&self, id: SolutionId) -> ScoreBreakdown {
-        let partition = self.partition(id);
-        let size_a = partition.iter().filter(|&&value| value).count();
-        let size_b = partition.len() - size_a;
-        let cut_edges = self
-            .graph
-            .edges()
-            .iter()
-            .filter(|&&[a, b]| partition[a] != partition[b])
-            .count();
-        ScoreBreakdown {
-            real: self.score(id),
-            cut_edges,
-            size_a,
-            size_b,
-            balance_penalty: self.condition.alpha * (size_a as f64 - size_b as f64).powi(2),
-        }
+        *self.breakdowns[id.0].get_or_init(|| {
+            let partition = self.partition(id);
+            let size_a = partition.iter().filter(|&&value| value).count();
+            let size_b = partition.len() - size_a;
+            let cut_edges = self
+                .graph
+                .edges()
+                .iter()
+                .filter(|&&[a, b]| partition[a] != partition[b])
+                .count();
+            ScoreBreakdown {
+                // Keep the real objective's historical alpha*d*d evaluation.
+                real: self.graph.score(partition, self.condition.alpha),
+                cut_edges,
+                size_a,
+                size_b,
+                // TSV historically evaluates the displayed term with powi.
+                balance_penalty: self.condition.alpha * (size_a as f64 - size_b as f64).powi(2),
+            }
+        })
     }
     pub fn measurement<'view>(
         &'view self,

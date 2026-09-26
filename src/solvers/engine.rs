@@ -449,7 +449,14 @@ impl<'a> Engine<'a> {
             return Err(Error::msg("non-finite search evaluation"));
         }
         let delta = next - self.search_evaluation;
-        Ok(delta < 0.0
+        Ok(self.sa_accept(delta, t))
+    }
+    /// `delta < 0.0 || (t > 0.0 && u < (-delta / t).exp())` for the job's
+    /// temperature `t`, with `u` drawn from the select stream only when the
+    /// right operand is evaluated (improvements and `t == 0` draw nothing).
+    #[inline(always)]
+    fn sa_accept(&mut self, delta: f64, t: f64) -> bool {
+        delta < 0.0
             || (t > 0.0 && {
                 let u = self.select_rng.r#gen::<f64>();
                 // The bits of `(-delta / t).exp()`.
@@ -459,7 +466,7 @@ impl<'a> Engine<'a> {
                     .expect("real-objective SA initializes the Metropolis memo")
                     .get(delta);
                 u < factor
-            }))
+            })
     }
     fn sa_smoothed(&mut self, t: f64, cancel: &CancellationToken) -> Result<StepStatus> {
         let mv = self.random_move(cancel)?;

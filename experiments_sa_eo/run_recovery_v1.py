@@ -4,9 +4,11 @@
     python experiments_sa_eo/run_recovery_v1.py --check        # 実行前の確認だけ（計算しない）
     python experiments_sa_eo/run_recovery_v1.py                # A → C → B を実行
     python experiments_sa_eo/run_recovery_v1.py --stages C,B   # 一部の段階だけ（順番は A → C → B のまま）
+    python experiments_sa_eo/run_recovery_v1.py --gpp PATH     # 検証済みのビルド済み gpp を使う
 
 計算を始める前に次を確かめ、1 つでも違えば計算せずに止まる。
-    1. gpp の release ビルドが現在のソースから作られている（cargo build --release --locked --bin gpp）
+    1. 通常は gpp の release ビルドを現在のソースから作る
+       （cargo build --release --locked --bin gpp）。--gpp 指定時はそのビルドを使い、自動ビルドしない
     2. 仕様ファイルが make_baseline_v1.py・make_recovery_v1.py の出力と一致する
     3. gpp validate の batch_id とジョブ数が、この計画の記録（STAGES）と一致する
 各段階は --rounds で流す（シードごとに全条件を終えてから次のシードへ進む）。中断しても同じコマンドで続きから
@@ -19,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -77,6 +80,14 @@ def build(log: Log) -> bool:
     return True
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def specs_match(log: Log) -> bool:
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
@@ -88,9 +99,9 @@ def specs_match(log: Log) -> bool:
     return not bad
 
 
-def validate(stage: str, log: Log) -> bool:
+def validate(stage: str, gpp: Path, log: Log) -> bool:
     spec, batch_id, jobs = STAGES[stage]
-    done = subprocess.run([str(GPP), "validate", str(spec), "--json"], cwd=REPO, capture_output=True,
+    done = subprocess.run([str(gpp), "validate", str(spec), "--json"], cwd=REPO, capture_output=True,
                           text=True, encoding="utf-8", errors="replace")
     if done.returncode:
         log(f"段階 {stage}: gpp validate が失敗した\n{done.stderr.strip()}")
@@ -103,9 +114,9 @@ def validate(stage: str, log: Log) -> bool:
     return True
 
 
-def failure_reason(root: Path, batch_id: str, condition_id: str, seed: str) -> str:
+def failure_reason(gpp: Path, root: Path, batch_id: str, condition_id: str, seed: str) -> str:
     done = subprocess.run(
-        [str(GPP), "inspect", "--batch", batch_id, "--root", str(root), "--condition", condition_id,
+        [str(gpp), "inspect", "--batch", batch_id, "--root", str(root), "--condition", condition_id,
          "--seed", seed, "--json"],
         cwd=REPO, capture_output=True, text=True, encoding="utf-8", errors="replace",
     )
@@ -116,10 +127,10 @@ def failure_reason(root: Path, batch_id: str, condition_id: str, seed: str) -> s
     return f"{error['code']}: {error['message']}" if error else "（理由の記録なし）"
 
 
-def run_stage(stage: str, root: Path, args: argparse.Namespace, log: Log) -> int:
+def run_stage(stage: str, gpp: Path, root: Path, args: argparse.Namespace, log: Log) -> int:
     spec, batch_id, jobs = STAGES[stage]
     resume = (root / "batches" / batch_id).exists()
-    cmd = [str(GPP)]
+    cmd = [str(gpp)]
     cmd += ["resume", "--batch", batch_id] if resume else ["run", str(spec)]
     cmd += ["--root", str(root), "--threads", str(args.threads), "--rounds"]
     if args.deadline_seconds is not None:
@@ -183,7 +194,8 @@ def run_stage(stage: str, root: Path, args: argparse.Namespace, log: Log) -> int
             log(f"  gpp の出力: {out.strip()}")
     # gpp run の進行表示には失敗理由が出ないので、最初の数件だけ gpp inspect で引いて記録する。
     for condition_id, seed in failed[:FAILURE_DETAILS]:
-        log(f"  失敗理由 {condition_id[:8]} seed={seed}: {failure_reason(root, batch_id, condition_id, seed)}")
+        log(f"  失敗理由 {condition_id[:8]} seed={seed}: "
+            f"{failure_reason(gpp, root, batch_id, condition_id, seed)}")
     if len(failed) > FAILURE_DETAILS:
         log(f"  失敗は計 {len(failed):,} 件。残りの理由は gpp inspect --batch {batch_id} --root {root} --json で確かめる")
     log(f"段階 {stage} 終了: 終了コード {code}、経過 {hms(time.monotonic() - start)}")
@@ -197,6 +209,8 @@ def main() -> int:
         stream.reconfigure(encoding="utf-8", errors="backslashreplace")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--check", action="store_true", help="確認だけして計算しない")
+    ap.add_argument("--gpp", type=Path,
+                    help="検証済みのビルド済み gpp。指定時は cargo build を省略し、全操作にこの実行ファイルを使う")
     ap.add_argument("--stages", default=",".join(ORDER), help="実行する段階（既定 A,C,B）")
     ap.add_argument("--root", type=Path, default=REPO / "data" / "v1", help="結果の保存先（既定 data/v1）")
     ap.add_argument("--threads", type=int, default=12, help="並列数（既定 12）")
@@ -210,11 +224,19 @@ def main() -> int:
     stages = [s for s in ORDER if s in wanted]
     root = args.root.resolve()
     log = Log(None if args.check else args.log_dir / f"run_{dt.datetime.now():%Y%m%d-%H%M%S}.log")
+    if args.gpp is None:
+        gpp = GPP
+    else:
+        gpp = args.gpp.resolve()
+        if not gpp.exists() or not gpp.is_file():
+            ap.error(f"--gpp が実行ファイルを指していない: {gpp}")
+        log(f"指定された gpp を使用（自動ビルドを省略）: {gpp}")
+        log(f"指定された gpp の SHA-256: {file_sha256(gpp)}")
 
     # 一部の段階だけ流すときも、計画全体（A・C・B）の仕様と batch_id を確かめる。
     # 段階間で条件 ID がずれると、C・B が A の結果を再利用できなくなるため。
-    ok = build(log) and specs_match(log)
-    ok = ok and all([validate(s, log) for s in ORDER])
+    ok = (build(log) if args.gpp is None else True) and specs_match(log)
+    ok = ok and all([validate(s, gpp, log) for s in ORDER])
     if not ok:
         log("確認に失敗したので実行しない")
         return 2
@@ -228,7 +250,7 @@ def main() -> int:
 
     log(f"実行する段階: {' → '.join(stages)}、保存先 {root}、{args.threads} 並列")
     for s in stages:
-        code = run_stage(s, root, args, log)
+        code = run_stage(s, gpp, root, args, log)
         if code == -1:
             log("時間制限で止めた。同じコマンドで続きから再開できる")
             return 0

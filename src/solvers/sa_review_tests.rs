@@ -365,8 +365,9 @@ fn memo_stays_exact_under_heavy_collisions() {
 }
 
 /// `has_edge` agrees with the edge list for every pair of every graph size
-/// 0..=130, and for every pair at 2047..=2050 vertices (matrix on both sides
-/// of the cap); graphs are shareable and hash consistently across threads.
+/// 0..=130, and for every pair at 2047..=2050 vertices (word boundaries of
+/// large rows; the fallback above the matrix cap is tested in `graph.rs`);
+/// graphs are shareable and hash consistently across threads.
 #[test]
 fn has_edge_exhaustive_and_hash_across_threads() {
     let check = |g: &Graph| {

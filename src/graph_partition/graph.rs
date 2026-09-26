@@ -8,8 +8,9 @@ use std::collections::BTreeSet;
 use std::sync::OnceLock;
 
 /// Largest vertex count for which [`Graph`] keeps an adjacency bit matrix
-/// (`node_count * ceil(node_count / 64)` words, at most 512 KiB).
-const MATRIX_MAX_NODES: usize = 2048;
+/// (`node_count * ceil(node_count / 64)` words, at most 8 MiB).
+const MATRIX_MAX_NODES: usize = 8192;
+const _: () = assert!(MATRIX_MAX_NODES * MATRIX_MAX_NODES.div_ceil(64) * 8 == 8 << 20);
 
 #[derive(Clone)]
 /// A normalized, immutable undirected graph.
@@ -253,8 +254,17 @@ mod tests {
             cases.push((n, random_edges(n, p, seed)));
         }
         for n in [MATRIX_MAX_NODES, MATRIX_MAX_NODES + 1] {
-            // Sparse, plus edges touching the last vertices and word ends.
-            let mut edges = random_edges(n, 0.002, n as u64);
+            // Three random neighbours per vertex (a pairwise draw would take
+            // too long here), plus edges touching the last vertices and word
+            // ends.
+            let mut rng = Mt19937GenRand64::new(n as u64);
+            let mut edges: Vec<[usize; 2]> = (0..n)
+                .flat_map(|a| {
+                    let b: [usize; 3] = std::array::from_fn(|_| rng.gen_range(0..n));
+                    b.map(|b| [a.min(b), a.max(b)])
+                })
+                .filter(|&[a, b]| a != b)
+                .collect();
             edges.extend([[0, n - 1], [63, 64], [n - 65, n - 64], [n - 2, n - 1]]);
             edges.sort();
             edges.dedup();
@@ -264,7 +274,17 @@ mod tests {
             let graph = Graph::from_edges(n, edges).unwrap();
             assert_eq!(graph.row_words > 0, n <= MATRIX_MAX_NODES, "n = {n}");
             let set: BTreeSet<[usize; 2]> = graph.edges().iter().copied().collect();
-            for a in 0..n {
+            // Every row of small graphs; for large ones, the rows at both ends
+            // and a stride of the rest.
+            let rows: Vec<usize> = if n <= 2100 {
+                (0..n).collect()
+            } else {
+                (0..130)
+                    .chain(n - 130..n)
+                    .chain((130..n - 130).step_by(17))
+                    .collect()
+            };
+            for a in rows {
                 let bs: Vec<usize> = if n <= 300 {
                     (0..n).collect()
                 } else {
@@ -344,5 +364,44 @@ mod tests {
             format!("{graph:?}"),
             "Graph { node_count: 3, edges: [[0, 1]], adjacency: [[1], [0], []] }"
         );
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    #[test]
+    fn adjacency_accelerator_matches_edges_and_sparse_fallback() {
+        for n in [2, 63, 64, 65, 124, 500, 8193] {
+            let edges: Vec<_> = (1..n).map(|v| [v - 1, v]).collect();
+            let graph = Graph::from_edges(n, edges.clone()).unwrap();
+            assert_eq!(graph.row_words == 0, n == 8193);
+            for a in 0..n {
+                for b in [0, a.saturating_sub(1), a, (a + 1).min(n - 1), n - 1] {
+                    assert_eq!(graph.has_edge(a, b), a.abs_diff(b) == 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cached_hash_keeps_original_encoding_across_clone_and_threads() {
+        let graph = Graph::from_edges(4, vec![[3, 1], [0, 2]]).unwrap();
+        let mut h = Sha256::new();
+        h.update(b"gpp-graph-v1\0");
+        h.update(4u64.to_le_bytes());
+        for value in [0u64, 2, 1, 3] {
+            h.update(value.to_le_bytes());
+        }
+        let expected = format!("{:x}", h.finalize());
+        let cloned_before = graph.clone();
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| assert_eq!(graph.content_hash(), expected));
+            }
+        });
+        assert_eq!(cloned_before.content_hash(), expected);
+        assert_eq!(graph.clone().content_hash(), expected);
     }
 }

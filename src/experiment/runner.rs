@@ -262,15 +262,19 @@ pub fn run_one(
     };
     let records = raw
         .into_iter()
-        .map(|r| MeasurementRecord {
-            step: r.step,
-            current_solution: intern(r.current),
-            best_solution: intern(r.best),
-            current_smoothed: r.current_smoothed,
-            search_evaluation: r.search_evaluation,
-            basin_real: r.basin_real,
-            basin_smoothed: r.basin_smoothed,
-            basin_best: r.basin_best,
+        .map(|r| {
+            let current_solution = intern(r.current);
+            let best_solution = intern(r.best);
+            MeasurementRecord {
+                step: r.step,
+                current_solution,
+                best_solution,
+                current_smoothed: r.current_smoothed,
+                search_evaluation: r.search_evaluation,
+                basin_real: r.basin_real,
+                basin_smoothed: r.basin_smoothed,
+                basin_best: r.basin_best,
+            }
         })
         .collect();
     let final_solution = intern(engine.state.partition().to_vec());
@@ -573,7 +577,7 @@ fn basin(
             Some(s) => smoothed_scan(
                 graph,
                 c,
-                &state,
+                &mut state,
                 s,
                 fixed_rng.as_ref(),
                 current,
@@ -606,10 +610,14 @@ fn basin(
 /// One best-improvement scan of [`basin`] on the smoothed objective `spec`:
 /// every move in canonical order, each candidate state evaluated with a fresh
 /// copy of `fixed_rng`. Returns the chosen move and its smoothed value.
+///
+/// Candidates are evaluated in place and undone
+/// ([`evaluate_smoothed_candidate_with_undo`]), so `state` is unchanged when
+/// the scan returns, including by an error.
 fn smoothed_scan(
     graph: &Graph,
     c: &Condition,
-    state: &PartitionState,
+    state: &mut PartitionState,
     spec: &SmoothingSpec,
     fixed_rng: Option<&Mt19937GenRand64>,
     current: f64,
@@ -627,16 +635,14 @@ fn smoothed_scan(
         if i & 1023 == 0 {
             cancel.check()?
         }
-        let mut candidate = state.clone();
-        smoothing::apply(&mut candidate, graph, mv);
-        let mut evaluation_rng = fixed_rng.cloned();
-        let x = smoothing::evaluate(
-            &candidate,
+        let x = evaluate_smoothed_candidate_with_undo(
+            state,
             graph,
             c.alpha,
             c.neighborhood,
             spec,
-            evaluation_rng.as_mut(),
+            fixed_rng,
+            mv,
             cancel,
             evals,
         )?;
@@ -654,10 +660,85 @@ fn smoothed_scan(
     Ok(choice.map(|mv| (mv, best)))
 }
 
+/// The smoothed value of `state` after `mv`, evaluated with a fresh copy of
+/// `fixed_rng`: the same value, draws and evaluation count as evaluating a
+/// modified clone, without copying the state.
+#[allow(clippy::too_many_arguments)]
+fn evaluate_smoothed_candidate_with_undo(
+    state: &mut PartitionState,
+    graph: &Graph,
+    alpha: f64,
+    neighborhood: Neighborhood,
+    spec: &SmoothingSpec,
+    fixed_rng: Option<&Mt19937GenRand64>,
+    mv: Move,
+    cancel: &CancellationToken,
+    evals: &mut u64,
+) -> Result<f64> {
+    smoothing::apply(state, graph, mv);
+    let mut evaluation_rng = fixed_rng.cloned();
+    let evaluated = smoothing::evaluate(
+        state,
+        graph,
+        alpha,
+        neighborhood,
+        spec,
+        evaluation_rng.as_mut(),
+        cancel,
+        evals,
+    );
+    // Every move is its own inverse. Undo before propagating an evaluation
+    // error so cancellation leaves the last committed basin state intact.
+    smoothing::apply(state, graph, mv);
+    evaluated
+}
+
 #[cfg(test)]
 mod best_basin_tests {
     use super::*;
     use crate::experiment::config::{Budget, GraphKind, GraphSpec, Measurement, Schedule};
+
+    #[test]
+    fn candidate_evaluation_error_restores_last_committed_state() {
+        let graph = Graph::from_edges(
+            6,
+            vec![[0, 1], [0, 4], [1, 2], [1, 5], [2, 3], [3, 4], [4, 5]],
+        )
+        .unwrap();
+        for neighborhood in [Neighborhood::Flip, Neighborhood::Swap] {
+            let partition = match neighborhood {
+                Neighborhood::Flip => vec![true, false, true, false, false, true],
+                Neighborhood::Swap => vec![true, true, true, false, false, false],
+            };
+            let mut state = PartitionState::new(&graph, partition).unwrap();
+            let before = state.clone();
+            let spec = SmoothingSpec::WeightedAverage { k: 1 };
+            let mv = smoothing::moves(&state, neighborhood)[0];
+            let cancelled = CancellationToken::new();
+            cancelled.cancel();
+            let mut evaluations = 0;
+            assert!(
+                evaluate_smoothed_candidate_with_undo(
+                    &mut state,
+                    &graph,
+                    0.05,
+                    neighborhood,
+                    &spec,
+                    None,
+                    mv,
+                    &cancelled,
+                    &mut evaluations,
+                )
+                .is_err()
+            );
+            assert_eq!(state.partition(), before.partition());
+            assert_eq!(state.cut_edges(), before.cut_edges());
+            assert_eq!(state.size_a(), before.size_a());
+            assert_eq!(state.cuts_at(), before.cuts_at());
+            assert_eq!(state.score(0.05).to_bits(), before.score(0.05).to_bits());
+            assert_eq!(evaluations, 0);
+        }
+    }
 
     #[test]
     fn cancelled_best_basin_does_not_populate_cache() {
@@ -756,3 +837,7 @@ mod best_basin_tests {
         assert_eq!(result.termination, BasinTermination::LocalOptimum);
     }
 }
+
+#[cfg(test)]
+#[path = "performance_probe.rs"]
+mod performance_probe;
