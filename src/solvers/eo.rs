@@ -598,7 +598,7 @@ impl Ranking {
             fenwick[bucket + 1] = count[0] + count[1];
         }
         for i in 1..=buckets {
-            let parent = i + (i & i.wrapping_neg());
+            let parent = i + i.isolate_lowest_one();
             if parent <= buckets {
                 fenwick[parent] += fenwick[i];
             }
@@ -677,12 +677,12 @@ impl Ranking {
         let mut i = from + 1;
         while i < self.fenwick.len() {
             self.fenwick[i] -= 1;
-            i += i & i.wrapping_neg();
+            i += i.isolate_lowest_one();
         }
         let mut j = to + 1;
         while j < self.fenwick.len() {
             self.fenwick[j] += 1;
-            j += j & j.wrapping_neg();
+            j += j.isolate_lowest_one();
         }
     }
 }

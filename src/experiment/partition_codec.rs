@@ -133,7 +133,7 @@ fn decode(hex: &str, length: usize) -> Result<Vec<bool>, String> {
         ));
     }
     let mut partition = Vec::with_capacity(length);
-    for (index, pair) in hex.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let byte = (digit_value(pair[0]) << 4) | digit_value(pair[1]);
         let bits = (length - 8 * index).min(8);
         if bits < 8 && byte >> bits != 0 {
