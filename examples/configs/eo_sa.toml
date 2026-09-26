@@ -1,0 +1,39 @@
+# One random graph, two neighborhoods, an eo_sa sweep (taus [0.0, 1.5] x
+# temperatures [0.1, 1.0]) plus one eo solver at tau=1.5 for comparison, and
+# two run seeds: 1 graph x 2 neighborhoods x (2x2 eo_sa + 1 eo) x 2 seeds =
+# 20 jobs.
+schema_version = 1
+name = "eo_sa demo"
+run_seeds = [0, 1]
+neighborhoods = ["flip", "swap"]
+
+[problem]
+alpha = 0.05
+
+[budget]
+max_steps = 100
+
+[measurement]
+schedule = "logarithmic"
+basin = "real"
+best_basin = true
+max_basin_steps = 50
+
+[[graphs]]
+kind = "random"
+node_counts = [12]
+expected_degrees = [3.0]
+seeds = [42]
+
+[[solvers]]
+kind = "eo_sa"
+taus = [0.0, 1.5]
+temperatures = [0.1, 1.0]
+# optional; defaults to [{ kind = "default" }]
+[[solvers.fitnesses]]
+kind = "default"
+
+# Same tau and fitness as one eo_sa condition, for direct comparison.
+[[solvers]]
+kind = "eo"
+taus = [1.5]

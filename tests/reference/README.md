@@ -8,3 +8,9 @@ Compare TSV bytes (including float formatting, order and blanks) against this
 oracle when changing export code. Metadata names, types and units must match;
 human-readable meanings may be improved without changing stored science.
 Do not update the oracle to make a regression pass.
+
+The `eo_sa` solver kind postdates `2aae96a`. The oracle's exhaustive matches on
+`SolverSpec` carry compile-only arms
+(`unreachable!("eo_sa postdates this frozen reference")`); they do not change
+any output for the pre-existing solver kinds, and `eo_sa` conditions are never
+exported through this oracle.

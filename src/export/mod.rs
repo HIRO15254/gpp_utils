@@ -64,7 +64,7 @@ fn identity_smoothing(c: &Condition) -> bool {
 fn smooth(c: &Condition) -> Option<&SmoothingSpec> {
     match &c.solver {
         SolverSpec::Hc { smoothing } | SolverSpec::Sa { smoothing, .. } => Some(smoothing),
-        SolverSpec::Eo { .. } => None,
+        SolverSpec::Eo { .. } | SolverSpec::EoSa { .. } => None,
     }
 }
 fn solver(c: &Condition) -> &SolverSpec {
@@ -113,14 +113,17 @@ fn run_value(c: &RunCtx<'_>, f: RunField) -> String {
             SolverSpec::Hc { .. } => "hc",
             SolverSpec::Sa { .. } => "sa",
             SolverSpec::Eo { .. } => "eo",
+            SolverSpec::EoSa { .. } => "eo_sa",
         }
         .into(),
         RunField::Temperature => match solver(condition) {
-            SolverSpec::Sa { temperature, .. } => temperature.to_string(),
+            SolverSpec::Sa { temperature, .. } | SolverSpec::EoSa { temperature, .. } => {
+                temperature.to_string()
+            }
             _ => String::new(),
         },
         RunField::Tau => match solver(condition) {
-            SolverSpec::Eo { tau, .. } => tau.to_string(),
+            SolverSpec::Eo { tau, .. } | SolverSpec::EoSa { tau, .. } => tau.to_string(),
             _ => String::new(),
         },
         RunField::Smoothing => match smooth(condition) {
@@ -136,10 +139,10 @@ fn run_value(c: &RunCtx<'_>, f: RunField) -> String {
             }
             _ => String::new(),
         },
-        RunField::Fitness => match solver(condition) {
-            SolverSpec::Eo { fitness, .. } => fitness.kind.clone(),
-            _ => String::new(),
-        },
+        RunField::Fitness => solver(condition)
+            .fitness()
+            .map(|fitness| fitness.kind.clone())
+            .unwrap_or_default(),
         RunField::FitnessVersion => {
             let name = run_value(c, RunField::Fitness);
             c.plan
@@ -149,10 +152,10 @@ fn run_value(c: &RunCtx<'_>, f: RunField) -> String {
                 .cloned()
                 .unwrap_or_default()
         }
-        RunField::FitnessParams => match solver(condition) {
-            SolverSpec::Eo { fitness, .. } => fitness.params.to_string(),
-            _ => String::new(),
-        },
+        RunField::FitnessParams => solver(condition)
+            .fitness()
+            .map(|fitness| fitness.params.to_string())
+            .unwrap_or_default(),
         RunField::MaxSteps => condition.budget.max_steps.to_string(),
         RunField::Completed => view
             .map(|v| v.result().completed_steps.to_string())
@@ -229,7 +232,10 @@ fn run_value(c: &RunCtx<'_>, f: RunField) -> String {
             option(view.and_then(|v| v.result().diagnostics.as_ref().map(|d| d.applied_moves)))
         }
         RunField::Rejected => {
-            if matches!(solver(condition), SolverSpec::Sa { .. }) {
+            if matches!(
+                solver(condition),
+                SolverSpec::Sa { .. } | SolverSpec::EoSa { .. }
+            ) {
                 view.and_then(|v| {
                     v.result().diagnostics.as_ref().map(|d| {
                         v.result()

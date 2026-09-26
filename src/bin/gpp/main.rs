@@ -11,7 +11,6 @@ use clap::{Parser, Subcommand};
 use gpp_utils::{ExperimentPlan, StoredExperiment};
 use gpp_utils::{
     experiment::{
-        config::SolverSpec,
         plan::{
             compile_experiment_with_versions, compile_stored_with_registry, load_spec,
             minimal_sample_toml,
@@ -28,7 +27,7 @@ use serde::Serialize;
 #[command(
     name = "gpp",
     about = "Reproducible graph partition experiments",
-    after_help = "SA uses a fixed temperature."
+    after_help = "SA and EO-SA (eo_sa) use a fixed temperature."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -252,7 +251,7 @@ fn read_stored(path: &Path) -> anyhow::Result<StoredExperiment> {
 
 fn validate_fitness(plan: &ExperimentPlan, registry: &FitnessRegistry) -> anyhow::Result<()> {
     for job in &plan.jobs {
-        if let SolverSpec::Eo { fitness, .. } = &job.condition.solver {
+        if let Some(fitness) = job.condition.solver.fitness() {
             registry.validate(fitness)?;
         }
     }

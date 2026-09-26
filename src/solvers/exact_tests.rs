@@ -777,3 +777,8 @@ fn eo_cancellation_consumes_selection_draws_and_changes_nothing_else() {
         }
     }
 }
+
+// EO-SA (`eo_sa`): EO proposals judged by the Metropolis rule. Compared with an
+// independent naive reference built on the `eo_v2` selection oracle.
+#[path = "eo_sa_exact_tests.rs"]
+mod eo_sa;

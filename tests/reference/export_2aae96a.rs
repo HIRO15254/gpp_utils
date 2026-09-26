@@ -60,6 +60,7 @@ fn smoothing(condition: &Condition) -> Option<&SmoothingSpec> {
     match &condition.solver {
         SolverSpec::Hc { smoothing } | SolverSpec::Sa { smoothing, .. } => Some(smoothing),
         SolverSpec::Eo { .. } => None,
+        SolverSpec::EoSa { .. } => unreachable!("eo_sa postdates this frozen reference"),
     }
 }
 fn identity(condition: &Condition) -> bool {
@@ -178,6 +179,7 @@ pub fn export_tsv(
                 fitness.kind.clone(),
                 fitness.params.to_string(),
             ),
+            SolverSpec::EoSa { .. } => unreachable!("eo_sa postdates this frozen reference"),
         };
         let sm = smoothing(c)
             .map(serde_json::to_value)
