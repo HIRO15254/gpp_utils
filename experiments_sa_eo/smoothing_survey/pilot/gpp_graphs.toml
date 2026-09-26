@@ -1,0 +1,30 @@
+# 予備実験のグラフが gpp と一致するかを確かめるための最小の実験仕様。
+# ベースラインの18グラフ(グラフシード0)を生成させるだけなので、探索は1ステップで終える。
+# 使い方: gpp run experiments_sa_eo/smoothing_survey/pilot/gpp_graphs.toml --root <作業用ディレクトリ>
+schema_version = 1
+run_seeds = [0]
+neighborhoods = ["flip"]
+
+[problem]
+alpha = 0.05
+
+[budget]
+max_steps = 1
+
+[[graphs]]
+kind = "random"
+node_counts = [124, 250, 500]
+expected_degrees = [5.0, 10.0, 20.0]
+seeds = [0]
+
+[[graphs]]
+kind = "geometric"
+node_counts = [124, 250, 500]
+expected_degrees = [5.0, 10.0, 20.0]
+seeds = [0]
+
+[[solvers]]
+kind = "sa"
+temperatures = [1.0]
+[[solvers.smoothing]]
+kind = "none"
