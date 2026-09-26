@@ -798,3 +798,118 @@ mod eo_sa;
 // copy directly and through the frozen engine and runner.
 #[path = "smoothing_exact_tests.rs"]
 mod smoothing_exact;
+
+// Independent review: non-smoothed HC (none / weighted_average k = 0) against the
+// frozen engine on graphs up to n = 100 and on alphas that bypass run_one
+// validation, including the non-finite search-evaluation error.
+#[test]
+fn hc_real_paths_match_frozen_engine_including_errors() {
+    let registry = FitnessRegistry::default_registry();
+    let reference_registry = frozen_registry();
+    let cancel = CancellationToken::new();
+    let mut rng = Mt19937GenRand64::new(99);
+    let mut graphs = vec![graph(), isolated_graph(), complete_graph(), eo_graph()];
+    for (n, p) in [
+        (2usize, 1.0),
+        (3, 0.5),
+        (20, 0.2),
+        (40, 0.1),
+        (64, 0.08),
+        (100, 0.05),
+    ] {
+        let mut edges = Vec::new();
+        for a in 0..n {
+            for b in a + 1..n {
+                if rng.r#gen::<f64>() < p {
+                    edges.push([a, b]);
+                }
+            }
+        }
+        graphs.push(Graph::from_edges(n, edges).unwrap());
+    }
+    let (mut errors, mut optima, mut steps_total) = (0, 0, 0);
+    for g in &graphs {
+        for neighborhood in [Neighborhood::Flip, Neighborhood::Swap] {
+            if neighborhood == Neighborhood::Swap && g.node_count() % 2 == 1 {
+                continue;
+            }
+            for smoothing in [SmoothingSpec::None, SmoothingSpec::WeightedAverage { k: 0 }] {
+                for alpha in [
+                    0.0,
+                    -0.0,
+                    0.05,
+                    0.125,
+                    1.0,
+                    1e17,
+                    1e300,
+                    1e306,
+                    1e308,
+                    f64::MAX,
+                    -1.0,
+                    -0.05,
+                    f64::INFINITY,
+                    f64::NEG_INFINITY,
+                    f64::NAN,
+                    5e-324,
+                ] {
+                    for seed in [0u64, 1, 2] {
+                        let c = condition_for(
+                            g,
+                            neighborhood,
+                            SolverSpec::Hc {
+                                smoothing: smoothing.clone(),
+                            },
+                            alpha,
+                        );
+                        let mut actual = Engine::new(g, &c, seed, &registry, &cancel).unwrap();
+                        let mut expected =
+                            reference::Engine::new(g, &c, seed, &reference_registry, &cancel)
+                                .unwrap();
+                        for step in 0..100_000 {
+                            let ctx = format!(
+                                "{neighborhood:?} {smoothing:?} a={alpha:e} seed={seed} n={} step={step}",
+                                g.node_count()
+                            );
+                            let a = actual.step(&cancel);
+                            let b = expected.step(&cancel);
+                            assert_eq!(
+                                actual.state.partition(),
+                                expected.state.partition(),
+                                "{ctx}"
+                            );
+                            assert_eq!(
+                                actual.search_evaluation.to_bits(),
+                                expected.search_evaluation.to_bits(),
+                                "{ctx}"
+                            );
+                            assert_eq!(
+                                actual.objective_evaluations, expected.objective_evaluations,
+                                "{ctx}"
+                            );
+                            assert_eq!(actual.applied_moves, expected.applied_moves, "{ctx}");
+                            assert_eq!(rng_probe(&actual, 3), expected.rng_probe(3), "{ctx}");
+                            steps_total += 1;
+                            match (a, b) {
+                                (Ok(x), Ok(y)) => {
+                                    assert_eq!(format!("{x:?}"), format!("{y:?}"), "{ctx}");
+                                    if x != StepStatus::Continue {
+                                        optima += 1;
+                                        break;
+                                    }
+                                }
+                                (Err(x), Err(y)) => {
+                                    assert_eq!(x.to_string(), y.to_string(), "{ctx}");
+                                    errors += 1;
+                                    break;
+                                }
+                                (x, y) => panic!("{ctx}: {x:?} vs {y:?}"),
+                            }
+                        }
+                        assert_eq!(rng_probe(&actual, 624), expected.rng_probe(624));
+                    }
+                }
+            }
+        }
+    }
+    assert!(errors > 0 && optima > 0 && steps_total > errors + optima);
+}
