@@ -920,3 +920,107 @@ fn hc_real_paths_match_frozen_engine_including_errors() {
 // that the reusable scratch permutation is always restored.
 #[path = "smoothing_review_tests.rs"]
 mod smoothing_review;
+
+// Independent review of the EO index: graphs with more than 64 vertices
+// (multi-word cell bitsets) and many distinct degrees (rankings spanning many
+// 64-bucket groups), compared with the naive v2 reference after every step,
+// with dense and with pooled cell bitsets.
+
+/// Configuration-model graph with target degrees uniform in `0..=max_degree`
+/// (loops and duplicates dropped): many distinct degrees, slots and buckets.
+fn review_spread_graph(n: usize, max_degree: usize, seed: u64) -> Graph {
+    use rand::seq::SliceRandom;
+    let mut rng = Mt19937GenRand64::new(seed);
+    let mut stubs = Vec::new();
+    for v in 0..n {
+        let d = rng.gen_range(0..=max_degree.min(n - 1));
+        stubs.extend(std::iter::repeat_n(v, d));
+    }
+    stubs.shuffle(&mut rng);
+    let mut edges = std::collections::BTreeSet::new();
+    for pair in stubs.chunks(2) {
+        if let [a, b] = *pair
+            && a != b
+        {
+            edges.insert(if a < b { [a, b] } else { [b, a] });
+        }
+    }
+    Graph::from_edges(n, edges.into_iter().collect()).unwrap()
+}
+
+/// Default, `multiplicative` (alpha 0.5) and `additive` with a `beta` so small
+/// that the minority values round to 1.0 and share one bucket.
+fn review_index_specs() -> [FitnessSpec; 3] {
+    [
+        FitnessSpec::default(),
+        FitnessSpec {
+            kind: "multiplicative".into(),
+            params: serde_json::json!({ "alpha": 0.5 }),
+        },
+        FitnessSpec {
+            kind: "additive".into(),
+            params: serde_json::json!({ "beta": 1.0e-17 }),
+        },
+    ]
+}
+
+/// Assert that `c` builds its EO index with the forced bitset layout.
+fn assert_layout(g: &Graph, c: &Condition, pooled: bool) {
+    let registry = FitnessRegistry::default_registry();
+    let engine = Engine::new(g, c, 0, &registry, &CancellationToken::new()).unwrap();
+    assert_eq!(engine.eo.as_ref().unwrap().is_pooled(), pooled, "{c:?}");
+}
+
+/// One graph with 130 vertices (three bitset words per cell) and degrees up to
+/// 129 (rankings of many 64-bucket groups).
+#[test]
+fn review_eo_v2_index_matches_reference_on_a_multi_group_graph() {
+    let registry = FitnessRegistry::default_registry();
+    let g = review_spread_graph(130, 129, 3);
+    for pooled in [false, true] {
+        crate::solvers::eo::with_layout(pooled, || {
+            for spec in review_index_specs() {
+                for neighborhood in [Neighborhood::Flip, Neighborhood::Swap] {
+                    for tau in [0.0, 1.5, 1.0e308] {
+                        let c = eo_condition(&g, neighborhood, tau, spec.clone());
+                        assert_layout(&g, &c, pooled);
+                        assert_eo_matches_reference(&g, &c, 0x5eed, 150, &registry, true);
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Random (200 vertices, degree 20) and geometric (256 vertices, degree 10)
+/// graphs; longer runs in the release regression.
+#[test]
+fn review_eo_v2_index_matches_reference_on_large_graphs() {
+    let registry = FitnessRegistry::default_registry();
+    let cancel = CancellationToken::new();
+    let steps = if cfg!(debug_assertions) { 40 } else { 400 };
+    for (kind, node_count, expected_degree) in [
+        (GraphKind::Random, 200, 20.0),
+        (GraphKind::Geometric, 256, 10.0),
+    ] {
+        let spec = GraphSpec {
+            kind,
+            node_count,
+            expected_degree,
+            seed: 1,
+        };
+        let g = Graph::generate(&spec, &cancel).unwrap();
+        for pooled in [false, true] {
+            crate::solvers::eo::with_layout(pooled, || {
+                for spec in review_index_specs() {
+                    for neighborhood in [Neighborhood::Flip, Neighborhood::Swap] {
+                        for tau in [0.5, 1.5] {
+                            let c = eo_condition(&g, neighborhood, tau, spec.clone());
+                            assert_eo_matches_reference(&g, &c, 7, steps, &registry, true);
+                        }
+                    }
+                }
+            });
+        }
+    }
+}

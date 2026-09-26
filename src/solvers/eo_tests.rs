@@ -597,9 +597,14 @@ fn canonical_keys_order_like_partial_cmp_then_side_then_vertex() {
     }
 }
 
-/// Members of `cell` in ascending order, read bit by bit from its bitset.
+/// Members of `cell` in ascending order, read bit by bit from its bitset (an
+/// empty cell may not hold a slot; `Rankings::assert_pool_consistent` checks
+/// that no other bits are set).
 fn cell_members(ranking: Ranking<'_>, cell: usize) -> Vec<usize> {
-    let words = &ranking.bits[cell * ranking.words..(cell + 1) * ranking.words];
+    if ranking.counts(cell / 2)[cell % 2] == 0 {
+        return Vec::new();
+    }
+    let words = ranking.members(cell);
     let mut members = Vec::new();
     for (w, &word) in words.iter().enumerate().filter(|&(_, &word)| word != 0) {
         members.extend((0..64).filter(|&b| word >> b & 1 == 1).map(|b| 64 * w + b));
@@ -674,7 +679,6 @@ fn assert_rankings_match_values(
 /// group totals and flags against the bucket sizes.
 fn assert_ranking_structures(ranking: Ranking<'_>, n: usize) {
     let buckets = GROUP * ranking.groups.len();
-    assert_eq!(ranking.bits.len(), 2 * buckets * ranking.words);
     let mut start = 0;
     let mut nonempty = Vec::new();
     for bucket in 0..buckets {
@@ -731,6 +735,11 @@ fn assert_ranking_structures(ranking: Ranking<'_>, n: usize) {
 
 #[test]
 fn index_matches_rebuild_and_direct_values_after_random_moves() {
+    with_layout(false, || assert_index_matches_after_random_moves(1500));
+    with_layout(true, || assert_index_matches_after_random_moves(400));
+}
+
+fn assert_index_matches_after_random_moves(moves: usize) {
     let graph = tie_graph();
     let n = graph.node_count();
     for spec in builtin_specs() {
@@ -753,12 +762,16 @@ fn index_matches_rebuild_and_direct_values_after_random_moves() {
                 &mut count,
             )
             .unwrap();
+            assert_eq!(
+                eo.is_pooled(),
+                FORCE_POOLED.with(std::cell::Cell::get).unwrap()
+            );
             let expected_rankings = match neighborhood {
                 Neighborhood::Flip if kind.depends_on_majority() => 3,
                 _ => 1,
             };
             let mut visited = [false; 3];
-            for _ in 0..1500 {
+            for _ in 0..moves {
                 let mv = match neighborhood {
                     Neighborhood::Flip => Move::Flip(rng.gen_range(0..n)),
                     Neighborhood::Swap => {
@@ -797,14 +810,16 @@ fn index_matches_rebuild_and_direct_values_after_random_moves() {
     }
 }
 
-/// Random relocations of `n` vertices among the keys of `slot_value`, ranked
-/// in the `R` size states `relations`; see
+/// `moves` random relocations of `n` vertices among the keys of
+/// `slot_value`, ranked in the `R` size states `relations` (in the bitset
+/// layout of the thread, see [`with_layout`]); see
 /// [`ranking_structures_match_naive_scans_after_random_relocations`].
 fn assert_random_relocations<const R: usize>(
     kind: BuiltinFitness,
     slot_value: &[f64],
     relations: [usize; R],
     n: usize,
+    moves: usize,
     rng: &mut Mt19937GenRand64,
 ) {
     let slots = slot_value.len();
@@ -830,26 +845,37 @@ fn assert_random_relocations<const R: usize>(
             rng.gen_range(0..keys)
         }
     };
+    let build = |key_of: &[u32]| {
+        let (mut rankings, cells) = Rankings::new(kind, slot_value, &majority, n).unwrap();
+        for (v, &key) in key_of.iter().enumerate() {
+            for &cell in &cells[key as usize * R..(key as usize + 1) * R] {
+                rankings.insert(v, cell);
+            }
+        }
+        (rankings, cells)
+    };
     let mut key_of: Vec<u32> = (0..n).map(|_| draw(rng)).collect();
-    let mut rankings = Rankings::new(kind, slot_value, &majority, &key_of).unwrap();
+    let (mut rankings, cells) = build(&key_of);
+    let row = |key: u32| -> [u32; R] { std::array::from_fn(|r| cells[key as usize * R + r]) };
     assert_eq!(rankings.count(), R);
-    for step in 0..=100 {
+    for step in 0..=moves {
         if step > 0 {
             let v = rng.gen_range(0..n);
             let key = draw(rng);
-            rankings.relocate::<R>(v, key_of[v] as usize, key as usize);
+            rankings.relocate_one(v, row(key_of[v]), row(key));
             key_of[v] = key;
         }
-        let context = format!("{kind:?} n={n} relations {relations:?} step {step}");
+        let context = format!(
+            "{kind:?} n={n} relations {relations:?} pooled {} step {step}",
+            rankings.pool.pooled
+        );
         for (r, &flags) in majority.iter().enumerate() {
             let ranking = rankings.get(r);
             assert_eq!(ranking_order(ranking), naive(&key_of, flags), "{context}");
             assert_ranking_structures(ranking, n);
         }
-        assert!(
-            rankings == Rankings::new(kind, slot_value, &majority, &key_of).unwrap(),
-            "{context}"
-        );
+        rankings.assert_pool_consistent();
+        assert!(rankings == build(&key_of).0, "{context}");
     }
 }
 
@@ -873,12 +899,161 @@ fn ranking_structures_match_naive_scans_after_random_relocations() {
     for n in [1, 63, 64, 65, 200] {
         for kind in kinds {
             for relation in 0..SIZE_STATES {
-                assert_random_relocations(kind, &slot_value, [relation], n, &mut rng);
+                assert_random_relocations(kind, &slot_value, [relation], n, 100, &mut rng);
             }
-            assert_random_relocations(kind, &slot_value, [0, 1, 2], n, &mut rng);
+            assert_random_relocations(kind, &slot_value, [0, 1, 2], n, 100, &mut rng);
         }
     }
 }
+
+/// The same with pooled bitsets: cells take a slot when they gain their first
+/// member and free it with their last one, including in one move (a vertex
+/// alone in its cell moving to an empty cell).
+#[test]
+fn pooled_ranking_structures_match_naive_scans_after_random_relocations() {
+    let kinds = [
+        BuiltinFitness::Default,
+        BuiltinFitness::Multiplicative { alpha: 0.5 },
+        BuiltinFitness::Additive { beta: 0.0 },
+    ];
+    let slot_value: Vec<f64> = (0..150).map(|i| i as f64 / 149.0).collect();
+    let mut rng = Mt19937GenRand64::new(0x5107);
+    with_layout(true, || {
+        for n in [1, 2, 65, 200] {
+            for kind in kinds {
+                assert_random_relocations(kind, &slot_value, [2], n, 100, &mut rng);
+                assert_random_relocations(kind, &slot_value, [0, 1, 2], n, 100, &mut rng);
+            }
+        }
+    });
+}
+
+/// Dense bitsets for the baseline graphs; pooled ones when dense bitsets would
+/// outgrow both 32 MiB and the pooled bound (degrees around 1000 make hundreds
+/// of thousands of buckets). On a graph with many degrees the pooled bitsets
+/// stay within `R * n` bitsets while moves empty and fill cells.
+#[test]
+fn bitset_layout_bounds_memory() {
+    // (vertices, buckets of all rankings, rankings): baseline-sized indexes and
+    // random graphs with n = 2000, d = 200 (28 MiB of dense bitsets).
+    for (n, buckets, count) in [
+        (124, 1152, 3),
+        (500, 1664, 3),
+        (500, 384, 1),
+        (2000, 56_832, 3),
+    ] {
+        assert!(!pooled_layout(buckets, n, count), "{n} {buckets} {count}");
+    }
+    // Random graphs with n = 4000, d = 1000 (595 MiB and 149 MiB dense) and
+    // n = 10000, d = 100 (55 MiB dense, above the pooled bound of 36 MiB).
+    for (n, buckets, count) in [(4000, 613_888, 3), (4000, 153_472, 1), (10_000, 22_720, 3)] {
+        assert!(pooled_layout(buckets, n, count), "{n} {buckets} {count}");
+    }
+    with_layout(true, assert_pooled_bitsets_stay_bounded);
+}
+
+fn assert_pooled_bitsets_stay_bounded() {
+    // Degrees 0 to 150 on 400 vertices.
+    let n = 400;
+    let mut edges = std::collections::BTreeSet::new();
+    for v in 0..n {
+        for k in 1..=v % 151 / 2 {
+            let u = (v + 7 * k) % n;
+            edges.insert([v.min(u), v.max(u)]);
+        }
+    }
+    let graph = Graph::from_edges(n, edges.into_iter().collect()).unwrap();
+    let mut state = random_state(&graph, 11);
+    let spec = spec("multiplicative", serde_json::json!({ "alpha": 0.5 }));
+    let [mut eo, _] = both_paths(&spec, &graph, &state, Neighborhood::Flip, 1.0);
+    let Ranker::Index(index) = &eo.ranker else {
+        unreachable!()
+    };
+    let pool = &index.rankings.pool;
+    let bitset = 8 * pool.words;
+    let dense = 2 * index.rankings.base[3] * bitset;
+    assert!(
+        pool.pooled && dense > 20 * 3 * n * bitset,
+        "{dense} bytes dense"
+    );
+    let mut rng = Mt19937GenRand64::new(5);
+    for step in 0..60 {
+        let mv = eo
+            .select(&graph, &state, Neighborhood::Flip, &mut rng, &mut 0)
+            .unwrap();
+        crate::smoothing::apply(&mut state, &graph, mv);
+        eo.applied(&graph, &state, mv, &mut 0);
+        if step % 20 == 19 {
+            eo.assert_index_consistent(&graph, &state, Neighborhood::Flip);
+        }
+    }
+    let Ranker::Index(index) = &eo.ranker else {
+        unreachable!()
+    };
+    let pool = &index.rankings.pool;
+    assert!(
+        pool.bits.len() * 8 <= 3 * n * bitset,
+        "{} bytes",
+        pool.bits.len() * 8
+    );
+}
+
+/// Independent review: synthetic rankings whose distinct value counts are
+/// exactly 1 to 4 whole groups (no padding) or one bucket off, with `n`
+/// around word boundaries, after every relocation.
+#[test]
+fn review_rankings_with_exact_group_multiples() {
+    let moves = 30;
+    let mut rng = Mt19937GenRand64::new(0x64);
+    for slots in [1usize, 2, 63, 64, 65, 127, 128, 129, 192, 255, 256] {
+        let slot_value: Vec<f64> = (0..slots)
+            .map(|i| {
+                if slots == 1 {
+                    0.5
+                } else {
+                    i as f64 / (slots - 1) as f64
+                }
+            })
+            .collect();
+        for n in [1usize, 2, 63, 64, 65, 128, 129] {
+            // Default: exactly `slots` buckets.
+            assert_random_relocations(
+                BuiltinFitness::Default,
+                &slot_value,
+                [2],
+                n,
+                moves,
+                &mut rng,
+            );
+            // Minority values all round to 1.0: `slots + 1` buckets.
+            assert_random_relocations(
+                BuiltinFitness::Additive { beta: 1.0e-17 },
+                &slot_value,
+                [0, 1, 2],
+                n,
+                moves,
+                &mut rng,
+            );
+            assert_random_relocations(
+                BuiltinFitness::Multiplicative { alpha: 0.5 },
+                &slot_value,
+                [0, 1, 2],
+                n,
+                moves,
+                &mut rng,
+            );
+            assert_random_relocations(
+                BuiltinFitness::Multiplicative { alpha: 5.0e-324 },
+                &slot_value,
+                [1],
+                n,
+                moves,
+                &mut rng,
+            );
+        }
+    }
+}
+
 #[test]
 fn select_in_word_finds_every_set_bit() {
     let mut rng = Mt19937GenRand64::new(0xb175);
