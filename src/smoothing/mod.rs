@@ -170,6 +170,13 @@ thread_local! {
 }
 
 /// Replays a partial Fisher-Yates shuffle of `0..m` in `O(take)` time.
+/// Longest identity permutation (and draw buffer) kept between calls, in
+/// entries (32 MiB of `usize`). Longer ones are rebuilt on each call, as the
+/// previous version rebuilt its index vector, so a huge Swap neighborhood does
+/// not pin its buffer to the thread for the thread's lifetime.
+/// Tests use a small limit so both the retained and the rebuilt path run.
+const RETAINED_ENTRIES: usize = if cfg!(test) { 1 << 12 } else { 1 << 22 };
+
 struct Shuffle {
     /// The identity permutation `0..identity.len()` between calls.
     identity: Vec<usize>,
@@ -192,6 +199,9 @@ impl Shuffle {
         let Self { identity, chosen } = self;
         // The draws do not depend on the entries, so they come first; an
         // early return leaves the identity untouched.
+        if chosen.capacity() > RETAINED_ENTRIES && take <= RETAINED_ENTRIES {
+            *chosen = Vec::new();
+        }
         chosen.clear();
         for i in 0..take {
             if i & 1023 == 0 {
@@ -215,6 +225,9 @@ impl Shuffle {
         for (i, &value) in chosen.iter().enumerate() {
             identity[i] = i;
             identity[value] = value;
+        }
+        if identity.len() > RETAINED_ENTRIES {
+            *identity = Vec::new();
         }
         Ok(chosen)
     }
@@ -646,6 +659,36 @@ pub(crate) fn scratch_status() -> (usize, bool, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scratch_is_retained_up_to_the_limit_and_rebuilt_beyond_it() {
+        let cancel = CancellationToken::default();
+        for (n, retained) in [(100, true), (140, false), (100, true)] {
+            let edges = (0..n - 1).map(|v| [v, v + 1]).collect();
+            let graph = Graph::from_edges(n, edges).unwrap();
+            let state = PartitionState::new(&graph, (0..n).map(|v| v % 2 == 0).collect()).unwrap();
+            let m = n / 2 * (n / 2);
+            assert_eq!(m <= RETAINED_ENTRIES, retained);
+            let mut rng = Mt19937GenRand64::new(3);
+            let mut evaluations = 0;
+            evaluate(
+                &state,
+                &graph,
+                0.05,
+                Neighborhood::Swap,
+                &SmoothingSpec::RandomKAverage { k: 7 },
+                Some(&mut rng),
+                &cancel,
+                &mut evaluations,
+            )
+            .unwrap();
+            assert_eq!(evaluations, 7);
+            let (len, intact, free) = scratch_status();
+            assert!(intact && free);
+            assert_eq!(len >= m, retained, "n {n}: identity length {len}");
+            assert!(len <= RETAINED_ENTRIES);
+        }
+    }
     use rand_mt::Mt19937GenRand64;
 
     #[test]
