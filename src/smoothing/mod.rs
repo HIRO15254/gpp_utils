@@ -6,6 +6,8 @@ use crate::graph_partition::{Graph, Move, PartitionState};
 use crate::optimization::CancellationToken;
 use rand::Rng;
 use rand_mt::Mt19937GenRand64;
+use std::cell::RefCell;
+use std::collections::BTreeSet;
 
 pub fn moves(state: &PartitionState, neighborhood: Neighborhood) -> Vec<Move> {
     moves_cancellable(state, neighborhood, &CancellationToken::default())
@@ -82,136 +84,549 @@ pub fn validate(spec: &SmoothingSpec, n: usize, neighborhood: Neighborhood) -> R
     }
 }
 
+/// Smoothed evaluation of `state` (`docs/algorithms.md`, section 3).
+///
+/// The distance-one neighbors are numbered in the order of [`moves`]: Flip
+/// neighbor `v` flips vertex `v`, and Swap neighbor `i` swaps `A[i / |B|]` with
+/// `B[i % |B|]`, where `A` and `B` list the vertices of each side in increasing
+/// order. `random_k_average` takes the first `min(k, M)` entries of a partial
+/// Fisher-Yates shuffle of `0..M` (step `i` draws `gen_range(i..M)`) in
+/// shuffled order and, if `k > M`, then the distance-two neighbors whose
+/// canonical ordinals Floyd's algorithm samples, in increasing ordinal order.
+///
+/// Neither the move list nor candidate states are materialized. The shuffle is
+/// replayed on a reused identity permutation with the same draws, and every
+/// score comes from the same integer cut and size counts and the same
+/// floating-point expression as [`move_score`] or [`PartitionState::score`] of
+/// the candidate, added in the same order.
 pub fn evaluate(
     state: &PartitionState,
     graph: &Graph,
     alpha: f64,
     neighborhood: Neighborhood,
     spec: &SmoothingSpec,
-    mut rng: Option<&mut Mt19937GenRand64>,
+    rng: Option<&mut Mt19937GenRand64>,
     cancel: &CancellationToken,
     evaluations: &mut u64,
 ) -> Result<f64> {
     validate(spec, graph.node_count(), neighborhood)?;
     let real = state.score(alpha);
-    if matches!(spec, SmoothingSpec::None) | matches!(spec, SmoothingSpec::WeightedAverage { k: 0 })
-    {
-        *evaluations += 1;
-        return Ok(real);
-    }
-    let first = moves_cancellable(state, neighborhood, cancel)?;
-    if first.is_empty() {
-        *evaluations += 1;
-        return Ok(real);
-    }
-    let k = match spec {
-        SmoothingSpec::RandomKAverage { k } => Some(*k),
-        _ => None,
+    let k = match *spec {
+        SmoothingSpec::None | SmoothingSpec::WeightedAverage { k: 0 } => {
+            *evaluations += 1;
+            return Ok(real);
+        }
+        SmoothingSpec::RandomKAverage { k } => Some(k),
+        SmoothingSpec::AllAverage | SmoothingSpec::WeightedAverage { .. } => None,
     };
-    let first_take = k.map_or(first.len(), |x| x.min(first.len()));
-    let mut indices: Vec<usize> = (0..first.len()).collect();
-    if k.is_some() {
-        let r = rng
-            .as_deref_mut()
-            .ok_or_else(|| Error::msg("random smoothing requires RNG"))?;
-        for i in 0..first_take {
+    let average = Average {
+        n: graph.node_count(),
+        neighborhood,
+        spec,
+        k,
+        real,
+    };
+    SCRATCH.with(|scratch| {
+        let Scratch { shuffle, swap } = &mut *scratch.borrow_mut();
+        match neighborhood {
+            Neighborhood::Flip => {
+                let mut neighbors = FlipNeighbors::new(state, graph, alpha);
+                average.evaluate(&mut neighbors, rng, cancel, evaluations, shuffle)
+            }
+            Neighborhood::Swap => {
+                let mut neighbors = SwapNeighbors::new(state, graph, alpha, swap);
+                if neighbors.count() > 0 {
+                    // `moves_cancellable` checks before it lists the first swap.
+                    cancel.check()?;
+                }
+                average.evaluate(&mut neighbors, rng, cancel, evaluations, shuffle)
+            }
+        }
+    })
+}
+
+/// Buffers reused by [`evaluate`] on this thread. Only the identity
+/// permutation of [`Shuffle`] carries over between calls.
+struct Scratch {
+    shuffle: Shuffle,
+    swap: SwapScratch,
+}
+
+thread_local! {
+    static SCRATCH: RefCell<Scratch> = const {
+        RefCell::new(Scratch {
+            shuffle: Shuffle {
+                identity: Vec::new(),
+                chosen: Vec::new(),
+            },
+            swap: SwapScratch {
+                side_a: Vec::new(),
+                side_b: Vec::new(),
+                slot: Vec::new(),
+                gain: Vec::new(),
+            },
+        })
+    };
+}
+
+/// Replays a partial Fisher-Yates shuffle of `0..m` in `O(take)` time.
+struct Shuffle {
+    /// The identity permutation `0..identity.len()` between calls.
+    identity: Vec<usize>,
+    /// The draws, then the chosen entries.
+    chosen: Vec<usize>,
+}
+
+impl Shuffle {
+    /// The first `take` entries of `0..m` after the shuffle steps
+    /// `i = 0..take`, where step `i` swaps entries `i` and `rng.gen_range(i..m)`.
+    /// Makes exactly these draws and checks cancellation before draw `i` when
+    /// `i % 1024 == 0`.
+    fn first(
+        &mut self,
+        rng: &mut Mt19937GenRand64,
+        m: usize,
+        take: usize,
+        cancel: &CancellationToken,
+    ) -> Result<&[usize]> {
+        let Self { identity, chosen } = self;
+        // The draws do not depend on the entries, so they come first; an
+        // early return leaves the identity untouched.
+        chosen.clear();
+        for i in 0..take {
             if i & 1023 == 0 {
                 cancel.check()?;
             }
-            let j = r.gen_range(i..indices.len());
-            indices.swap(i, j);
+            chosen.push(rng.gen_range(i..m));
         }
+        if identity.len() < m {
+            let len = identity.len();
+            identity.extend(len..m);
+        }
+        for (i, slot) in chosen.iter_mut().enumerate() {
+            identity.swap(i, *slot);
+            // Later steps only touch entries after `i`, so entry `i` is final.
+            *slot = identity[i];
+        }
+        // Restore the identity. The steps changed the first `take` entries and
+        // the drawn entries after them. The first step that draws such an entry
+        // `j` moves its value `j` to a final place, so the latter are exactly
+        // the chosen values of at least `take`.
+        for (i, &value) in chosen.iter().enumerate() {
+            identity[i] = i;
+            identity[value] = value;
+        }
+        Ok(chosen)
     }
-    let mut total = 0.0;
-    let mut count = 0usize;
-    for (q, &i) in indices[..first_take].iter().enumerate() {
-        if q & 1023 == 0 {
-            cancel.check()?
-        }
-        total += move_score(state, graph, first[i], alpha);
-        count += 1;
-    }
-    if let Some(k) = k
-        && k > count
-    {
-        let needed = k - count;
-        let r = rng.unwrap();
-        let distance_two =
-            (max_random_k(graph.node_count(), neighborhood) as usize).saturating_sub(first.len());
-        // Floyd's algorithm samples exact canonical ordinals without replacement.
-        let mut ordinals = std::collections::BTreeSet::new();
-        for j in distance_two - needed..distance_two {
-            if j & 1023 == 0 {
-                cancel.check()?;
-            }
-            let candidate = r.gen_range(0..=j);
-            if !ordinals.insert(candidate) {
-                ordinals.insert(j);
-            }
-        }
-        for (q, ordinal) in ordinals.into_iter().enumerate() {
-            if q & 1023 == 0 {
-                cancel.check()?;
-            }
-            let mut s = state.clone();
-            apply_distance_two(&mut s, graph, neighborhood, ordinal);
-            total += s.score(alpha);
-            count += 1;
-        }
-    }
-    *evaluations += count as u64;
-    let avg = total / count as f64;
-    Ok(match spec {
-        SmoothingSpec::WeightedAverage { k } => {
-            let w = (*k).min(first.len()) as f64 / first.len() as f64;
-            w * avg + (1.0 - w) * real
-        }
-        _ => avg,
-    })
 }
-fn apply_distance_two(
-    state: &mut PartitionState,
-    graph: &Graph,
+
+/// Distance-one and distance-two neighbors of a state in canonical order.
+trait Neighbors {
+    /// Number `M` of distance-one neighbors.
+    fn count(&self) -> usize;
+    /// Called before the scores of a random sample of `samples` neighbors.
+    fn prepare(&mut self, _samples: usize) {}
+    /// [`move_score`] of distance-one neighbor `ordinal`.
+    fn score(&self, ordinal: usize) -> f64;
+    /// Sum of all distance-one scores, added to `0.0` in canonical order.
+    fn sum(&mut self, cancel: &CancellationToken) -> Result<f64>;
+    /// Objective of distance-two neighbor `ordinal`.
+    fn distance_two_score(&self, ordinal: usize) -> f64;
+}
+
+/// The averaging rule of [`evaluate`] for a nontrivial specification.
+struct Average<'a> {
+    n: usize,
     neighborhood: Neighborhood,
-    ordinal: usize,
-) {
-    match neighborhood {
-        Neighborhood::Flip => {
-            let (a, b) = nth_pair(graph.node_count(), ordinal);
-            state.apply_flip(graph, a);
-            state.apply_flip(graph, b);
+    spec: &'a SmoothingSpec,
+    /// `Some(k)` for `random_k_average`.
+    k: Option<usize>,
+    real: f64,
+}
+
+impl Average<'_> {
+    fn evaluate(
+        &self,
+        neighbors: &mut impl Neighbors,
+        rng: Option<&mut Mt19937GenRand64>,
+        cancel: &CancellationToken,
+        evaluations: &mut u64,
+        shuffle: &mut Shuffle,
+    ) -> Result<f64> {
+        let m = neighbors.count();
+        if m == 0 {
+            *evaluations += 1;
+            return Ok(self.real);
         }
-        Neighborhood::Swap => {
-            let side_a: Vec<_> = state
-                .partition()
-                .iter()
-                .enumerate()
-                .filter_map(|(i, &x)| x.then_some(i))
-                .collect();
-            let side_b: Vec<_> = state
-                .partition()
-                .iter()
-                .enumerate()
-                .filter_map(|(i, &x)| (!x).then_some(i))
-                .collect();
-            let combinations = side_a.len() * (side_a.len() - 1) / 2;
-            let (ai, aj) = nth_pair(side_a.len(), ordinal / combinations);
-            let (bi, bj) = nth_pair(side_b.len(), ordinal % combinations);
-            state.apply_swap(graph, side_a[ai], side_b[bi]);
-            state.apply_swap(graph, side_a[aj], side_b[bj]);
+        let (total, count) = match self.k {
+            None => (neighbors.sum(cancel)?, m),
+            Some(k) => {
+                let r = rng.ok_or_else(|| Error::msg("random smoothing requires RNG"))?;
+                let take = k.min(m);
+                neighbors.prepare(k);
+                let mut total = 0.0;
+                for (q, &ordinal) in shuffle.first(r, m, take, cancel)?.iter().enumerate() {
+                    if q & 1023 == 0 {
+                        cancel.check()?;
+                    }
+                    total += neighbors.score(ordinal);
+                }
+                if k > take {
+                    let needed = k - take;
+                    let distance_two =
+                        (max_random_k(self.n, self.neighborhood) as usize).saturating_sub(m);
+                    // Floyd's algorithm samples exact canonical ordinals without replacement.
+                    let mut ordinals = BTreeSet::new();
+                    for j in distance_two - needed..distance_two {
+                        if j & 1023 == 0 {
+                            cancel.check()?;
+                        }
+                        let candidate = r.gen_range(0..=j);
+                        if !ordinals.insert(candidate) {
+                            ordinals.insert(j);
+                        }
+                    }
+                    for (q, ordinal) in ordinals.into_iter().enumerate() {
+                        if q & 1023 == 0 {
+                            cancel.check()?;
+                        }
+                        total += neighbors.distance_two_score(ordinal);
+                    }
+                }
+                (total, k)
+            }
+        };
+        *evaluations += count as u64;
+        let avg = total / count as f64;
+        Ok(match *self.spec {
+            SmoothingSpec::WeightedAverage { k } => {
+                let w = k.min(m) as f64 / m as f64;
+                w * avg + (1.0 - w) * self.real
+            }
+            _ => avg,
+        })
+    }
+}
+
+/// Flip neighbor `v` flips vertex `v`.
+struct FlipNeighbors<'a> {
+    state: &'a PartitionState,
+    graph: &'a Graph,
+    alpha: f64,
+    cut_edges: i64,
+    /// The balance terms of [`PartitionState::flip_score`] for a vertex on
+    /// side B (index 0) and side A (index 1). The side sizes after a flip
+    /// depend only on the side of the vertex, so each term is computed once by
+    /// the same expression; the term of an empty side is never used.
+    balance: [f64; 2],
+}
+
+impl<'a> FlipNeighbors<'a> {
+    fn new(state: &'a PartitionState, graph: &'a Graph, alpha: f64) -> Self {
+        let n = state.partition().len();
+        let size_a = state.size_a();
+        let balance = |a: usize| {
+            let d = a as i64 - (n - a) as i64;
+            alpha * d as f64 * d as f64
+        };
+        let from_b = if size_a < n {
+            balance(size_a + 1)
+        } else {
+            f64::NAN
+        };
+        let from_a = size_a.checked_sub(1).map_or(f64::NAN, balance);
+        Self {
+            state,
+            graph,
+            alpha,
+            cut_edges: state.cut_edges() as i64,
+            balance: [from_b, from_a],
+        }
+    }
+
+    /// [`PartitionState::flip_score`] of `v`, which is on `side` and has
+    /// `cuts_at[v] == cuts_v`.
+    fn flip_score(&self, v: usize, side: bool, cuts_v: i64) -> f64 {
+        let cut = self.cut_edges + self.graph.degree(v) as i64 - 2 * cuts_v;
+        cut as f64 + self.balance[usize::from(side)]
+    }
+}
+
+impl Neighbors for FlipNeighbors<'_> {
+    fn count(&self) -> usize {
+        self.state.partition().len()
+    }
+
+    fn score(&self, v: usize) -> f64 {
+        self.flip_score(v, self.state.partition()[v], self.state.cuts_at()[v])
+    }
+
+    fn sum(&mut self, cancel: &CancellationToken) -> Result<f64> {
+        let sides = self.state.partition().chunks(1024);
+        let cuts = self.state.cuts_at().chunks(1024);
+        let mut total = 0.0;
+        for (chunk, (sides, cuts)) in sides.zip(cuts).enumerate() {
+            cancel.check()?;
+            for (v, (&side, &cuts_v)) in (chunk * 1024..).zip(sides.iter().zip(cuts)) {
+                total += self.flip_score(v, side, cuts_v);
+            }
+        }
+        Ok(total)
+    }
+
+    fn distance_two_score(&self, ordinal: usize) -> f64 {
+        let (a, b) = nth_pair(self.graph.node_count(), ordinal);
+        score_after_flips(self.state, self.graph, self.alpha, &[a, b])
+    }
+}
+
+struct SwapScratch {
+    /// Side-A (`true`) vertices in increasing order.
+    side_a: Vec<usize>,
+    /// Side-B (`false`) vertices in increasing order.
+    side_b: Vec<usize>,
+    /// For [`Neighbors::sum`]: index of each vertex in `side_b`, or
+    /// `side_b.len()` for side-A vertices.
+    slot: Vec<usize>,
+    /// For [`Neighbors::sum`]: `degree - 2 * cuts_at` per `side_b` entry and
+    /// one unused trailing slot.
+    gain: Vec<i64>,
+}
+
+impl SwapScratch {
+    /// Makes `side_a` and `side_b` list the vertices of each side of
+    /// `partition` in increasing order, as [`moves_cancellable`] does.
+    fn list_sides(&mut self, partition: &[bool]) {
+        // Branch-free: every vertex is written to both lists, and only the
+        // list of its side advances.
+        let Self { side_a, side_b, .. } = self;
+        side_a.resize(partition.len(), 0);
+        side_b.resize(partition.len(), 0);
+        let (mut len_a, mut len_b) = (0, 0);
+        for (v, &side) in partition.iter().enumerate() {
+            side_a[len_a] = v;
+            side_b[len_b] = v;
+            len_a += usize::from(side);
+            len_b += usize::from(!side);
+        }
+        side_a.truncate(len_a);
+        side_b.truncate(len_b);
+    }
+}
+
+/// Swap neighbor `i` swaps `A[i / |B|]` with `B[i % |B|]`, where `A` and `B`
+/// list the vertices of each side in increasing order.
+struct SwapNeighbors<'a> {
+    state: &'a PartitionState,
+    graph: &'a Graph,
+    alpha: f64,
+    scratch: &'a mut SwapScratch,
+    /// Whether `scratch` lists the sides of `state`; otherwise the vertices of
+    /// a sample are selected by their rank on their side.
+    listed: bool,
+}
+
+impl<'a> SwapNeighbors<'a> {
+    fn new(
+        state: &'a PartitionState,
+        graph: &'a Graph,
+        alpha: f64,
+        scratch: &'a mut SwapScratch,
+    ) -> Self {
+        Self {
+            state,
+            graph,
+            alpha,
+            scratch,
+            listed: false,
+        }
+    }
+
+    fn list_sides(&mut self) {
+        if !self.listed {
+            self.scratch.list_sides(self.state.partition());
+            self.listed = true;
         }
     }
 }
 
-fn nth_pair(n: usize, mut ordinal: usize) -> (usize, usize) {
-    for a in 0..n - 1 {
-        let row = n - a - 1;
-        if ordinal < row {
-            return (a, a + 1 + ordinal);
+/// The vertex with `rank` (from 0) among the vertices on `side`, in increasing
+/// order; panics if there is none.
+fn select(partition: &[bool], side: bool, mut rank: usize) -> usize {
+    // Number of vertices on `side` among 8 to 64 sides: the sides are read as
+    // bytes 0 and 1 of 64-bit words, whose byte sums stay below 256.
+    let count = |sides: &[bool]| {
+        let mut bytes = 0u64;
+        for &word in sides.as_chunks::<8>().0 {
+            bytes += u64::from_ne_bytes(word.map(u8::from));
         }
-        ordinal -= row;
+        let on_a = (bytes.wrapping_mul(0x0101_0101_0101_0101) >> 56) as usize;
+        if side { on_a } else { sides.len() - on_a }
+    };
+    // Skip whole blocks of 64 and then of 8 sides before the target, then scan.
+    let mut start = 0;
+    for block in partition.as_chunks::<64>().0 {
+        let count = count(block);
+        if rank < count {
+            break;
+        }
+        rank -= count;
+        start += 64;
     }
-    unreachable!("validated distance-two ordinal")
+    for block in partition[start..].as_chunks::<8>().0 {
+        let count = count(block);
+        if rank < count {
+            break;
+        }
+        rank -= count;
+        start += 8;
+    }
+    for (v, &x) in (start..).zip(&partition[start..]) {
+        let hit = usize::from(x == side);
+        if rank < hit {
+            return v;
+        }
+        rank -= hit;
+    }
+    unreachable!("rank below the side size")
+}
+
+impl Neighbors for SwapNeighbors<'_> {
+    fn count(&self) -> usize {
+        self.state.size_a() * self.state.size_b()
+    }
+
+    fn prepare(&mut self, samples: usize) {
+        // Selecting both vertices of a sample by rank took about as long as
+        // listing the sides of 128 vertices, so only a few samples of a large
+        // state are selected.
+        if samples.saturating_mul(128) > self.state.partition().len() {
+            self.list_sides();
+        }
+    }
+
+    fn score(&self, ordinal: usize) -> f64 {
+        let size_b = self.state.size_b();
+        let (a, b) = if self.listed {
+            let SwapScratch { side_a, side_b, .. } = &*self.scratch;
+            (side_a[ordinal / size_b], side_b[ordinal % size_b])
+        } else {
+            let partition = self.state.partition();
+            (
+                select(partition, true, ordinal / size_b),
+                select(partition, false, ordinal % size_b),
+            )
+        };
+        self.state.swap_score(self.graph, a, b, self.alpha)
+    }
+
+    fn sum(&mut self, cancel: &CancellationToken) -> Result<f64> {
+        self.list_sides();
+        // `swap_score(a, b)` is `(cut_edges + delta) as f64 + balance`, where the
+        // balance term does not depend on the pair and the integer `delta` is
+        // `gain(a) + gain(b) + 2 * adjacent` with `gain(v) = degree(v) - 2 * cuts_at(v)`.
+        let (state, graph, alpha) = (self.state, self.graph, self.alpha);
+        let SwapScratch {
+            side_a,
+            side_b,
+            slot,
+            gain,
+        } = &mut *self.scratch;
+        let cuts = state.cuts_at();
+        slot.clear();
+        slot.resize(state.partition().len(), side_b.len());
+        gain.clear();
+        for (i, &b) in side_b.iter().enumerate() {
+            slot[b] = i;
+            gain.push(graph.degree(b) as i64 - 2 * cuts[b]);
+        }
+        gain.push(0);
+        let d = state.size_a() as i64 - state.size_b() as i64;
+        let balance = alpha * d as f64 * d as f64;
+        let cut_edges = state.cut_edges() as i64;
+        let mut total = 0.0;
+        for &a in side_a.iter() {
+            cancel.check()?;
+            let base = cut_edges + graph.degree(a) as i64 - 2 * cuts[a];
+            // Temporarily add `2 * adjacent` to the gains of the neighbors of `a`.
+            for &u in graph.neighbors(a) {
+                gain[slot[u]] += 2;
+            }
+            for &gain_b in &gain[..side_b.len()] {
+                total += (base + gain_b) as f64 + balance;
+            }
+            for &u in graph.neighbors(a) {
+                gain[slot[u]] -= 2;
+            }
+        }
+        Ok(total)
+    }
+
+    fn distance_two_score(&self, ordinal: usize) -> f64 {
+        assert!(
+            self.listed,
+            "distance-two samples follow all distance-one samples"
+        );
+        let SwapScratch { side_a, side_b, .. } = &*self.scratch;
+        let combinations = side_a.len() * (side_a.len() - 1) / 2;
+        let (ai, aj) = nth_pair(side_a.len(), ordinal / combinations);
+        let (bi, bj) = nth_pair(side_b.len(), ordinal % combinations);
+        let flips = [side_a[ai], side_b[bi], side_a[aj], side_b[bj]];
+        score_after_flips(self.state, self.graph, self.alpha, &flips)
+    }
+}
+
+/// [`PartitionState::score`] after [`PartitionState::apply_flip`] of the
+/// distinct `vertices` in order, from the same integer updates without a copy.
+fn score_after_flips(state: &PartitionState, graph: &Graph, alpha: f64, vertices: &[usize]) -> f64 {
+    let partition = state.partition();
+    let cuts = state.cuts_at();
+    let mut cut_edges = state.cut_edges() as i64;
+    let mut size_a = state.size_a();
+    for (t, &v) in vertices.iter().enumerate() {
+        // `cuts_at[v]` when `v` is flipped: flipping an earlier neighbor `u`
+        // moved the edge `(u, v)` into or out of the cut.
+        let mut cuts_v = cuts[v];
+        for &u in &vertices[..t] {
+            if graph.neighbors(u).binary_search(&v).is_ok() {
+                if partition[v] != partition[u] {
+                    cuts_v -= 1;
+                } else {
+                    cuts_v += 1;
+                }
+            }
+        }
+        cut_edges += graph.degree(v) as i64 - 2 * cuts_v;
+        if partition[v] {
+            size_a -= 1;
+        } else {
+            size_a += 1;
+        }
+    }
+    let d = size_a as i64 - (partition.len() - size_a) as i64;
+    cut_edges as f64 + alpha * d as f64 * d as f64
+}
+
+/// The pair `(a, b)`, `a < b < n`, at position `ordinal` of the lexicographic
+/// order; panics if there is none.
+fn nth_pair(n: usize, ordinal: usize) -> (usize, usize) {
+    if n < 2 || ordinal >= n * (n - 1) / 2 {
+        unreachable!("validated distance-two ordinal")
+    }
+    // Row `a` lists `(a, a + 1..n)` from position `a * (2n - a - 1) / 2`.
+    let start = |a: usize| a * (2 * n - a - 1) / 2;
+    // The row is the last one starting at or before `ordinal`: start(lo) <=
+    // ordinal < start(hi), where start(n - 1) is the pair count.
+    let (mut lo, mut hi) = (0, n - 1);
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if start(mid) <= ordinal {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    (lo, lo + 1 + ordinal - start(lo))
 }
 
 #[cfg(test)]
@@ -274,5 +689,59 @@ mod tests {
         )
         .unwrap();
         assert_eq!(evaluations, 5);
+    }
+
+    #[test]
+    fn select_finds_every_rank_on_both_sides() {
+        let mut rng = Mt19937GenRand64::new(3);
+        let sizes = (0..=80).chain([127, 128, 129, 200, 255, 256, 257, 500, 513]);
+        for n in sizes {
+            for density in [0.0, 0.1, 0.5, 0.9, 1.0] {
+                let partition: Vec<bool> = (0..n).map(|_| rng.gen_bool(density)).collect();
+                for side in [true, false] {
+                    let vertices = (0..n).filter(|&v| partition[v] == side);
+                    for (rank, v) in vertices.enumerate() {
+                        assert_eq!(select(&partition, side, rank), v, "{n} {side} {rank}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The row-by-row enumeration of `nth_pair` at e4b6a1c.
+    fn nth_pair_by_rows(n: usize, mut ordinal: usize) -> (usize, usize) {
+        for a in 0..n - 1 {
+            let row = n - a - 1;
+            if ordinal < row {
+                return (a, a + 1 + ordinal);
+            }
+            ordinal -= row;
+        }
+        unreachable!("validated distance-two ordinal")
+    }
+
+    #[test]
+    fn nth_pair_matches_the_lexicographic_order_and_rejects_other_ordinals() {
+        for n in 0..=70usize {
+            let pairs = (0..n).flat_map(|a| (a + 1..n).map(move |b| (a, b)));
+            let mut count = 0;
+            for (ordinal, pair) in pairs.enumerate() {
+                assert_eq!(nth_pair(n, ordinal), pair);
+                assert_eq!(nth_pair_by_rows(n, ordinal), pair);
+                count += 1;
+            }
+            assert!(std::panic::catch_unwind(|| nth_pair(n, count)).is_err());
+            if n > 0 {
+                assert!(std::panic::catch_unwind(|| nth_pair_by_rows(n, count)).is_err());
+            }
+        }
+        let mut rng = Mt19937GenRand64::new(5);
+        for n in [100, 499, 500, 1000, 4097] {
+            let pairs = n * (n - 1) / 2;
+            let ordinals = (0..500).map(|_| rng.gen_range(0..pairs));
+            for ordinal in ordinals.chain([0, 1, n - 2, n - 1, pairs - 2, pairs - 1]) {
+                assert_eq!(nth_pair(n, ordinal), nth_pair_by_rows(n, ordinal));
+            }
+        }
     }
 }

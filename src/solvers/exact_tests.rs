@@ -5,6 +5,17 @@ use crate::experiment::config::{
 use rand::Rng;
 use std::sync::Arc;
 
+// Frozen copy of the smoothing module (`crate::smoothing`, non-test code) at
+// e4b6a1c. The frozen engine and runner import it instead of the live module,
+// so they stay an independent oracle when production smoothing is optimized.
+#[allow(clippy::too_many_arguments)]
+mod smoothing_e4b6a1c {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/solvers/test_reference/smoothing_e4b6a1c.rs"
+    ));
+}
+
 // Executable oracle for SA, HC, smoothing and the runner: production engine at
 // 51577f9, with Graph getter adapters. EO changed intentionally in algorithm v2
 // and is compared with `eo_v2` below instead.
@@ -782,3 +793,8 @@ fn eo_cancellation_consumes_selection_draws_and_changes_nothing_else() {
 // independent naive reference built on the `eo_v2` selection oracle.
 #[path = "eo_sa_exact_tests.rs"]
 mod eo_sa;
+
+// Smoothing: production `crate::smoothing` compared with the frozen e4b6a1c
+// copy directly and through the frozen engine and runner.
+#[path = "smoothing_exact_tests.rs"]
+mod smoothing_exact;
