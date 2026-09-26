@@ -43,11 +43,16 @@ gpp run gpp_graphs.toml --root ../out/gpp                 # 同じグラフをgp
 python compare_graphs.py ../out/gpp/graphs ../out/graphs  # 辺リストの一致を確認
 python eig.py ../out/graphs ../out/eig                     # ラプラシアンの固有分解
 ./target/release/smoothing_pilot run ../out/eig all all -100 120 10 8 > ../out/pilot.tsv
-python analyze.py ../out/pilot.tsv 1000000                 # 交差検証した最適Θでの比較表
-python analyze.py ../out/pilot.tsv --summary pilot_summary.tsv
+# 幾何グラフだけシード8〜31を追加（7手法、Θ=-0.3〜+1.0）
+./target/release/smoothing_pilot run ../out/eig geometric none,rk1,nsm_rho1,nsm_erosion,hk_tau0.5,hk_tau2,hk_sched -30 100 10 24 8 > ../out/pilot_ext.tsv
+python analyze.py ../out/pilot.tsv 1000000 --graphs random  # ランダムグラフの比較表（第5.2節）
+python analyze.py ../out/pilot.tsv,../out/pilot_ext.tsv 1000000 --graphs geometric --window -0.3,1.0 --variants none,rk1,nsm_rho1,nsm_erosion,hk_tau0.5,hk_tau2,hk_sched  # 第5.3節
+python analyze.py ../out/pilot.tsv,../out/pilot_ext.tsv --summary pilot_summary.tsv
 ```
 
-`run`の引数は、固有分解のディレクトリ、グラフ名の部分一致（カンマ区切り、`all`で全部）、手法（カンマ区切り、`all`で全部）、Θ×100の下限・上限・刻み、シード数の順である。本文の予備実験は上の`run`の行（Θ=-1.0〜+1.2の0.1刻み23点、シード0〜7）で、4スレッドで約1時間かかった。`pilot_summary.tsv`は、その結果をグラフ×手法×Θごとに集計したものである。
+`run`の引数は、固有分解のディレクトリ、グラフ名の部分一致（カンマ区切り、`all`で全部）、手法（カンマ区切り、`all`で全部）、Θ×100の下限・上限・刻み、シード数、先頭のシード番号（省略時0）の順である。10番目の引数に`crn`を与えると、初期分割をグラフとシードだけで決める（手法・温度で共通にする）。本文の予備実験では使っていない。
+
+本文の予備実験は上の2つの`run`の行である。4スレッドで、1つ目は約1時間、2つ目は約20分かかった（別の計算と並行したときの値）。`pilot_summary.tsv`は、両方の結果をグラフ×手法×Θごとに集計したものである。列は、シード数、$10^5$・$10^6$ ステップ時点の暫定解ベイスン値の平均、$10^6$ 時点の標準誤差、暫定解の実評価値の平均、受理率である。
 
 ## 本文との対応
 
