@@ -629,6 +629,20 @@ fn nth_pair(n: usize, ordinal: usize) -> (usize, usize) {
     (lo, lo + 1 + ordinal - start(lo))
 }
 
+/// Test-only view of the reusable scratch: (identity length, identity intact,
+/// RefCell free), used to check that no call leaves the permutation scrambled.
+#[cfg(test)]
+pub(crate) fn scratch_status() -> (usize, bool, bool) {
+    SCRATCH.with(|scratch| match scratch.try_borrow() {
+        Ok(s) => (
+            s.shuffle.identity.len(),
+            s.shuffle.identity.iter().enumerate().all(|(i, &v)| i == v),
+            true,
+        ),
+        Err(_) => (0, false, false),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

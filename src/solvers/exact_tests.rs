@@ -913,3 +913,10 @@ fn hc_real_paths_match_frozen_engine_including_errors() {
     }
     assert!(errors > 0 && optima > 0 && steps_total > errors + optima);
 }
+
+// Independent review of the smoothing speedup: random differential tests against
+// the frozen copy (n up to 3000, under catch_unwind), asynchronous mid-call
+// cancellation followed by reuse, size sequences and parallel threads, checking
+// that the reusable scratch permutation is always restored.
+#[path = "smoothing_review_tests.rs"]
+mod smoothing_review;
