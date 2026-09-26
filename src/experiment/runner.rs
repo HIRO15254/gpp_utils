@@ -154,6 +154,7 @@ pub fn run_one(
         // `next` is the first checkpoint after `completed`), so it is called
         // only after that checkpoint's step or a stopping step.
         let until = wanted[next];
+        debug_assert!(until > completed, "checkpoints increase past {completed}");
         let advance = engine.advance(until, &mut completed, cancel, |engine, completed| {
             let real = if search_is_real {
                 engine.search_evaluation

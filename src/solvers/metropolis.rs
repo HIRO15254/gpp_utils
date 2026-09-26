@@ -11,6 +11,12 @@
 const BITS: u32 = 10;
 const LEN: usize = 1 << BITS;
 
+/// Entry of `key`: Fibonacci hashing; the shift keeps the slot below `LEN`.
+#[inline]
+pub(super) fn slot(key: u64) -> usize {
+    (key.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (u64::BITS - BITS)) as usize
+}
+
 /// The factor as SA and EO-SA evaluate it.
 #[inline]
 fn factor(delta: f64, t: f64) -> f64 {
@@ -49,9 +55,7 @@ impl MetropolisFactor {
     #[inline]
     pub(crate) fn get(&mut self, delta: f64) -> f64 {
         let key = delta.to_bits();
-        // Fibonacci hashing; the shift keeps the slot below `LEN`.
-        let slot = (key.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (u64::BITS - BITS)) as usize;
-        let entry = &mut self.entries[slot];
+        let entry = &mut self.entries[slot(key)];
         if entry.0 == key {
             entry.1
         } else {
@@ -157,12 +161,10 @@ mod tests {
     fn colliding_keys_stay_exact() {
         let t = 0.7;
         let mut memo = MetropolisFactor::new(t);
-        let slot =
-            |x: f64| (x.to_bits().wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - BITS)) as usize;
         let first = 1.25f64;
         let second = (1..)
             .map(|i| first + i as f64 * 0.125)
-            .find(|&x| slot(x) == slot(first))
+            .find(|&x| slot(x.to_bits()) == slot(first.to_bits()))
             .unwrap();
         for _ in 0..4 {
             for x in [first, second, 0.0, -0.0] {

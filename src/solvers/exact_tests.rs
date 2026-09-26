@@ -931,3 +931,10 @@ fn hc_real_paths_match_frozen_engine_including_errors() {
 // that the reusable scratch permutation is always restored.
 #[path = "smoothing_review_tests.rs"]
 mod smoothing_review;
+
+// Independent review of the SA step and partition-state speedup: HC and SA
+// runners against the frozen runner at every stop position, cancellation from
+// the observer of `Engine::advance`, memo collisions (including the slot of
+// +0.0) and exhaustive adjacency tests around the matrix cap.
+#[path = "sa_review_tests.rs"]
+mod sa_review;
