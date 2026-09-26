@@ -477,6 +477,10 @@ fn run(
         }
         Variant::RandomK(k) => {
             let k = *k;
+            assert!(
+                k >= 1 && k <= n,
+                "random_k needs 1 <= K <= n (distance-1 samples only)"
+            );
             let mut pick = vec![0usize; k];
             let est = |st: &St, rng: &mut Mt64, pick: &mut Vec<usize>| -> f64 {
                 let mut c = 0;
