@@ -11,7 +11,7 @@ use crate::fitness::FitnessRegistry;
 use crate::graph_partition::{BestImprovement, Graph, Move, NonFinite, PartitionState};
 use crate::optimization::{CancellationToken, rng_for};
 use crate::smoothing;
-use crate::solvers::{Engine, StepStatus};
+use crate::solvers::{Advance, Engine, StepStatus};
 use rand_mt::Mt19937GenRand64;
 use std::{
     collections::BTreeMap,
@@ -148,29 +148,37 @@ pub fn run_one(
         }
     }
     while completed < condition.budget.max_steps && termination != RunTermination::Cancelled {
-        if cancel.is_cancelled() {
-            termination = RunTermination::Cancelled;
-            break;
-        }
-        let status = match engine.step(cancel) {
-            Ok(x) => x,
-            Err(_error) if cancel.is_cancelled() => {
+        // Per step: stop if cancelled, step, count it and track the best
+        // solution. `record_if_due` records nothing before the next
+        // checkpoint `wanted[next]` (which exists: `max_steps` is one and
+        // `next` is the first checkpoint after `completed`), so it is called
+        // only after that checkpoint's step or a stopping step.
+        let until = wanted[next];
+        let advance = engine.advance(until, &mut completed, cancel, |engine, completed| {
+            let real = if search_is_real {
+                engine.search_evaluation
+            } else {
+                engine.state.score(condition.alpha)
+            };
+            if real < best_score {
+                best_score = real;
+                best.copy_from_slice(engine.state.partition());
+                best_step = completed
+            }
+        });
+        let status = match advance {
+            Advance::Reached => StepStatus::Continue,
+            Advance::Stopped(status) => status,
+            Advance::Cancelled => {
                 termination = RunTermination::Cancelled;
                 break;
             }
-            Err(e) => return Err(e),
+            Advance::Failed(_error) if cancel.is_cancelled() => {
+                termination = RunTermination::Cancelled;
+                break;
+            }
+            Advance::Failed(e) => return Err(e),
         };
-        completed += 1;
-        let real = if search_is_real {
-            engine.search_evaluation
-        } else {
-            engine.state.score(condition.alpha)
-        };
-        if real < best_score {
-            best_score = real;
-            best.copy_from_slice(engine.state.partition());
-            best_step = completed
-        }
         if let Err(error) = record_if_due(
             graph,
             condition,

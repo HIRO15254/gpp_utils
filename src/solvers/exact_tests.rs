@@ -37,6 +37,11 @@ mod reference {
                 (0..count).map(|_| smooth.r#gen()).collect(),
             )
         }
+
+        /// The select, tie and smoothing streams, for exact state comparison.
+        pub(super) fn rngs(&self) -> [&Mt19937GenRand64; 3] {
+            [&self.select_rng, &self.tie_rng, &self.smooth_rng]
+        }
     }
 
     #[allow(clippy::too_many_arguments, clippy::collapsible_if)]
@@ -798,6 +803,12 @@ mod eo_sa;
 // copy directly and through the frozen engine and runner.
 #[path = "smoothing_exact_tests.rs"]
 mod smoothing_exact;
+
+// Real-objective SA (Metropolis memo, cross-side swap score, specialized step
+// loop) against the frozen engine and runner, and `Engine::advance` against
+// the loop of `Engine::step` calls it replaces in the runner.
+#[path = "sa_exact_tests.rs"]
+mod sa_exact;
 
 // Independent review: non-smoothed HC (none / weighted_average k = 0) against the
 // frozen engine on graphs up to n = 100 and on alphas that bypass run_one
