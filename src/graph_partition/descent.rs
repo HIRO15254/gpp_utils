@@ -33,6 +33,25 @@ use crate::optimization::CancellationToken;
 use rand::Rng;
 use rand_mt::Mt19937GenRand64;
 
+#[cfg(test)]
+thread_local! {
+    /// Scan events recorded for the cancellation-schedule test while it has
+    /// enabled recording on this thread (`None` otherwise): `(kind, position)`
+    /// with kind 0 = cancellation check (Flip: vertex; Swap: row rank, or the
+    /// row count at the end), 1 = scored candidate (Flip: vertex; Swap: rank of
+    /// `a`), 2 = worked row (rank), 3 = row bound test (vertex).
+    pub(crate) static EVENTS: std::cell::RefCell<Option<Vec<(u8, usize)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+fn event(kind: u8, at: usize) {
+    EVENTS.with(|e| {
+        if let Some(events) = e.borrow_mut().as_mut() {
+            events.push((kind, at));
+        }
+    });
+}
+
 /// Logical candidates (including skipped ones) between cancellation checks.
 const CHECK_INTERVAL: usize = 1024;
 const _: () = assert!(CHECK_INTERVAL.is_multiple_of(64));
@@ -579,6 +598,8 @@ impl BestImprovement {
         for w in 0..stop.div_ceil(64) {
             let base = w * 64;
             if w != 0 && base.is_multiple_of(CHECK_INTERVAL) {
+                #[cfg(test)]
+                event(0, base);
                 cancel.check()?;
             }
             let in_a = tracker.in_a[w];
@@ -601,6 +622,7 @@ impl BestImprovement {
                 #[cfg(test)]
                 {
                     self.scored += 1;
+                    event(1, v);
                 }
                 let x = bounds[side].score(gain);
                 debug_assert_eq!(
@@ -666,13 +688,19 @@ impl BestImprovement {
                 row_bits &= row_bits - 1;
                 let a = w * 64 + j;
                 let ga = tracker.gain[a];
+                #[cfg(test)]
+                event(3, a);
                 if ga + min_b > limit {
                     continue;
                 }
                 let rank = rank_base + (in_a & ((1u64 << j) - 1)).count_ones() as usize;
                 if checks.due(rank) {
+                    #[cfg(test)]
+                    event(0, rank);
                     cancel.check()?;
                 }
+                #[cfg(test)]
+                event(2, rank);
                 // The level set holding every `b` with `ga + gain(b) <= limit`.
                 let mut set = tracker.set(tracker.level(limit - ga));
                 for (wb, &in_a_b) in tracker.in_a.iter().enumerate() {
@@ -688,6 +716,7 @@ impl BestImprovement {
                         #[cfg(test)]
                         {
                             self.scored += 1;
+                            event(1, rank);
                         }
                         let x = bound.score(ga + gb + 2 * i64::from(graph.has_edge(a, b)));
                         debug_assert_eq!(
@@ -706,6 +735,8 @@ impl BestImprovement {
             rank_base += in_a.count_ones() as usize;
         }
         if checks.due_at_end(rows) {
+            #[cfg(test)]
+            event(0, rows);
             cancel.check()?;
         }
         *evaluations += total;
@@ -1127,3 +1158,14 @@ mod review_tests;
 #[cfg(test)]
 #[path = "descent_tracked_tests.rs"]
 mod tracked_tests;
+
+// Independent review of the tracked descents: a full-scan oracle that reads
+// the cut data from the edge list and checks the tracker against its written
+// definition, and the cancellation checks of tracked scans against the full
+// scan's schedule.
+#[cfg(test)]
+#[path = "descent_oracle_review_tests.rs"]
+mod oracle_review_tests;
+#[cfg(test)]
+#[path = "descent_schedule_review_tests.rs"]
+mod schedule_review_tests;
