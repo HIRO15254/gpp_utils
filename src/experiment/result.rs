@@ -179,7 +179,7 @@ impl RunResult {
         );
         let smooth = match &condition.solver {
             SolverSpec::Hc { smoothing } | SolverSpec::Sa { smoothing, .. } => Some(smoothing),
-            SolverSpec::Eo { .. } => None,
+            SolverSpec::Eo { .. } | SolverSpec::EoSa { .. } => None,
         };
         let nontrivial = smooth.is_some_and(|s| {
             !matches!(
@@ -390,8 +390,7 @@ impl RunResult {
                 "time components exceed elapsed time"
             );
             ensure!(
-                d.fitness_values_computed_search.is_some()
-                    == matches!(condition.solver, SolverSpec::Eo { .. }),
+                d.fitness_values_computed_search.is_some() == condition.solver.fitness().is_some(),
                 "fitness diagnostic applicability mismatch"
             );
         }
@@ -585,7 +584,7 @@ impl<'view, 'result> MeasurementView<'view, 'result> {
 fn smoothing(condition: &Condition) -> Option<&SmoothingSpec> {
     match &condition.solver {
         SolverSpec::Hc { smoothing } | SolverSpec::Sa { smoothing, .. } => Some(smoothing),
-        SolverSpec::Eo { .. } => None,
+        SolverSpec::Eo { .. } | SolverSpec::EoSa { .. } => None,
     }
 }
 fn identity_smoothing(condition: &Condition) -> bool {

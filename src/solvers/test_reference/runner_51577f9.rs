@@ -76,6 +76,7 @@ pub fn run_one(
             }
             registry.validate(fitness)?;
         }
+        SolverSpec::EoSa { .. } => unreachable!("eo_sa postdates this frozen reference"),
     }
     if matches!(condition.neighborhood, Neighborhood::Swap) && !graph.node_count().is_multiple_of(2) {
         return Err(Error::msg("swap requires an even node count"));
@@ -316,6 +317,7 @@ fn record(
     let smoothing_spec = match &c.solver {
         SolverSpec::Hc { smoothing } | SolverSpec::Sa { smoothing, .. } => Some(smoothing),
         SolverSpec::Eo { .. } => None,
+        SolverSpec::EoSa { .. } => unreachable!("eo_sa postdates this frozen reference"),
     };
     let mut current_smoothed = None;
     let mut search_evaluation = None;

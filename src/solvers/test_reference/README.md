@@ -20,6 +20,13 @@ inside these fixtures replaces `graph.node_count` with `graph.node_count()`.
 It performs the same field read; no loop, arithmetic, RNG operation or
 algorithm branch changes. Future semantic changes must not update this oracle.
 
+The `eo_sa` solver kind was added to `SolverSpec` after `51577f9`. Rust
+requires exhaustive matches, so the frozen engine and runner carry one
+compile-only arm per exhaustive `match` on `SolverSpec`:
+`SolverSpec::EoSa { .. } => unreachable!("eo_sa postdates this frozen reference")`.
+The arms add no branch for the pre-existing variants, and no test passes an
+`eo_sa` condition to this oracle.
+
 ## EO since algorithm v2
 
 EO changed intentionally in algorithm `v2`: ties are no longer shuffled with

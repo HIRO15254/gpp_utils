@@ -123,6 +123,7 @@ impl<'a> Engine<'a> {
         match &self.condition.solver {
             SolverSpec::Hc { smoothing } | SolverSpec::Sa { smoothing, .. } => smoothing,
             SolverSpec::Eo { .. } => unreachable!(),
+            SolverSpec::EoSa { .. } => unreachable!("eo_sa postdates this frozen reference"),
         }
     }
     pub fn step(&mut self, cancel: &CancellationToken) -> Result<StepStatus> {
@@ -130,6 +131,7 @@ impl<'a> Engine<'a> {
             SolverSpec::Hc { .. } => self.hc(cancel),
             SolverSpec::Sa { temperature, .. } => self.sa(*temperature, cancel),
             SolverSpec::Eo { tau, .. } => self.eo(*tau, cancel),
+            SolverSpec::EoSa { .. } => unreachable!("eo_sa postdates this frozen reference"),
         }
     }
     fn hc(&mut self, cancel: &CancellationToken) -> Result<StepStatus> {

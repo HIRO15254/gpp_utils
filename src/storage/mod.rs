@@ -566,7 +566,7 @@ fn run_job(
 pub fn validate_registry(plan: &ExperimentPlan, registry: &FitnessRegistry) -> Result<()> {
     let versions = registry.versions();
     for job in &plan.jobs {
-        if let crate::experiment::config::SolverSpec::Eo { fitness, .. } = &job.condition.solver {
+        if let Some(fitness) = job.condition.solver.fitness() {
             registry.validate(fitness)?;
             let expected = plan
                 .experiment

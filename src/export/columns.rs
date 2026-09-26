@@ -195,8 +195,14 @@ pub(super) const RUN_COLUMNS: &[ColumnSpec<RunField>] = &[
         Neighborhood
     ),
     run_c!("solver", "string", None, "Solver kind", Solver),
-    run_c!("temperature", "number", None, "SA temperature", Temperature),
-    run_c!("tau", "number", None, "EO rank exponent", Tau),
+    run_c!(
+        "temperature",
+        "number",
+        None,
+        "Metropolis temperature (sa, eo_sa)",
+        Temperature
+    ),
+    run_c!("tau", "number", None, "EO rank exponent (eo, eo_sa)", Tau),
     run_c!("smoothing", "string", None, "Smoothing kind", Smoothing),
     run_c!("k", "integer", None, "Effective smoothing sample count", K),
     run_c!(
@@ -378,14 +384,14 @@ pub(super) const RUN_COLUMNS: &[ColumnSpec<RunField>] = &[
         "accepted_moves",
         "integer",
         None,
-        "Applied moves (accepted moves for SA)",
+        "Applied moves (accepted moves for sa and eo_sa)",
         Accepted
     ),
     run_c!(
         "rejected_moves",
         "integer",
         None,
-        "Rejected SA moves",
+        "Rejected Metropolis moves (sa, eo_sa)",
         Rejected
     ),
     run_c!(

@@ -103,7 +103,7 @@ seed_<seed>.jsonは次の項目だけを持つ。
 - ランダム平滑化では探索が保持した値と計測用固定サンプルの値が異なり得るため、search_evaluationも保存する。
 - 決定的平滑化のsearch_evaluationはcurrent_smoothedと同じなので保存しない。
 - noneでは平滑化関連の値を保存せず、必要な表示時にcurrent_solutionの実評価値から生成する。weighted_averageで有効K=0の場合も同じ扱いにする。
-- EOには平滑化評価を保存しない。表示・exportでは非適用として空欄にする。
+- EO・EO-SAには平滑化評価を保存しない。表示・exportでは非適用として空欄にする。
 
 ### ベイスン計測
 
@@ -117,7 +117,7 @@ seed_<seed>.jsonは次の項目だけを持つ。
 
 terminationはlocal_optimumまたはstep_limit。値が局所最適か単なる打ち切り終点かを判別するために残す。走査数は通常保存せず、診断有効時だけstepsを追加する。
 
-noneおよびweighted_averageの有効K=0では、both指定でもbasin_realだけ保存する。対応する平滑化ベイスンは表示・export時に同じ測定結果から生成する。EOではboth要求も実空間だけに解決し、basin_smoothedは非適用とする。有効な計測モードは条件から求まるので別フィールドとして保存しない。
+noneおよびweighted_averageの有効K=0では、both指定でもbasin_realだけ保存する。対応する平滑化ベイスンは表示・export時に同じ測定結果から生成する。EO・EO-SAではboth要求も実空間だけに解決し、basin_smoothedは非適用とする。有効な計測モードは条件から求まるので別フィールドとして保存しない。
 
 ベイスン値は、現在スコアだけからは求められず、ベイスン終点の分割も保存しないため保持する。測定のために訪問した解を探索のbest_realへ混ぜない。
 
@@ -131,10 +131,10 @@ measurement.diagnosticsの既定値はfalse。trueの実行だけ、結果のdia
 
 - applied_moves（探索で適用した移動数。Swapは1移動）。
 - objective_evaluations_search、objective_evaluations_measurement（実際に計算した目的関数値の数）。
-- fitness_values_computed_search（EOのみ。組み込み適応度の差分更新索引経路は初期構築のn回に、ステップごとの更新頂点数（Flip: 1+deg(v)、Swap: 2+deg(a)+deg(b)）を加えた数。カスタム適応度の汎用経路は毎ステップn。いずれもキャッシュ参照は含まない）。
+- fitness_values_computed_search（EO・EO-SAのみ。組み込み適応度の差分更新索引経路は初期構築のn回に、ステップごとの更新頂点数（Flip: 1+deg(v)、Swap: 2+deg(a)+deg(b)）を加えた数。カスタム適応度の汎用経路は毎ステップn。いずれもキャッシュ参照は含まない）。
 - search_ms、measurement_ms（時間内訳）。
 
-各recordにカウンターや時間の累積値を繰り返し保存しない。accepted_movesは現在の全手法でapplied_movesと同じ、SAのrejected_movesはcompleted_steps-applied_movesなので保存しない。時間合計はelapsed_msを使い、other_msは必要時に差から算出する。無効時の診断値を0として扱わず、表示時は空欄とする。
+各recordにカウンターや時間の累積値を繰り返し保存しない。accepted_movesは現在の全手法でapplied_movesと同じ、SA・EO-SAのrejected_movesはcompleted_steps-applied_movesなので保存しない。時間合計はelapsed_msを使い、other_msは必要時に差から算出する。無効時の診断値を0として扱わず、表示時は空欄とする。
 
 ## 5. 完了結果の具体例
 
@@ -226,7 +226,7 @@ export実装の`ColumnSpec`が、`runs.tsv`と`traces.tsv`の列順、型、単�
 
 列順はcondition_id、seed、status、step、current_real、best_real、search_evaluation、current_smoothed、basin_real_from_real、basin_smoothed_from_real、basin_real_status、basin_real_steps、basin_real_from_smoothed、basin_smoothed_from_smoothed、basin_smoothed_status、basin_smoothed_steps、basin_real_from_best、basin_best_status、basin_best_steps。実評価値はJSONのcurrent_solutionとbest_solution参照から生成する。
 
-初期・終了点の実評価値、noneの場合の平滑化値、重複を省略したベイスン値は、前述の規則で補完する。分割配列とSolutionIdはTSVへ複製しない。保存された途中計測点のカット数・群サイズ・ペナルティはJSONの参照分割から取得できる。途中の時間・カウンターは元データがないため追加しない。EOの平滑化列は空欄。未計測や診断無効のstepsも空欄。condition_idとseedでruns.tsvへ結合できる。
+初期・終了点の実評価値、noneの場合の平滑化値、重複を省略したベイスン値は、前述の規則で補完する。分割配列とSolutionIdはTSVへ複製しない。保存された途中計測点のカット数・群サイズ・ペナルティはJSONの参照分割から取得できる。途中の時間・カウンターは元データがないため追加しない。EO・EO-SAの平滑化列は空欄。未計測や診断無効のstepsも空欄。condition_idとseedでruns.tsvへ結合できる。
 
 出力例の主要列だけを抜き出すと次の表になる。
 
@@ -254,7 +254,7 @@ export実装の`ColumnSpec`が、`runs.tsv`と`traces.tsv`の列順、型、単�
 
 - 正本に展開済み計画、状態集計、設定コピー、初期分割、解から導出できる終点スコアが含まれないこと。
 - 初期・終了点のcurrent_solution/best_solution参照、分割プールの重複排除、途中の暫定解の保持。
-- none/weighted K=0の重複値補完、EOの非適用、計測なし、打ち切り、診断無効を区別できること。
+- none/weighted K=0の重複値補完、EO・EO-SAの非適用、計測なし、打ち切り、診断無効を区別できること。
 - 診断の有効・無効で探索結果が変わらず、診断無効時に値を0として偽装しないこと。
 - manifestやsummaryなしで完了・未開始・中断・失敗を判定し、再開できること。
 - 上書き失敗時の既存完了結果の維持と、残存マーカーの処理。
