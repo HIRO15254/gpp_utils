@@ -839,3 +839,8 @@ fn sa_exp_cache_preserves_rng_shortcuts_bits_and_collisions() {
     let underflow = check(&mut engine, f64::MAX, f64::MIN_POSITIVE);
     assert_eq!(underflow.to_bits(), 0.0f64.to_bits());
 }
+
+// EO-SA (`eo_sa`): EO proposals judged by the Metropolis rule. Compared with an
+// independent naive reference built on the `eo_v2` selection oracle.
+#[path = "eo_sa_exact_tests.rs"]
+mod eo_sa;

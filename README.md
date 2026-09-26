@@ -6,9 +6,9 @@
 
 - グラフ生成: Random (Erdos-Renyi) / Geometric
 - 近傍: Flip（任意分割）/ Swap（偶数頂点・等分割）
-- 探索: Hill Climbing、固定温度 Simulated Annealing、Extremal Optimization
+- 探索: Hill Climbing、固定温度 Simulated Annealing、Extremal Optimization、EO-SA（`eo_sa`: EOの提案とSAのMetropolis判定の組み合わせ）
 - 平滑化: `none`、`all_average`、`random_k_average`、`weighted_average`（HC/SAのみ）
-- EO: 必須の `taus`（`tau >= 0`）と適応度 `default`（`good_edge_fraction-v1`）・`multiplicative`（`multiplicative-v1`、`alpha`）・`additive`（`additive-v1`、`beta`）。paramsは`1.0`のような浮動小数点のJSON数値で指定する。Rustの登録機構でさらに拡張可能
+- EO: 必須の `taus`（`tau >= 0`）と適応度 `default`（`good_edge_fraction-v1`）・`multiplicative`（`multiplicative-v1`、`alpha`）・`additive`（`additive-v1`、`beta`）。paramsは`1.0`のような浮動小数点のJSON数値で指定する。Rustの登録機構でさらに拡張可能。EO-SA（`eo_sa`）は同じ`taus`と適応度に加えて必須の`temperatures`（`temperature >= 0`）を指定
 - TOML/JSON設定、直積スイープ、CPU並列、キャンセル、ジョブ単位の再開
 - 計算予算のスイープ・条件別指定、探索シードごとのラウンド実行、暫定解からの実評価ベイスン計測
 - 結果はJSON正本、必要時にTSVを生成。集計・作図は外部ツールで行う
@@ -80,6 +80,17 @@ params = { alpha = 0.5 }
 kind = "additive"
 params = { beta = 3.0 }
 ```
+
+EO-SAでEOの提案とSAのMetropolis判定を組み合わせる設定例です。
+
+```toml
+[[solvers]]
+kind = "eo_sa"
+taus = [0.5, 1.5]
+temperatures = [0.1, 1.0]
+```
+
+詳細は[examples/configs/eo_sa.toml](examples/configs/eo_sa.toml)と[algorithms.md](docs/algorithms.md)の「EO-SA」セクションを参照してください。
 
 `budget.max_steps = [100, 1000]`で計算予算もスイープできます。手法・近傍によって予算を変える場合は、ルートの`neighborhoods`・`solvers`を`[[conditions]]`へ移し、各グループに`neighborhoods`・`solvers`と任意の`budget`を設定します。グループに予算がなければ全体から継承します。明示した計測ステップはすべての有効予算以下にしてください。
 

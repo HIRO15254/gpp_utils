@@ -72,6 +72,24 @@ pub enum SolverSpec {
         tau: f64,
         fitness: FitnessSpec,
     },
+    /// EO proposals (selection rule v2) judged by the SA Metropolis rule at a
+    /// fixed temperature; `tau = 0` proposes like SA and a huge temperature
+    /// accepts every EO move. See `docs/algorithms.md`.
+    EoSa {
+        tau: f64,
+        temperature: f64,
+        fitness: FitnessSpec,
+    },
+}
+
+impl SolverSpec {
+    /// Vertex-fitness definition ranked by `eo` and `eo_sa`; `None` otherwise.
+    pub fn fitness(&self) -> Option<&FitnessSpec> {
+        match self {
+            SolverSpec::Eo { fitness, .. } | SolverSpec::EoSa { fitness, .. } => Some(fitness),
+            SolverSpec::Hc { .. } | SolverSpec::Sa { .. } => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -216,6 +234,12 @@ pub enum SolverSweep {
     },
     Eo {
         taus: Vec<f64>,
+        #[serde(default)]
+        fitnesses: Option<Vec<FitnessSpec>>,
+    },
+    EoSa {
+        taus: Vec<f64>,
+        temperatures: Vec<f64>,
         #[serde(default)]
         fitnesses: Option<Vec<FitnessSpec>>,
     },

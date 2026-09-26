@@ -171,7 +171,7 @@ pub fn compile_stored_with_registry(
 ) -> crate::error::Result<ExperimentPlan> {
     let plan = compile_with_stored(stored)?;
     for job in &plan.jobs {
-        if let SolverSpec::Eo { fitness, .. } = &job.condition.solver {
+        if let Some(fitness) = job.condition.solver.fitness() {
             registry.validate(fitness)?;
             let expected = registry
                 .versions()
@@ -285,7 +285,7 @@ fn condition_versions(
     solver: &SolverSpec,
 ) -> crate::error::Result<BTreeMap<String, String>> {
     let mut relevant = pinned_versions();
-    if let SolverSpec::Eo { fitness, .. } = solver {
+    if let Some(fitness) = solver.fitness() {
         let key = format!("fitness:{}", fitness.kind);
         relevant.insert(
             key.clone(),
@@ -304,7 +304,8 @@ fn requested_fitnesses(spec: &ExperimentSpec) -> BTreeSet<String> {
         .chain(spec.conditions.iter().map(|condition| &condition.solvers))
     {
         for solver in solvers {
-            if let SolverSweep::Eo { fitnesses, .. } = solver {
+            if let SolverSweep::Eo { fitnesses, .. } | SolverSweep::EoSa { fitnesses, .. } = solver
+            {
                 if let Some(fitnesses) = fitnesses {
                     names.extend(fitnesses.iter().map(|f| f.kind.clone()));
                 } else {
@@ -396,18 +397,34 @@ fn normalize_solvers(solvers: &mut [SolverSweep]) {
                         *t = 0.0;
                     }
                 }
-                if fitnesses.is_none() {
-                    *fitnesses = Some(vec![FitnessSpec::default()]);
-                }
-                if let Some(fitnesses) = fitnesses {
-                    for fitness in fitnesses {
-                        if fitness.kind == "default" && fitness.params.is_null() {
-                            fitness.params = FitnessSpec::default().params;
-                        }
+                normalize_fitnesses(fitnesses);
+            }
+            SolverSweep::EoSa {
+                taus,
+                temperatures,
+                fitnesses,
+            } => {
+                for t in taus.iter_mut().chain(temperatures.iter_mut()) {
+                    if *t == 0.0 {
+                        *t = 0.0;
                     }
                 }
+                normalize_fitnesses(fitnesses);
             }
             _ => {}
+        }
+    }
+}
+
+fn normalize_fitnesses(fitnesses: &mut Option<Vec<FitnessSpec>>) {
+    if fitnesses.is_none() {
+        *fitnesses = Some(vec![FitnessSpec::default()]);
+    }
+    if let Some(fitnesses) = fitnesses {
+        for fitness in fitnesses {
+            if fitness.kind == "default" && fitness.params.is_null() {
+                fitness.params = FitnessSpec::default().params;
+            }
         }
     }
 }
@@ -634,6 +651,40 @@ fn expand_solvers(
                             tau,
                             fitness: fitness.clone(),
                         });
+                    }
+                }
+            }
+            SolverSweep::EoSa {
+                taus,
+                temperatures,
+                fitnesses,
+            } => {
+                if taus.is_empty() {
+                    bail!("eo_sa.taus must be non-empty");
+                }
+                if temperatures.is_empty() {
+                    bail!("eo_sa.temperatures must be non-empty");
+                }
+                let default_fitnesses = [FitnessSpec::default()];
+                let fitnesses = fitnesses.as_deref().unwrap_or(&default_fitnesses);
+                if fitnesses.is_empty() {
+                    bail!("eo_sa.fitnesses must be non-empty when specified");
+                }
+                for &tau in taus {
+                    if !tau.is_finite() || tau < 0.0 {
+                        bail!("tau must be finite and non-negative");
+                    }
+                    for &temperature in temperatures {
+                        if !temperature.is_finite() || temperature < 0.0 {
+                            bail!("temperature must be finite and non-negative");
+                        }
+                        for fitness in fitnesses {
+                            result.push(SolverSpec::EoSa {
+                                tau,
+                                temperature,
+                                fitness: fitness.clone(),
+                            });
+                        }
                     }
                 }
             }

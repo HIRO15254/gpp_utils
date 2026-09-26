@@ -86,6 +86,19 @@ pub fn run_one(
             }
             registry.validate(fitness)?;
         }
+        SolverSpec::EoSa {
+            tau,
+            temperature,
+            fitness,
+        } => {
+            if !tau.is_finite() || *tau < 0.0 {
+                return Err(Error::msg("tau must be finite and non-negative"));
+            }
+            if !temperature.is_finite() || *temperature < 0.0 {
+                return Err(Error::msg("temperature must be finite and non-negative"));
+            }
+            registry.validate(fitness)?;
+        }
     }
     if matches!(condition.neighborhood, Neighborhood::Swap) && !graph.node_count().is_multiple_of(2)
     {
@@ -98,7 +111,7 @@ pub fn run_one(
         SolverSpec::Sa {
             smoothing: SmoothingSpec::None | SmoothingSpec::WeightedAverage { k: 0 },
             ..
-        }
+        } | SolverSpec::EoSa { .. }
     );
     let initial = engine.state.partition().to_vec();
     let mut best = initial.clone();
@@ -262,7 +275,10 @@ pub fn run_one(
         applied_moves: engine.applied_moves,
         objective_evaluations_search: engine.objective_evaluations,
         objective_evaluations_measurement: measurement_evals,
-        fitness_values_computed_search: matches!(condition.solver, SolverSpec::Eo { .. })
+        fitness_values_computed_search: condition
+            .solver
+            .fitness()
+            .is_some()
             .then_some(engine.fitness_values),
         search_ms: (elapsed_ms - measurement_ms).max(0.0),
         measurement_ms,
@@ -361,7 +377,7 @@ fn record(
     let start = Instant::now();
     let smoothing_spec = match &c.solver {
         SolverSpec::Hc { smoothing } | SolverSpec::Sa { smoothing, .. } => Some(smoothing),
-        SolverSpec::Eo { .. } => None,
+        SolverSpec::Eo { .. } | SolverSpec::EoSa { .. } => None,
     };
     let mut current_smoothed = None;
     let mut search_evaluation = None;

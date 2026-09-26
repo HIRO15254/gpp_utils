@@ -24,6 +24,8 @@ pub struct Engine<'a> {
     select_rng: Mt19937GenRand64,
     tie_rng: Mt19937GenRand64,
     smooth_rng: Mt19937GenRand64,
+    /// Metropolis acceptance draws of `eo_sa`; `None` for the other solvers.
+    accept_rng: Option<Mt19937GenRand64>,
     eo: Option<Eo>,
     /// Exact Metropolis thresholds keyed by the observed delta bits. The
     /// temperature is fixed for an Engine, so it is intentionally not in the key.
@@ -58,13 +60,13 @@ impl<'a> Engine<'a> {
         let state = PartitionState::new(graph, p)?;
         let solver = serde_json::to_vec(&condition.solver)?;
         let alpha = condition.alpha.to_bits().to_le_bytes();
-        let fitness_version = match &condition.solver {
-            SolverSpec::Eo { fitness, .. } => registry
+        let fitness_version = match condition.solver.fitness() {
+            Some(fitness) => registry
                 .versions()
                 .get(&fitness.kind)
                 .cloned()
                 .unwrap_or_default(),
-            _ => String::new(),
+            None => String::new(),
         };
         let mut e = Self {
             graph,
@@ -101,13 +103,27 @@ impl<'a> Engine<'a> {
                 b"algorithm-v1",
                 b"smooth",
             ]),
+            accept_rng: matches!(condition.solver, SolverSpec::EoSa { .. }).then(|| {
+                rng_for(&[
+                    hash.as_bytes(),
+                    nlabel,
+                    &seedb,
+                    &alpha,
+                    &solver,
+                    fitness_version.as_bytes(),
+                    b"algorithm-v1",
+                    b"accept",
+                ])
+            }),
             eo: None,
             sa_exp_cache: [None; SA_EXP_CACHE_CAPACITY],
             objective_evaluations: 0,
             fitness_values: 0,
             applied_moves: 0,
         };
-        if let SolverSpec::Eo { fitness, tau } = &condition.solver {
+        if let SolverSpec::Eo { fitness, tau } | SolverSpec::EoSa { fitness, tau, .. } =
+            &condition.solver
+        {
             e.eo = Some(Eo::new(
                 registry.create_engine_fitness(fitness)?,
                 graph,
@@ -136,7 +152,7 @@ impl<'a> Engine<'a> {
     fn smoothing_spec(&self) -> &SmoothingSpec {
         match &self.condition.solver {
             SolverSpec::Hc { smoothing } | SolverSpec::Sa { smoothing, .. } => smoothing,
-            SolverSpec::Eo { .. } => unreachable!(),
+            SolverSpec::Eo { .. } | SolverSpec::EoSa { .. } => unreachable!(),
         }
     }
     pub fn step(&mut self, cancel: &CancellationToken) -> Result<StepStatus> {
@@ -144,6 +160,7 @@ impl<'a> Engine<'a> {
             SolverSpec::Hc { .. } => self.hc(cancel),
             SolverSpec::Sa { temperature, .. } => self.sa(*temperature, cancel),
             SolverSpec::Eo { .. } => self.eo(cancel),
+            SolverSpec::EoSa { temperature, .. } => self.eo_sa(*temperature, cancel),
         }
     }
     fn hc(&mut self, cancel: &CancellationToken) -> Result<StepStatus> {
@@ -346,6 +363,43 @@ impl<'a> Engine<'a> {
         self.applied_moves += 1;
         self.objective_evaluations += 1;
         self.search_evaluation = self.state.score(self.condition.alpha);
+        Ok(StepStatus::Continue)
+    }
+    /// One EO-SA step: an EO proposal (selection rule v2 on the current
+    /// ranking) judged by the SA Metropolis rule on the real objective. The
+    /// acceptance draw comes from its own stream, so the selection stream
+    /// advances exactly as in EO; a rejected move leaves the state and the
+    /// ranking unchanged.
+    fn eo_sa(&mut self, t: f64, cancel: &CancellationToken) -> Result<StepStatus> {
+        let eo = self
+            .eo
+            .as_mut()
+            .expect("EO-SA conditions initialize the EO selector");
+        let mv = eo.select(
+            self.graph,
+            &self.state,
+            self.condition.neighborhood,
+            &mut self.select_rng,
+            &mut self.fitness_values,
+        )?;
+        cancel.check()?;
+        let next = smoothing::move_score(&self.state, self.graph, mv, self.condition.alpha);
+        self.objective_evaluations += 1;
+        if !next.is_finite() {
+            return Err(Error::msg("non-finite search evaluation"));
+        }
+        let accept_rng = self
+            .accept_rng
+            .as_mut()
+            .expect("EO-SA conditions initialize the acceptance stream");
+        let delta = next - self.search_evaluation;
+        let accept = delta < 0.0 || (t > 0.0 && accept_rng.r#gen::<f64>() < (-delta / t).exp());
+        if accept {
+            smoothing::apply(&mut self.state, self.graph, mv);
+            eo.applied(self.graph, &self.state, mv, &mut self.fitness_values);
+            self.search_evaluation = next;
+            self.applied_moves += 1;
+        }
         Ok(StepStatus::Continue)
     }
 }
