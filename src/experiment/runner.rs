@@ -8,7 +8,7 @@ use crate::experiment::result::{
     SolutionId,
 };
 use crate::fitness::FitnessRegistry;
-use crate::graph_partition::{Graph, PartitionState};
+use crate::graph_partition::{BestImprovement, Graph, Move, NonFinite, PartitionState};
 use crate::optimization::{CancellationToken, rng_for};
 use crate::smoothing;
 use crate::solvers::{Engine, StepStatus};
@@ -550,54 +550,31 @@ fn basin(
         *evals += 1;
         state.score(c.alpha)
     };
+    // Scratch buffers shared by every real-objective scan of this descent.
+    let mut real_scan = BestImprovement::new(c.neighborhood, c.alpha, NonFinite::Compare);
     let termination = loop {
         if steps >= c.measurement.max_basin_steps {
             break BasinTermination::StepLimit;
         }
         steps += 1;
-        let mut choice = None;
-        let mut best = current;
-        let mut ties = 0u64;
-        for (i, mv) in smoothing::moves_cancellable(&state, c.neighborhood, cancel)?
-            .into_iter()
-            .enumerate()
-        {
-            if i & 1023 == 0 {
-                cancel.check()?
-            }
-            let x = if let Some(s) = spec {
-                let mut candidate = state.clone();
-                smoothing::apply(&mut candidate, graph, mv);
-                let mut evaluation_rng = fixed_rng.clone();
-                smoothing::evaluate(
-                    &candidate,
-                    graph,
-                    c.alpha,
-                    c.neighborhood,
-                    s,
-                    evaluation_rng.as_mut(),
-                    cancel,
-                    evals,
-                )?
-            } else {
-                *evals += 1;
-                // Evaluate the same resulting integer cut/size counts without
-                // cloning or applying a move that will usually be discarded.
-                smoothing::move_score(&state, graph, mv, c.alpha)
-            };
-            if x < best {
-                best = x;
-                choice = Some(mv);
-                ties = 1;
-            } else if choice.is_some() && x == best {
-                ties += 1;
-                if rand::Rng::gen_range(tie_rng, 0..ties) == 0 {
-                    choice = Some(mv);
-                }
-            }
-        }
-        match choice {
-            Some(mv) => {
+        let found = match spec {
+            // The same candidates, rule, tie draws and evaluation count as
+            // scoring every move with `smoothing::move_score`.
+            None => real_scan.scan(graph, &state, current, tie_rng, cancel, evals)?,
+            Some(s) => smoothed_scan(
+                graph,
+                c,
+                &state,
+                s,
+                fixed_rng.as_ref(),
+                current,
+                tie_rng,
+                cancel,
+                evals,
+            )?,
+        };
+        match found {
+            Some((mv, best)) => {
                 smoothing::apply(&mut state, graph, mv);
                 current = best
             }
@@ -615,6 +592,57 @@ fn basin(
         },
         state,
     ))
+}
+
+/// One best-improvement scan of [`basin`] on the smoothed objective `spec`:
+/// every move in canonical order, each candidate state evaluated with a fresh
+/// copy of `fixed_rng`. Returns the chosen move and its smoothed value.
+fn smoothed_scan(
+    graph: &Graph,
+    c: &Condition,
+    state: &PartitionState,
+    spec: &SmoothingSpec,
+    fixed_rng: Option<&Mt19937GenRand64>,
+    current: f64,
+    tie_rng: &mut Mt19937GenRand64,
+    cancel: &CancellationToken,
+    evals: &mut u64,
+) -> Result<Option<(Move, f64)>> {
+    let mut choice = None;
+    let mut best = current;
+    let mut ties = 0u64;
+    for (i, mv) in smoothing::moves_cancellable(state, c.neighborhood, cancel)?
+        .into_iter()
+        .enumerate()
+    {
+        if i & 1023 == 0 {
+            cancel.check()?
+        }
+        let mut candidate = state.clone();
+        smoothing::apply(&mut candidate, graph, mv);
+        let mut evaluation_rng = fixed_rng.cloned();
+        let x = smoothing::evaluate(
+            &candidate,
+            graph,
+            c.alpha,
+            c.neighborhood,
+            spec,
+            evaluation_rng.as_mut(),
+            cancel,
+            evals,
+        )?;
+        if x < best {
+            best = x;
+            choice = Some(mv);
+            ties = 1;
+        } else if choice.is_some() && x == best {
+            ties += 1;
+            if rand::Rng::gen_range(tie_rng, 0..ties) == 0 {
+                choice = Some(mv);
+            }
+        }
+    }
+    Ok(choice.map(|mv| (mv, best)))
 }
 
 #[cfg(test)]

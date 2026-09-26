@@ -2,7 +2,7 @@ use super::eo::Eo;
 use crate::error::{Error, Result};
 use crate::experiment::config::{Condition, Neighborhood, SmoothingSpec, SolverSpec};
 use crate::fitness::FitnessRegistry;
-use crate::graph_partition::{Graph, Move, PartitionState};
+use crate::graph_partition::{BestImprovement, Graph, Move, NonFinite, PartitionState};
 use crate::optimization::{CancellationToken, rng_for};
 use crate::smoothing;
 use rand::{Rng, seq::SliceRandom};
@@ -25,6 +25,8 @@ pub struct Engine<'a> {
     /// Metropolis acceptance draws of `eo_sa`; `None` for the other solvers.
     accept_rng: Option<Mt19937GenRand64>,
     eo: Option<Eo>,
+    /// Scratch of the real-objective HC scan, reused across steps.
+    best_improvement: BestImprovement,
     pub objective_evaluations: u64,
     pub fitness_values: u64,
     pub applied_moves: u64,
@@ -111,6 +113,11 @@ impl<'a> Engine<'a> {
                 ])
             }),
             eo: None,
+            best_improvement: BestImprovement::new(
+                condition.neighborhood,
+                condition.alpha,
+                NonFinite::Reject,
+            ),
             objective_evaluations: 0,
             fitness_values: 0,
             applied_moves: 0,
@@ -158,8 +165,33 @@ impl<'a> Engine<'a> {
         }
     }
     fn hc(&mut self, cancel: &CancellationToken) -> Result<StepStatus> {
-        let list = smoothing::moves_cancellable(&self.state, self.condition.neighborhood, cancel)?;
         let spec = self.smoothing_spec().clone();
+        if matches!(
+            spec,
+            SmoothingSpec::None | SmoothingSpec::WeightedAverage { k: 0 }
+        ) {
+            // Real move scores: the same candidates, rule, tie draws,
+            // evaluation count and non-finite check as scoring every move with
+            // `smoothing::move_score`.
+            let found = self.best_improvement.scan(
+                self.graph,
+                &self.state,
+                self.search_evaluation,
+                &mut self.tie_rng,
+                cancel,
+                &mut self.objective_evaluations,
+            )?;
+            return Ok(match found {
+                Some((mv, best)) => {
+                    smoothing::apply(&mut self.state, self.graph, mv);
+                    self.search_evaluation = best;
+                    self.applied_moves += 1;
+                    StepStatus::Continue
+                }
+                None => StepStatus::LocalOptimum,
+            });
+        }
+        let list = smoothing::moves_cancellable(&self.state, self.condition.neighborhood, cancel)?;
         if matches!(spec, SmoothingSpec::RandomKAverage { .. }) {
             self.search_evaluation = smoothing::evaluate(
                 &self.state,
@@ -172,10 +204,6 @@ impl<'a> Engine<'a> {
                 &mut self.objective_evaluations,
             )?;
         }
-        let real_move_scores = matches!(
-            spec,
-            SmoothingSpec::None | SmoothingSpec::WeightedAverage { k: 0 }
-        );
         let mut best = self.search_evaluation;
         let mut choice = None;
         let mut ties = 0u64;
@@ -183,25 +211,19 @@ impl<'a> Engine<'a> {
             if i & 1023 == 0 {
                 cancel.check()?
             }
-            let x = if real_move_scores {
-                let x = smoothing::move_score(&self.state, self.graph, mv, self.condition.alpha);
-                self.objective_evaluations += 1;
-                x
-            } else {
-                smoothing::apply(&mut self.state, self.graph, mv);
-                let evaluated = smoothing::evaluate(
-                    &self.state,
-                    self.graph,
-                    self.condition.alpha,
-                    self.condition.neighborhood,
-                    &spec,
-                    Some(&mut self.smooth_rng),
-                    cancel,
-                    &mut self.objective_evaluations,
-                );
-                smoothing::apply(&mut self.state, self.graph, mv);
-                evaluated?
-            };
+            smoothing::apply(&mut self.state, self.graph, mv);
+            let evaluated = smoothing::evaluate(
+                &self.state,
+                self.graph,
+                self.condition.alpha,
+                self.condition.neighborhood,
+                &spec,
+                Some(&mut self.smooth_rng),
+                cancel,
+                &mut self.objective_evaluations,
+            );
+            smoothing::apply(&mut self.state, self.graph, mv);
+            let x = evaluated?;
             if !x.is_finite() {
                 return Err(Error::msg("non-finite search evaluation"));
             }
