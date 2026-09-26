@@ -3,9 +3,11 @@
 最適Θの選択による楽観的な偏りを避けるため、シードを2分割して交差検証する(0-3で選んで4-7で評価し、逆も行って平均する)。
 --summary を付けると、グラフ×手法×Θごとの平均・標準誤差・受理率をTSVで書き出す。
 
+複数の出力(例: シードを追加した試走)をカンマ区切りで渡すと、まとめて集計する。
+
 使い方:
-    python analyze.py <pilot.tsv> [checkpoint(既定 1000000)]
-    python analyze.py <pilot.tsv> --summary <out.tsv>
+    python analyze.py <pilot.tsv[,more.tsv]> [checkpoint(既定 1000000)] [--window lo,hi] [--variants a,b,...]
+    python analyze.py <pilot.tsv[,more.tsv]> --summary <out.tsv>
 """
 
 import collections
@@ -16,10 +18,18 @@ import sys
 ORDER = ["none", "rk1", "rk4", "nsm_rho1", "nsm_rho0.5", "nsm_erosion", "hk_tau0.5", "hk_tau2", "hk_sched"]
 
 
-def load(path):
+def load(paths, window=None, variants=None, graphs=None):
     rows = collections.defaultdict(lambda: collections.defaultdict(dict))
-    for r in csv.DictReader(open(path, encoding="utf-8"), delimiter="\t"):
-        rows[r["step"]][(r["graph"], r["variant"])].setdefault(float(r["theta"]), {})[int(r["seed"])] = r
+    for path in paths.split(","):
+        for r in csv.DictReader(open(path, encoding="utf-8"), delimiter="\t"):
+            theta = float(r["theta"])
+            if window and not (window[0] - 1e-9 <= theta <= window[1] + 1e-9):
+                continue
+            if variants and r["variant"] not in variants:
+                continue
+            if graphs and not any(g in r["graph"] for g in graphs):
+                continue
+            rows[r["step"]][(r["graph"], r["variant"])].setdefault(theta, {})[int(r["seed"])] = r
     return rows
 
 
@@ -92,9 +102,22 @@ def summary(rows, out):
                 f.write(f"{g}\t{v}\t{t:.2f}\t{len(seeds)}\t{mean(b5):.3f}\t{mean(b6):.3f}\t{se(b6):.3f}\t{mean(real):.3f}\t{mean(acc):.5f}\n")
 
 
+def option(name):
+    if name in sys.argv:
+        return sys.argv[sys.argv.index(name) + 1]
+    return None
+
+
 if __name__ == "__main__":
-    data = load(sys.argv[1])
-    if len(sys.argv) > 3 and sys.argv[2] == "--summary":
-        summary(data, sys.argv[3])
+    window = option("--window")
+    window = tuple(map(float, window.split(","))) if window else None
+    variants = option("--variants")
+    variants = variants.split(",") if variants else None
+    graphs = option("--graphs")
+    graphs = graphs.split(",") if graphs else None
+    data = load(sys.argv[1], window, variants, graphs)
+    if option("--summary"):
+        summary(data, option("--summary"))
     else:
-        table(data, sys.argv[2] if len(sys.argv) > 2 else "1000000")
+        step = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("--") else "1000000"
+        table(data, step)
