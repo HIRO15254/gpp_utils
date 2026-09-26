@@ -66,7 +66,7 @@ pub struct Engine<'a> {
     /// `(-delta / t).exp()` of the real-objective SA and of EO-SA at the
     /// job's temperature; `None` for the other solvers.
     metropolis: Option<MetropolisFactor>,
-    /// Scratch of the real-objective HC scan, reused across steps.
+    /// The real-objective HC scan; tracks `state` from the first HC step on.
     best_improvement: BestImprovement,
     pub objective_evaluations: u64,
     pub fitness_values: u64,
@@ -288,7 +288,12 @@ impl<'a> Engine<'a> {
     /// evaluation count and non-finite check as scoring every move with
     /// `smoothing::move_score`.
     fn hc_real(&mut self, cancel: &CancellationToken) -> Result<StepStatus> {
-        let found = self.best_improvement.scan(
+        // Only this method changes the state of a real-objective HC engine,
+        // so the data tracked from the first step on stays in step with it.
+        if !self.best_improvement.is_tracking() {
+            self.best_improvement.track(self.graph, &self.state);
+        }
+        let found = self.best_improvement.scan_tracked(
             self.graph,
             &self.state,
             self.search_evaluation,
@@ -298,7 +303,8 @@ impl<'a> Engine<'a> {
         )?;
         Ok(match found {
             Some((mv, best)) => {
-                smoothing::apply(&mut self.state, self.graph, mv);
+                // `smoothing::apply` plus the tracked data.
+                self.best_improvement.apply(self.graph, &mut self.state, mv);
                 self.search_evaluation = best;
                 self.applied_moves += 1;
                 StepStatus::Continue

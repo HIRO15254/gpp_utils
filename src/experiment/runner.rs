@@ -558,8 +558,12 @@ fn basin(
         *evals += 1;
         state.score(c.alpha)
     };
-    // Scratch buffers shared by every real-objective scan of this descent.
+    // Every real-objective scan of this descent works on data tracked from
+    // `state` and updated with each applied move.
     let mut real_scan = BestImprovement::new(c.neighborhood, c.alpha, NonFinite::Compare);
+    if spec.is_none() {
+        real_scan.track(graph, &state);
+    }
     let termination = loop {
         if steps >= c.measurement.max_basin_steps {
             break BasinTermination::StepLimit;
@@ -568,7 +572,7 @@ fn basin(
         let found = match spec {
             // The same candidates, rule, tie draws and evaluation count as
             // scoring every move with `smoothing::move_score`.
-            None => real_scan.scan(graph, &state, current, tie_rng, cancel, evals)?,
+            None => real_scan.scan_tracked(graph, &state, current, tie_rng, cancel, evals)?,
             Some(s) => smoothed_scan(
                 graph,
                 c,
@@ -583,7 +587,12 @@ fn basin(
         };
         match found {
             Some((mv, best)) => {
-                smoothing::apply(&mut state, graph, mv);
+                if spec.is_none() {
+                    // `smoothing::apply` plus the tracked data.
+                    real_scan.apply(graph, &mut state, mv);
+                } else {
+                    smoothing::apply(&mut state, graph, mv);
+                }
                 current = best
             }
             None => break BasinTermination::LocalOptimum,

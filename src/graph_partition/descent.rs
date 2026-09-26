@@ -17,9 +17,14 @@
 //! scan without materializing the move list. A move with `x > best`, or with
 //! `x >= best` while there is no choice yet, changes neither `best`, `choice`,
 //! `ties` nor the tie RNG. Such moves are skipped when an integer bound proves
-//! it; the other moves are scored with the same [`PartitionState`] methods in
-//! canonical order, so the result, the tie draws and the evaluation count equal
-//! those of the full scan.
+//! it; the other moves are scored with the expression of the
+//! [`PartitionState`] methods in canonical order, so the result, the tie draws
+//! and the evaluation count equal those of the full scan.
+//!
+//! A descent (one basin or one HC run) keeps per-vertex gains and gain-level
+//! bitsets of its partition, updated in `O(degree)` per applied move, so a
+//! scan reads one bitset word per 64 vertices (Flip) or per 64 vertices of a
+//! row (Swap) instead of every vertex or every pair; see [`Tracker`].
 
 use super::{Graph, Move, PartitionState};
 use crate::error::{Error, Result};
@@ -30,6 +35,11 @@ use rand_mt::Mt19937GenRand64;
 
 /// Logical candidates (including skipped ones) between cancellation checks.
 const CHECK_INTERVAL: usize = 1024;
+const _: () = assert!(CHECK_INTERVAL.is_multiple_of(64));
+
+/// Gains beyond `±LEVEL_CAP` share the outermost levels of [`Tracker`]; this
+/// bounds its memory for graphs with hubs.
+const LEVEL_CAP: i64 = 64;
 
 /// What a scan does with a non-finite candidate score.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -108,14 +118,49 @@ struct Bound {
 }
 
 impl Bound {
+    /// `f(s)`: the bits of [`PartitionState::flip_score`] for `s = gain(v)`
+    /// and of [`PartitionState::swap_score`] for
+    /// `s = gain(a) + gain(b) + 2 * adjacent` under the matching penalty.
+    #[inline(always)]
+    fn score(&self, s: i64) -> f64 {
+        (self.cut + s) as f64 + self.penalty
+    }
+
     /// The largest `s` in `-radius..=radius` with `rule.may_change(f(s))`, or
     /// `-radius - 1` if there is none. Within the range, `s <= limit` holds
     /// exactly when `rule.may_change(f(s))` does.
     fn limit(&self, rule: &Rule) -> i64 {
-        let admissible = |s: i64| rule.may_change((self.cut + s) as f64 + self.penalty);
+        let admissible = |s: i64| rule.may_change(self.score(s));
         let (mut yes, mut no) = (-self.radius - 1, self.radius + 1);
         // Invariant: every `s <= yes` in range is admissible and no `s >= no`
-        // is; the sentinels themselves are never evaluated.
+        // is; the sentinels themselves are never evaluated. The first two
+        // probes sit at the prefix end estimated in floating point (`f(s)`
+        // is about `cut + s + penalty`); truncation instead of `floor` and
+        // rounding can put it one off, which the second probe covers. Every
+        // probe evaluates the exact predicate and the bisection finishes any
+        // other case, so the estimate only saves probes.
+        let guess = ((rule.best - self.penalty) as i64)
+            .saturating_sub(self.cut)
+            .clamp(-self.radius, self.radius);
+        if admissible(guess) {
+            yes = guess;
+            if guess + 1 < no {
+                if admissible(guess + 1) {
+                    yes = guess + 1;
+                } else {
+                    no = guess + 1;
+                }
+            }
+        } else {
+            no = guess;
+            if guess - 1 > yes {
+                if admissible(guess - 1) {
+                    yes = guess - 1;
+                } else {
+                    no = guess - 1;
+                }
+            }
+        }
         while no - yes > 1 {
             let mid = yes + (no - yes) / 2;
             if admissible(mid) {
@@ -128,21 +173,249 @@ impl Bound {
     }
 }
 
+/// Incremental data of the partition a descent works on.
+///
+/// With `gain(v) = degree(v) - 2 * cuts_at[v]` (the change of the cut size
+/// when `v` flips) and `level(v) = clamp(gain(v), -cap - 1, cap + 1) + cap + 1`
+/// for `cap = min(max degree, level cap)`, bit `v % 64` of
+/// `levels[i * words + v / 64]` is set exactly when `level(v) <= i`. For
+/// `-cap - 1 <= t <= cap` the set of level [`Self::level`]`(t)` is therefore
+/// exactly `{v : gain(v) <= t}`, and for any `t` it contains that set (the
+/// top level holds every vertex). The scans use it only to skip vertices
+/// and compare the exact gain of every vertex they take from it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Tracker {
+    /// Whether the fields describe a partition.
+    active: bool,
+    n: usize,
+    words: usize,
+    /// The largest degree; every gain lies in `-dmax..=dmax`.
+    dmax: i64,
+    cap: i64,
+    gain: Vec<i64>,
+    /// Bit `v % 64` of word `v / 64` is set when `v` is in group A.
+    in_a: Vec<u64>,
+    levels: Vec<u64>,
+    /// Whether `count_b` is kept (Swap scans need it).
+    counts: bool,
+    /// `count_b[g + dmax]`: vertices of group B with gain `g`; empty unless
+    /// `counts`.
+    count_b: Vec<u32>,
+}
+
+impl Tracker {
+    /// Rebuild all fields for `state`.
+    fn track(&mut self, graph: &Graph, state: &PartitionState, level_cap: i64, counts: bool) {
+        let partition = state.partition();
+        let cuts = state.cuts_at();
+        let n = partition.len();
+        let words = n.div_ceil(64);
+        self.active = true;
+        self.n = n;
+        self.words = words;
+        let mut dmax = 0;
+        self.gain.clear();
+        self.gain.extend(cuts.iter().enumerate().map(|(v, &c)| {
+            let degree = graph.degree(v) as i64;
+            dmax = dmax.max(degree);
+            degree - 2 * c
+        }));
+        self.dmax = dmax;
+        self.cap = dmax.min(level_cap);
+        self.counts = counts;
+        self.count_b.clear();
+        if counts {
+            self.count_b.resize(2 * dmax as usize + 1, 0);
+        }
+        self.in_a.clear();
+        self.in_a.resize(words, 0);
+        self.levels.clear();
+        self.levels.resize(self.level_count() * words, 0);
+        let cap = self.cap;
+        for (w, (sides, gains)) in partition.chunks(64).zip(self.gain.chunks(64)).enumerate() {
+            let mut in_a_word = 0;
+            for (j, (&in_a, &g)) in sides.iter().zip(gains).enumerate() {
+                in_a_word |= u64::from(in_a) << j;
+                if counts && !in_a {
+                    self.count_b[(g + dmax) as usize] += 1;
+                }
+                let level = (g.clamp(-cap - 1, cap + 1) + cap + 1) as usize;
+                self.levels[level * words + w] |= 1 << j;
+            }
+            self.in_a[w] = in_a_word;
+        }
+        // Each level so far holds the vertices exactly at it; accumulate.
+        if words > 0 {
+            for i in 1..self.level_count() {
+                let (lower, upper) = self.levels.split_at_mut(i * words);
+                for (word, below) in upper[..words].iter_mut().zip(&lower[(i - 1) * words..]) {
+                    *word |= below;
+                }
+            }
+        }
+    }
+
+    fn level_count(&self) -> usize {
+        2 * self.cap as usize + 3
+    }
+
+    /// The level whose set contains `{v : gain(v) <= t}`, exactly for
+    /// `-cap - 1 <= t <= cap` (see the type documentation).
+    #[inline(always)]
+    fn level(&self, t: i64) -> usize {
+        (t.clamp(-self.cap - 1, self.cap + 1) + self.cap + 1) as usize
+    }
+
+    /// Word `w` of the set of level `level`.
+    #[inline(always)]
+    fn word(&self, level: usize, w: usize) -> u64 {
+        self.levels[level * self.words + w]
+    }
+
+    /// The words of the set of level `level`.
+    #[inline(always)]
+    fn set(&self, level: usize) -> &[u64] {
+        &self.levels[level * self.words..][..self.words]
+    }
+
+    /// The smallest gain in group B; requires `counts` and a nonempty group.
+    fn min_gain_b(&self) -> i64 {
+        let first = self.count_b.iter().position(|&c| c > 0);
+        first.expect("group B is not empty") as i64 - self.dmax
+    }
+
+    /// Update the level sets for the gain of `v` changing from `g` to `h`.
+    #[inline(always)]
+    fn relevel(&mut self, v: usize, g: i64, h: i64) {
+        let (from, to) = (self.level(g), self.level(h));
+        let (words, bit) = (self.words, 1u64 << (v % 64));
+        // `v` joins the sets of levels `to..from` or leaves those of
+        // `from..to`.
+        let mut i = from.min(to) * words + v / 64;
+        let end = from.max(to) * words;
+        if to < from {
+            while i < end {
+                self.levels[i] |= bit;
+                i += words;
+            }
+        } else {
+            while i < end {
+                self.levels[i] &= !bit;
+                i += words;
+            }
+        }
+    }
+
+    /// Record the flip of `v` (as [`PartitionState::apply_flip`] does).
+    #[inline]
+    fn flip(&mut self, graph: &Graph, v: usize) {
+        let dmax = self.dmax;
+        let (w, bit) = (v / 64, 1u64 << (v % 64));
+        let was_in_a = self.in_a[w] & bit != 0;
+        let g = self.gain[v];
+        // `v` changes group and its cut edges become uncut and vice versa.
+        if self.counts {
+            if was_in_a {
+                self.count_b[(dmax - g) as usize] += 1;
+            } else {
+                self.count_b[(g + dmax) as usize] -= 1;
+            }
+        }
+        self.relevel(v, g, -g);
+        self.gain[v] = -g;
+        self.in_a[w] ^= bit;
+        // No gain is clamped when `cap == dmax`: then `level(g) = g + cap + 1`,
+        // and a gain change by 2 moves a vertex across exactly two levels.
+        let unclamped = self.cap == dmax;
+        let words = self.words;
+        for &u in graph.neighbors(v) {
+            let (wu, bit) = (u / 64, 1u64 << (u % 64));
+            let in_a = self.in_a[wu] & bit != 0;
+            let g = self.gain[u];
+            // The edge to `u` becomes cut when `u` is in the group `v` left.
+            let drop = in_a == was_in_a;
+            let h = if drop { g - 2 } else { g + 2 };
+            if self.counts && !in_a {
+                self.count_b[(g + dmax) as usize] -= 1;
+                self.count_b[(h + dmax) as usize] += 1;
+            }
+            if unclamped {
+                // `u` joins the sets of levels `level(h)` and `level(h) + 1`
+                // (drop) or leaves those of `level(g)` and `level(g) + 1`.
+                let first = (g.min(h) + self.cap + 1) as usize * words + wu;
+                let joined = if drop { bit } else { 0 };
+                for i in [first, first + words] {
+                    self.levels[i] = self.levels[i] & !bit | joined;
+                }
+            } else {
+                self.relevel(u, g, h);
+            }
+            self.gain[u] = h;
+        }
+    }
+
+    /// Panics unless the fields equal those rebuilt for `state`.
+    #[cfg(debug_assertions)]
+    fn assert_tracks(&self, graph: &Graph, state: &PartitionState, level_cap: i64) {
+        let mut fresh = Tracker::default();
+        fresh.track(graph, state, level_cap, self.counts);
+        assert!(*self == fresh, "the descent data does not track the state");
+    }
+}
+
+/// The cancellation checks of a Swap scan that visits only some rows.
+///
+/// The full scan checks before the rows (ranks in group A) `period - 1`,
+/// `2 * period - 1`, ... with `period = ceil(CHECK_INTERVAL / row_len)`: before
+/// the row with which the rows since the last check reach [`CHECK_INTERVAL`]
+/// candidates. A scan that skips rows makes each such check before the next
+/// row it visits or, after its last one, before counting.
+struct RowChecks {
+    period: usize,
+    /// The first check row not yet covered by a check.
+    next: usize,
+}
+
+impl RowChecks {
+    fn new(row_len: usize) -> Self {
+        let period = CHECK_INTERVAL.div_ceil(row_len);
+        Self {
+            period,
+            next: period - 1,
+        }
+    }
+
+    /// Whether to check before visiting the row of rank `rank` (ranks
+    /// increase): true when a check row in `..=rank` is not yet covered.
+    #[inline]
+    fn due(&mut self, rank: usize) -> bool {
+        if rank < self.next {
+            return false;
+        }
+        // The first check row after `rank`.
+        self.next = ((rank + 1) / self.period + 1) * self.period - 1;
+        true
+    }
+
+    /// Whether to check after the last visited row of a scan with `rows` rows.
+    fn due_at_end(&self, rows: usize) -> bool {
+        self.next < rows
+    }
+}
+
 /// Exact best-improvement scan of the real objective with reusable buffers.
 ///
 /// One value serves any number of scans under a fixed neighborhood and
-/// `alpha`, e.g. every scan of one basin descent or of one HC run.
+/// `alpha`. A descent (one basin or one HC run) calls [`Self::track`] once,
+/// then [`Self::scan_tracked`] and, for each chosen move, [`Self::apply`].
 #[derive(Clone, Debug)]
 pub(crate) struct BestImprovement {
     neighborhood: Neighborhood,
     alpha: f64,
     non_finite: NonFinite,
-    /// Group A vertices (`partition[v] == true`) in ascending order.
-    side_a: Vec<usize>,
-    /// Group B vertices in ascending order.
-    side_b: Vec<usize>,
-    /// `gain(b)` of each entry of `side_b`.
-    gain_b: Vec<i64>,
+    /// [`LEVEL_CAP`]; tests lower it to exercise clamped levels.
+    level_cap: i64,
+    tracker: Tracker,
     /// Candidates scored by the last scan.
     #[cfg(test)]
     scored: u64,
@@ -154,34 +427,43 @@ impl BestImprovement {
             neighborhood,
             alpha,
             non_finite,
-            side_a: Vec::new(),
-            side_b: Vec::new(),
-            gain_b: Vec::new(),
+            level_cap: LEVEL_CAP,
+            tracker: Tracker::default(),
             #[cfg(test)]
             scored: 0,
         }
     }
 
-    /// One scan of the whole neighborhood of `state`, starting from
-    /// `best = start`.
-    ///
-    /// Returns the chosen move and its score, or `None` when no move improves
-    /// on `start`. The result and the tie RNG draws equal those of the full
-    /// scan described in the module documentation. `evaluations` advances by
-    /// the neighborhood size (`n` for Flip, `|A| * |B|` for Swap) when the
-    /// scan completes. Cancellation is checked first and then about every
-    /// [`CHECK_INTERVAL`] candidates.
-    ///
-    /// With `gain(v) = degree(v) - 2 * cuts_at[v]` and the balance penalty
-    /// `alpha * d as f64 * d as f64` of the resulting group sizes, the score
-    /// is `f(s) = (cut + s) as f64 + penalty` (see [`Bound`]) with
-    /// `s = gain(v)` for `Flip(v)` and `s = gain(a) + gain(b) + 2 * adjacent`
-    /// for `Swap(a, b)`. A Flip's penalty depends only on the side of `v`, and
-    /// no swap changes it. Because `f` is non-decreasing, a Flip with
-    /// `gain(v) > limit` and a Swap with `gain(a) + gain(b) > limit` (a lower
-    /// bound of its `s`) cannot change the rule and are skipped; `limit` is
-    /// recomputed whenever `best` drops. The remaining candidates are scored
-    /// with [`PartitionState::flip_score`] or [`PartitionState::swap_score`].
+    /// Whether [`Self::track`] has been called.
+    pub(crate) fn is_tracking(&self) -> bool {
+        self.tracker.active
+    }
+
+    /// Start tracking `state` for [`Self::scan_tracked`] and [`Self::apply`].
+    pub(crate) fn track(&mut self, graph: &Graph, state: &PartitionState) {
+        let counts = self.neighborhood == Neighborhood::Swap;
+        self.tracker.track(graph, state, self.level_cap, counts);
+    }
+
+    /// Apply `mv` to the tracked `state` (as [`crate::smoothing::apply`]) and
+    /// to the tracked data.
+    pub(crate) fn apply(&mut self, graph: &Graph, state: &mut PartitionState, mv: Move) {
+        match mv {
+            Move::Flip(v) => {
+                state.apply_flip(graph, v);
+                self.tracker.flip(graph, v);
+            }
+            Move::Swap(a, b) => {
+                state.apply_swap(graph, a, b);
+                self.tracker.flip(graph, a);
+                self.tracker.flip(graph, b);
+            }
+        }
+    }
+
+    /// [`Self::track`] `state`, then [`Self::scan_tracked`]: one scan of any
+    /// state (tests).
+    #[cfg(test)]
     pub(crate) fn scan(
         &mut self,
         graph: &Graph,
@@ -191,7 +473,54 @@ impl BestImprovement {
         cancel: &CancellationToken,
         evaluations: &mut u64,
     ) -> Result<Option<(Move, f64)>> {
+        self.track(graph, state);
+        self.scan_tracked(graph, state, start, tie_rng, cancel, evaluations)
+    }
+
+    /// One scan of the whole neighborhood of the tracked `state`, starting
+    /// from `best = start`. `state` must be the one passed to [`Self::track`],
+    /// changed since then only by [`Self::apply`] (checked in debug builds).
+    ///
+    /// Returns the chosen move and its score, or `None` when no move improves
+    /// on `start`. The result and the tie RNG draws equal those of the full
+    /// scan described in the module documentation. `evaluations` advances by
+    /// the neighborhood size (`n` for Flip, `|A| * |B|` for Swap) when the
+    /// scan completes. Cancellation is checked first and then wherever the
+    /// full scan checks it: before vertex `v` of a Flip scan when `v` is a
+    /// positive multiple of [`CHECK_INTERVAL`], and before the rows of a Swap
+    /// scan given by [`RowChecks`], where a check due at a skipped row is made
+    /// before the next visited row or before counting.
+    ///
+    /// With `gain(v) = degree(v) - 2 * cuts_at[v]` and the balance penalty
+    /// `alpha * d as f64 * d as f64` of the resulting group sizes, the score
+    /// is `f(s) = (cut + s) as f64 + penalty` (see [`Bound`]) with
+    /// `s = gain(v)` for `Flip(v)` and `s = gain(a) + gain(b) + 2 * adjacent`
+    /// for `Swap(a, b)`. A Flip's penalty depends only on the side of `v`, and
+    /// no swap changes it. Because `f` is non-decreasing, a Flip with
+    /// `gain(v) > limit` and a Swap with `gain(a) + gain(b) > limit` (a lower
+    /// bound of its `s`) cannot change the rule and are skipped; `limit` is
+    /// recomputed whenever `best` drops. The remaining candidates are found
+    /// from the gain-level bitsets in canonical order and scored with `f`,
+    /// which has the bits of [`PartitionState::flip_score`] or
+    /// [`PartitionState::swap_score`].
+    pub(crate) fn scan_tracked(
+        &mut self,
+        graph: &Graph,
+        state: &PartitionState,
+        start: f64,
+        tie_rng: &mut Mt19937GenRand64,
+        cancel: &CancellationToken,
+        evaluations: &mut u64,
+    ) -> Result<Option<(Move, f64)>> {
         cancel.check()?;
+        assert!(
+            self.tracker.active && self.tracker.n == state.partition().len(),
+            "scan_tracked needs the tracked state"
+        );
+        #[cfg(debug_assertions)]
+        {
+            self.tracker.assert_tracks(graph, state, self.level_cap);
+        }
         #[cfg(test)]
         {
             self.scored = 0;
@@ -211,9 +540,8 @@ impl BestImprovement {
         cancel: &CancellationToken,
         evaluations: &mut u64,
     ) -> Result<Option<(Move, f64)>> {
-        let partition = state.partition();
-        let cuts = state.cuts_at();
-        let n = partition.len();
+        let tracker = &self.tracker;
+        let n = tracker.n;
         let size_a = state.size_a();
         // The penalty `PartitionState::flip_score` computes for a vertex of
         // group B (index 0) or A (index 1). A group without vertices never
@@ -232,11 +560,12 @@ impl BestImprovement {
         // non-finite exactly when the penalty is: with `Reject`, the full scan
         // fails at the first vertex whose group has a non-finite penalty.
         let stop = match self.non_finite {
-            NonFinite::Reject => partition
+            NonFinite::Reject if !penalties.iter().all(|p| p.is_finite()) => state
+                .partition()
                 .iter()
                 .position(|&in_a| !penalties[usize::from(in_a)].is_finite())
                 .unwrap_or(n),
-            NonFinite::Compare => n,
+            _ => n,
         };
         let cut = state.cut_edges() as i64;
         let bounds = penalties.map(|penalty| Bound {
@@ -246,20 +575,43 @@ impl BestImprovement {
         });
         let mut rule = Rule::new(start);
         let mut limits = bounds.each_ref().map(|bound| bound.limit(&rule));
-        for (v, &in_a) in partition.iter().enumerate().take(stop) {
-            if v != 0 && v % CHECK_INTERVAL == 0 {
+        let mut levels = limits.map(|limit| tracker.level(limit));
+        for w in 0..stop.div_ceil(64) {
+            let base = w * 64;
+            if w != 0 && base.is_multiple_of(CHECK_INTERVAL) {
                 cancel.check()?;
             }
-            if graph.degree(v) as i64 - 2 * cuts[v] > limits[usize::from(in_a)] {
-                continue;
+            let in_a = tracker.in_a[w];
+            let candidates = |levels: [usize; 2]| {
+                tracker.word(levels[0], w) & !in_a | tracker.word(levels[1], w) & in_a
+            };
+            let mut bits = candidates(levels);
+            if stop - base < 64 {
+                bits &= (1u64 << (stop - base)) - 1;
             }
-            #[cfg(test)]
-            {
-                self.scored += 1;
-            }
-            let x = state.flip_score(graph, v, self.alpha);
-            if rule.consider(x, Move::Flip(v), tie_rng) {
-                limits = bounds.each_ref().map(|bound| bound.limit(&rule));
+            while bits != 0 {
+                let j = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let v = base + j;
+                let side = (in_a >> j & 1) as usize;
+                let gain = tracker.gain[v];
+                if gain > limits[side] {
+                    continue;
+                }
+                #[cfg(test)]
+                {
+                    self.scored += 1;
+                }
+                let x = bounds[side].score(gain);
+                debug_assert_eq!(
+                    x.to_bits(),
+                    state.flip_score(graph, v, self.alpha).to_bits()
+                );
+                if rule.consider(x, Move::Flip(v), tie_rng) {
+                    limits = bounds.each_ref().map(|bound| bound.limit(&rule));
+                    levels = limits.map(|limit| tracker.level(limit));
+                    bits &= candidates(levels);
+                }
             }
         }
         if stop < n {
@@ -279,24 +631,10 @@ impl BestImprovement {
         cancel: &CancellationToken,
         evaluations: &mut u64,
     ) -> Result<Option<(Move, f64)>> {
-        let cuts = state.cuts_at();
-        let gain = |v: usize| graph.degree(v) as i64 - 2 * cuts[v];
-        self.side_a.clear();
-        self.side_b.clear();
-        self.gain_b.clear();
-        let mut min_b = i64::MAX;
-        for (v, &in_a) in state.partition().iter().enumerate() {
-            if in_a {
-                self.side_a.push(v);
-            } else {
-                let g = gain(v);
-                self.side_b.push(v);
-                self.gain_b.push(g);
-                min_b = min_b.min(g);
-            }
-        }
-        let row_len = self.side_b.len();
-        let total = self.side_a.len() as u64 * row_len as u64;
+        let tracker = &self.tracker;
+        let rows = state.size_a();
+        let row_len = state.size_b();
+        let total = rows as u64 * row_len as u64;
         if total == 0 {
             return Ok(None);
         }
@@ -312,35 +650,63 @@ impl BestImprovement {
         let bound = Bound {
             cut: state.cut_edges() as i64,
             penalty,
-            radius: 2 * state.partition().len() as i64,
+            radius: 2 * tracker.n as i64,
         };
         let mut rule = Rule::new(start);
         let mut limit = bound.limit(&rule);
-        let mut unchecked = 0usize;
-        for &a in &self.side_a {
-            unchecked += row_len;
-            if unchecked >= CHECK_INTERVAL {
-                unchecked = 0;
-                cancel.check()?;
-            }
-            let ga = gain(a);
-            // Every candidate of the row has `s >= ga + min_b`.
-            if ga + min_b > limit {
-                continue;
-            }
-            for (&b, &gb) in self.side_b.iter().zip(&self.gain_b) {
-                if ga + gb > limit {
+        // Every candidate of the row of `a` has `s >= gain(a) + min_b`.
+        let min_b = tracker.min_gain_b();
+        let mut checks = RowChecks::new(row_len);
+        let mut rank_base = 0;
+        for w in 0..tracker.words {
+            let in_a = tracker.in_a[w];
+            let mut row_bits = tracker.word(tracker.level(limit - min_b), w) & in_a;
+            while row_bits != 0 {
+                let j = row_bits.trailing_zeros() as usize;
+                row_bits &= row_bits - 1;
+                let a = w * 64 + j;
+                let ga = tracker.gain[a];
+                if ga + min_b > limit {
                     continue;
                 }
-                #[cfg(test)]
-                {
-                    self.scored += 1;
+                let rank = rank_base + (in_a & ((1u64 << j) - 1)).count_ones() as usize;
+                if checks.due(rank) {
+                    cancel.check()?;
                 }
-                let x = state.swap_score(graph, a, b, self.alpha);
-                if rule.consider(x, Move::Swap(a, b), tie_rng) {
-                    limit = bound.limit(&rule);
+                // The level set holding every `b` with `ga + gain(b) <= limit`.
+                let mut set = tracker.set(tracker.level(limit - ga));
+                for (wb, &in_a_b) in tracker.in_a.iter().enumerate() {
+                    let mut bits = set[wb] & !in_a_b;
+                    while bits != 0 {
+                        let jb = bits.trailing_zeros() as usize;
+                        bits &= bits - 1;
+                        let b = wb * 64 + jb;
+                        let gb = tracker.gain[b];
+                        if ga + gb > limit {
+                            continue;
+                        }
+                        #[cfg(test)]
+                        {
+                            self.scored += 1;
+                        }
+                        let x = bound.score(ga + gb + 2 * i64::from(graph.has_edge(a, b)));
+                        debug_assert_eq!(
+                            x.to_bits(),
+                            state.swap_score(graph, a, b, self.alpha).to_bits()
+                        );
+                        if rule.consider(x, Move::Swap(a, b), tie_rng) {
+                            limit = bound.limit(&rule);
+                            set = tracker.set(tracker.level(limit - ga));
+                            bits &= set[wb];
+                        }
+                    }
                 }
+                row_bits &= tracker.word(tracker.level(limit - min_b), w);
             }
+            rank_base += in_a.count_ones() as usize;
+        }
+        if checks.due_at_end(rows) {
+            cancel.check()?;
         }
         *evaluations += total;
         Ok(rule.outcome())
@@ -754,3 +1120,10 @@ mod tests {
 #[cfg(test)]
 #[path = "descent_review_tests.rs"]
 mod review_tests;
+
+// Tracked descents (`track`, `scan_tracked`, `apply`) against a full scan on
+// many graphs, level caps and alphas; cancellation; HC and the runner against
+// the frozen 51577f9 engine and runner on larger graphs.
+#[cfg(test)]
+#[path = "descent_tracked_tests.rs"]
+mod tracked_tests;
