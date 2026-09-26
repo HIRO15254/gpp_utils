@@ -121,7 +121,7 @@ noneおよびweighted_averageの有効K=0では、both指定でもbasin_realだ�
 
 ベイスン値は、現在スコアだけからは求められず、ベイスン終点の分割も保存しないため保持する。測定のために訪問した解を探索のbest_realへ混ぜない。
 
-`basin_real`と`basin_smoothed`は現行解を始点とし、`measurement.basin`で選ぶ。`basin_best`は独立した選択なので`basin=none`でも保存できる。同じ暫定分割が続く計測点では直前の完了した`basin_best`を再利用する。専用の同点処理RNGはグラフ内容・近傍・alpha・探索シード・暫定分割・用途ラベルから導出し、計測ステップ・計算予算・ソルバーに依存させない。実評価値は始点の暫定解以下でなければならず、同じ暫定分割を参照する完了計測はビット単位で同じ値を持つ。終点の分割・群サイズ差は保存しない。診断のstepsは初回計算時の走査数であり、キャッシュ再利用時の追加計算量ではない。累積の目的関数実計算数には再利用を含めない。
+`basin_real`と`basin_smoothed`は現行解を始点とし、`measurement.basin`で選ぶ。`basin_best`は独立した選択なので`basin=none`でも保存できる。同じ暫定分割が続く計測点では直前の完了した`basin_best`を再利用する。専用の同点処理RNGはグラフ内容・近傍・alpha・探索シード・暫定分割・用途ラベルから導出し、計測ステップ・計算予算・ソルバーに依存させない。実評価値は始点の暫定解以下でなければならず、同じ暫定分割を参照する完了計測はビット単位で同じ値を持つ。終点の分割・群サイズ差は保存しない。診断のstepsは初回計算時の走査数であり、キャッシュ再利用時の追加計算量ではない。累積の目的関数評価回数には再利用を含めない。
 
 暫定解ベイスンが有効な完了レコードでは`basin_best`を必須とする。中断時の最後の未完成計測は他の追加計測と同様に省略し、確定済みの現行解・暫定解参照だけを保存できる。未完成値をキャッシュに登録しない。
 
@@ -130,7 +130,7 @@ noneおよびweighted_averageの有効K=0では、both指定でもbasin_realだ�
 measurement.diagnosticsの既定値はfalse。trueの実行だけ、結果のdiagnosticsに以下の最終累積値を保存する。診断設定は結果条件の識別に含め、無効な結果を有効な結果として再利用しない。探索用RNGには影響させない。
 
 - applied_moves（探索で適用した移動数。Swapは1移動）。
-- objective_evaluations_search、objective_evaluations_measurement（実際に計算した目的関数値の数）。
+- objective_evaluations_search、objective_evaluations_measurement（目的関数値の論理的な評価回数）。平滑化なしのHCと実評価ベイスンの近傍走査は、結果を変えない下界で計算を省いた候補も含めて、完了した走査ごとに近傍の候補数を数える（中断で完了しなかった走査は数えない）。平滑化した評価は計算した候補ごとに数える。
 - fitness_values_computed_search（EO・EO-SAのみ。組み込み適応度の差分更新索引経路は初期構築のn回に、ステップごとの更新頂点数（Flip: 1+deg(v)、Swap: 2+deg(a)+deg(b)）を加えた数。カスタム適応度の汎用経路は毎ステップn。いずれもキャッシュ参照は含まない）。
 - search_ms、measurement_ms（時間内訳）。
 

@@ -36,52 +36,6 @@ fn builtin_kind(spec: &FitnessSpec) -> BuiltinFitness {
     }
 }
 
-#[test]
-fn member_set_preserves_rank_order_across_bitset_threshold() {
-    let mut members = MemberSet::new();
-    for v in (0..=BITSET_MEMBER_THRESHOLD as u32).rev() {
-        members.insert(v, 128);
-    }
-    assert!(matches!(members, MemberSet::Bits { len: 33, .. }));
-    assert_eq!(
-        (0..members.len())
-            .map(|rank| members.select(rank))
-            .collect::<Vec<_>>(),
-        (0..=BITSET_MEMBER_THRESHOLD).collect::<Vec<_>>()
-    );
-
-    members.remove(7);
-    assert!(matches!(members, MemberSet::Small(_)));
-    let expected = (0..=BITSET_MEMBER_THRESHOLD)
-        .filter(|&v| v != 7)
-        .collect::<Vec<_>>();
-    assert_eq!(
-        (0..members.len())
-            .map(|rank| members.select(rank))
-            .collect::<Vec<_>>(),
-        expected
-    );
-
-    members.insert(96, 128);
-    assert!(matches!(members, MemberSet::Bits { len: 33, .. }));
-    assert_eq!(members.select(32), 96);
-}
-
-#[test]
-fn member_set_keeps_vector_storage_above_bitset_graph_limit() {
-    let mut members = MemberSet::new();
-    for v in (0..=BITSET_MEMBER_THRESHOLD as u32).rev() {
-        members.insert(v, MAX_BITSET_VERTICES + 1);
-    }
-    assert!(matches!(members, MemberSet::Small(_)));
-    assert_eq!(
-        (0..members.len())
-            .map(|rank| members.select(rank))
-            .collect::<Vec<_>>(),
-        (0..=BITSET_MEMBER_THRESHOLD).collect::<Vec<_>>()
-    );
-}
-
 /// Degrees 0 to 6, a triangle, a path and six isolated vertices.
 fn tie_graph() -> Graph {
     let mut edges: Vec<[usize; 2]> = (1..=6).map(|v| [0, v]).collect();
@@ -280,6 +234,9 @@ fn first_vertex_measure_matches_block_average_on_both_paths() {
 #[test]
 fn second_vertex_measure_matches_conditional_closed_form_on_both_paths() {
     let graph = tie_graph();
+    // Blocks without conditioned members followed by eligible ones: the index
+    // path adds their +0.0 shares and overwrites their entries.
+    let mut skipped = 0;
     for seed in [4, 5] {
         let state = random_state(&graph, seed);
         let side = state.partition();
@@ -291,19 +248,18 @@ fn second_vertex_measure_matches_conditional_closed_form_on_both_paths() {
                 .unwrap();
             let (order, blocks) = naive_blocks(&values, side);
             for tau in [0.0, 0.5, 1.5, 3.0] {
-                let [mut indexed, mut sorted] =
-                    both_paths(&spec, &graph, &state, Neighborhood::Swap, tau);
+                let [indexed, sorted] = both_paths(&spec, &graph, &state, Neighborhood::Swap, tau);
                 for o in [false, true] {
-                    let total = indexed.conditional_blocks(&state, o).unwrap();
-                    assert_eq!(
-                        total.to_bits(),
-                        sorted.conditional_blocks(&state, o).unwrap().to_bits()
-                    );
+                    let (indexed_blocks, total) = indexed.conditional_blocks(&state, o).unwrap();
+                    let (sorted_blocks, sorted_total) =
+                        sorted.conditional_blocks(&state, o).unwrap();
+                    assert_eq!(total.to_bits(), sorted_total.to_bits());
                     assert!(total > 0.0);
                     // Bits of every share and of T, with the contract's operation order.
                     let cum = &indexed.cum;
                     let mut literal = 0.0;
                     let mut shares = Vec::new();
+                    let mut pending = 0;
                     for &(s, e) in &blocks {
                         let c_o = order[s..e].iter().filter(|&&v| side[v] == o).count();
                         if c_o > 0 {
@@ -312,12 +268,15 @@ fn second_vertex_measure_matches_conditional_closed_form_on_both_paths() {
                             let x = w * c_o as f64 / (e - s) as f64;
                             literal += x;
                             shares.push((w.to_bits(), x.to_bits()));
+                            skipped += pending;
+                            pending = 0;
+                        } else {
+                            pending += 1;
                         }
                     }
                     assert_eq!(total.to_bits(), literal.to_bits());
-                    for eo in [&indexed, &sorted] {
-                        let actual: Vec<_> = eo
-                            .eligible
+                    for eligible in [&indexed_blocks, &sorted_blocks] {
+                        let actual: Vec<_> = eligible
                             .iter()
                             .map(|b| (b.weight.to_bits(), b.share.to_bits()))
                             .collect();
@@ -326,8 +285,8 @@ fn second_vertex_measure_matches_conditional_closed_form_on_both_paths() {
                     let mut counts = vec![0; graph.node_count()];
                     for k in 0..GRID {
                         let u2 = grid(k);
-                        let v = indexed.second(&state, o, total, u2);
-                        assert_eq!(v, sorted.second(&state, o, total, u2));
+                        let v = indexed.second(&state, &indexed_blocks, o, total, u2);
+                        assert_eq!(v, sorted.second(&state, &sorted_blocks, o, total, u2));
                         assert_eq!(side[v], o);
                         counts[v] += 1;
                     }
@@ -347,6 +306,10 @@ fn second_vertex_measure_matches_conditional_closed_form_on_both_paths() {
             }
         }
     }
+    assert!(
+        skipped > 0,
+        "the fixture skips blocks between eligible ones"
+    );
 }
 
 #[test]
@@ -355,7 +318,7 @@ fn exact_boundary_draws_select_the_upper_rank_and_block() {
     // puts 1 (B) and 0 (A) in block 0, isolated 2 (B) and 3 (A) in block 1.
     let graph = Graph::from_edges(4, vec![[0, 1]]).unwrap();
     let state = PartitionState::new(&graph, vec![true, false, false, true]).unwrap();
-    for mut eo in both_paths(
+    for eo in both_paths(
         &FitnessSpec::default(),
         &graph,
         &state,
@@ -369,10 +332,14 @@ fn exact_boundary_draws_select_the_upper_rank_and_block() {
         }
         // Both blocks share 1/4 per side; `target == next` moves to the next block.
         for (o, members) in [(false, [1, 2]), (true, [0, 3])] {
-            let total = eo.conditional_blocks(&state, o).unwrap();
+            let (eligible, total) = eo.conditional_blocks(&state, o).unwrap();
             assert_eq!(total, 0.5);
             for (u2, v) in [(0.0, members[0]), (0.5, members[1]), (0.999, members[1])] {
-                assert_eq!(eo.second(&state, o, total, u2), v, "o={o} u2={u2}");
+                assert_eq!(
+                    eo.second(&state, &eligible, o, total, u2),
+                    v,
+                    "o={o} u2={u2}"
+                );
             }
         }
     }
@@ -394,7 +361,7 @@ fn fallback_fixture() -> (Graph, PartitionState) {
 #[test]
 fn huge_tau_falls_back_to_lowest_opposite_block_without_nan() {
     let (graph, state) = fallback_fixture();
-    for [mut indexed, mut sorted] in [
+    for [mut indexed, sorted] in [
         both_paths(
             &FitnessSpec::default(),
             &graph,
@@ -415,13 +382,17 @@ fn huge_tau_falls_back_to_lowest_opposite_block_without_nan() {
             assert_eq!(sorted.first(&state, grid(k)), 0);
         }
         // Every group-B block has zero weight, so T underflows to exactly zero.
-        let total = indexed.conditional_blocks(&state, false).unwrap();
+        let (indexed_blocks, total) = indexed.conditional_blocks(&state, false).unwrap();
         assert_eq!(total.to_bits(), 0.0f64.to_bits());
-        assert_eq!(sorted.conditional_blocks(&state, false).unwrap(), 0.0);
+        let (sorted_blocks, sorted_total) = sorted.conditional_blocks(&state, false).unwrap();
+        assert_eq!(sorted_total, 0.0);
         let mut counts = [0usize; 12];
         for k in 0..GRID {
-            let v = indexed.second(&state, false, total, grid(k));
-            assert_eq!(v, sorted.second(&state, false, total, grid(k)));
+            let v = indexed.second(&state, &indexed_blocks, false, total, grid(k));
+            assert_eq!(
+                v,
+                sorted.second(&state, &sorted_blocks, false, total, grid(k))
+            );
             counts[v] += 1;
         }
         assert_eq!(counts[1], GRID / 2);
@@ -446,7 +417,7 @@ fn huge_tau_falls_back_to_lowest_opposite_block_without_nan() {
     // block shares equally, so T = 2/4 and each B member gets half of it.
     let graph = Graph::from_edges(4, vec![]).unwrap();
     let state = PartitionState::new(&graph, vec![true, true, false, false]).unwrap();
-    for mut eo in both_paths(
+    for eo in both_paths(
         &FitnessSpec::default(),
         &graph,
         &state,
@@ -456,10 +427,10 @@ fn huge_tau_falls_back_to_lowest_opposite_block_without_nan() {
         for (u, v) in [(0.1, 2), (0.3, 3), (0.6, 0), (0.9, 1)] {
             assert_eq!(eo.first(&state, u), v);
         }
-        let total = eo.conditional_blocks(&state, false).unwrap();
+        let (eligible, total) = eo.conditional_blocks(&state, false).unwrap();
         assert_eq!(total, 0.5);
-        assert_eq!(eo.second(&state, false, total, 0.25), 2);
-        assert_eq!(eo.second(&state, false, total, 0.75), 3);
+        assert_eq!(eo.second(&state, &eligible, false, total, 0.25), 2);
+        assert_eq!(eo.second(&state, &eligible, false, total, 0.75), 3);
     }
 }
 
@@ -626,16 +597,24 @@ fn canonical_keys_order_like_partial_cmp_then_side_then_vertex() {
     }
 }
 
+/// Members of `cell` in ascending order, read bit by bit from its bitset.
+fn cell_members(ranking: Ranking<'_>, cell: usize) -> Vec<usize> {
+    let words = &ranking.bits[cell * ranking.words..(cell + 1) * ranking.words];
+    let mut members = Vec::new();
+    for (w, &word) in words.iter().enumerate().filter(|&(_, &word)| word != 0) {
+        members.extend((0..64).filter(|&b| word >> b & 1 == 1).map(|b| 64 * w + b));
+    }
+    members
+}
+
 /// Canonical order and blocks represented by one ranking.
-fn ranking_order(ranking: &Ranking) -> (Vec<usize>, Vec<(usize, usize)>) {
+fn ranking_order(ranking: Ranking<'_>) -> (Vec<usize>, Vec<(usize, usize)>) {
     let mut order = Vec::new();
     let mut blocks = Vec::new();
-    for bucket in 0..ranking.counts.len() {
+    for bucket in 0..GROUP * ranking.groups.len() {
         let start = order.len();
-        for side in 0..2 {
-            let members = &ranking.members[2 * bucket + side];
-            order.extend((0..members.len()).map(|rank| members.select(rank)));
-        }
+        order.extend(cell_members(ranking, 2 * bucket));
+        order.extend(cell_members(ranking, 2 * bucket + 1));
         if order.len() > start {
             blocks.push((start, order.len()));
         }
@@ -663,7 +642,7 @@ fn assert_rankings_match_values(
         "current state of {spec:?}"
     );
     for (relation, &ranking) in index.ranking_of_state.iter().enumerate() {
-        if index.rankings.len() == 1 && relation != 2 && kind.depends_on_majority() {
+        if index.rankings.count() == 1 && relation != 2 && kind.depends_on_majority() {
             continue; // Swap keeps only the size state of its initial partition (balanced for valid runs).
         }
         // Majority by the size relation: A larger, B larger, equal.
@@ -678,28 +657,75 @@ fn assert_rankings_match_values(
             })
             .collect();
         assert_eq!(
-            ranking_order(&index.rankings[ranking]),
+            ranking_order(index.rankings.get(ranking)),
             naive_blocks(&values, side),
             "size relation {relation} of {spec:?}"
         );
     }
-    for ranking in &index.rankings {
-        let mut start = 0;
-        for (bucket, count) in ranking.counts.iter().enumerate() {
-            for (side, &side_count) in count.iter().enumerate() {
-                let members = &ranking.members[2 * bucket + side];
-                assert_eq!(members.len(), side_count as usize);
-                assert!(
-                    (1..members.len()).all(|rank| members.select(rank - 1) < members.select(rank))
-                );
+    for r in 0..index.rankings.count() {
+        assert_ranking_structures(index.rankings.get(r), graph.node_count());
+    }
+}
+
+/// Check the bucket-level structures and the member selection of `ranking`
+/// against naive scans of its cell bitsets: `select` and `member` against the
+/// ascending member lists, `locate` on every position against a prefix scan of
+/// the bucket sizes, the non-empty iteration against a full scan, and the
+/// group totals and flags against the bucket sizes.
+fn assert_ranking_structures(ranking: Ranking<'_>, n: usize) {
+    let buckets = GROUP * ranking.groups.len();
+    assert_eq!(ranking.bits.len(), 2 * buckets * ranking.words);
+    let mut start = 0;
+    let mut nonempty = Vec::new();
+    for bucket in 0..buckets {
+        let low = cell_members(ranking, 2 * bucket);
+        let high = cell_members(ranking, 2 * bucket + 1);
+        for (side, members) in [&low, &high].into_iter().enumerate() {
+            let cell = 2 * bucket + side;
+            assert_eq!(members.len(), ranking.counts(bucket)[side] as usize);
+            for (k, &v) in members.iter().enumerate() {
+                assert_eq!(ranking.select(cell, k), v, "cell {cell} rank {k}");
             }
-            let size = ranking.size(bucket);
-            for position in start..start + size {
-                assert_eq!(ranking.locate(position), (bucket, start));
-            }
-            start += size;
         }
-        assert_eq!(start, graph.node_count());
+        let block: Vec<usize> = low.iter().chain(&high).copied().collect();
+        assert_eq!(ranking.size(bucket), block.len());
+        for (offset, &v) in block.iter().enumerate() {
+            assert_eq!(ranking.member(bucket, offset), v);
+            let position = start + offset;
+            assert_eq!(
+                ranking.locate(position),
+                (bucket, start),
+                "position {position}"
+            );
+        }
+        if !block.is_empty() {
+            nonempty.push(bucket);
+        }
+        start += block.len();
+    }
+    assert_eq!(start, n);
+    let mut visited = Vec::new();
+    ranking.for_each_nonempty(|bucket, counts| {
+        assert_eq!(counts, ranking.counts(bucket), "bucket {bucket}");
+        visited.push(bucket);
+    });
+    assert_eq!(visited, nonempty, "non-empty buckets");
+    for (g, group) in ranking.groups.iter().enumerate() {
+        let sizes: Vec<usize> = (GROUP * g..GROUP * (g + 1))
+            .map(|bucket| ranking.size(bucket))
+            .collect();
+        assert_eq!(
+            group.size as usize,
+            sizes.iter().sum::<usize>(),
+            "group {g}"
+        );
+        for (b, &size) in sizes.iter().enumerate() {
+            assert_eq!(
+                group.nonempty >> b & 1 == 1,
+                size > 0,
+                "group {g} bucket {b}"
+            );
+        }
     }
 }
 
@@ -761,12 +787,108 @@ fn index_matches_rebuild_and_direct_values_after_random_moves() {
                 let Ranker::Index(index) = &eo.ranker else {
                     unreachable!()
                 };
-                assert_eq!(index.rankings.len(), expected_rankings);
+                assert_eq!(index.rankings.count(), expected_rankings);
                 assert_rankings_match_values(index, &spec, &graph, &state);
             }
             if neighborhood == Neighborhood::Flip {
                 assert_eq!(visited, [true; 3], "{spec:?} crossed every size state");
             }
+        }
+    }
+}
+
+/// Random relocations of `n` vertices among the keys of `slot_value`, ranked
+/// in the `R` size states `relations`; see
+/// [`ranking_structures_match_naive_scans_after_random_relocations`].
+fn assert_random_relocations<const R: usize>(
+    kind: BuiltinFitness,
+    slot_value: &[f64],
+    relations: [usize; R],
+    n: usize,
+    rng: &mut Mt19937GenRand64,
+) {
+    let slots = slot_value.len();
+    let keys = 2 * slots as u32;
+    let majority = relations.map(majority_flags);
+    let naive = |key_of: &[u32], flags: [bool; 2]| {
+        let values: Vec<f64> = key_of
+            .iter()
+            .map(|&key| {
+                let key = key as usize;
+                kind.lambda(slot_value[key % slots], flags[key / slots])
+            })
+            .collect();
+        let side: Vec<bool> = key_of.iter().map(|&key| key >= slots as u32).collect();
+        naive_blocks(&values, &side)
+    };
+    // A few popular keys keep most buckets empty and a few crowded.
+    let popular: Vec<u32> = (0..6).map(|_| rng.gen_range(0..keys)).collect();
+    let draw = |rng: &mut Mt19937GenRand64| {
+        if rng.gen_bool(0.7) {
+            popular[rng.gen_range(0..popular.len())]
+        } else {
+            rng.gen_range(0..keys)
+        }
+    };
+    let mut key_of: Vec<u32> = (0..n).map(|_| draw(rng)).collect();
+    let mut rankings = Rankings::new(kind, slot_value, &majority, &key_of).unwrap();
+    assert_eq!(rankings.count(), R);
+    for step in 0..=100 {
+        if step > 0 {
+            let v = rng.gen_range(0..n);
+            let key = draw(rng);
+            rankings.relocate::<R>(v, key_of[v] as usize, key as usize);
+            key_of[v] = key;
+        }
+        let context = format!("{kind:?} n={n} relations {relations:?} step {step}");
+        for (r, &flags) in majority.iter().enumerate() {
+            let ranking = rankings.get(r);
+            assert_eq!(ranking_order(ranking), naive(&key_of, flags), "{context}");
+            assert_ranking_structures(ranking, n);
+        }
+        assert!(
+            rankings == Rankings::new(kind, slot_value, &majority, &key_of).unwrap(),
+            "{context}"
+        );
+    }
+}
+
+/// Random relocations on synthetic rankings with up to 300 buckets (five
+/// groups, the last one partly padding), most of them empty: the membership
+/// and blocks equal the canonical order computed from the values, the
+/// structures pass the naive scans of [`assert_ranking_structures`], and the
+/// rankings equal a rebuild after every move. `alpha = 0` and `beta = 0` map
+/// many keys to one cell, so some moves keep their cell in some rankings.
+#[test]
+fn ranking_structures_match_naive_scans_after_random_relocations() {
+    let kinds = [
+        BuiltinFitness::Default,
+        BuiltinFitness::Multiplicative { alpha: 0.5 },
+        BuiltinFitness::Multiplicative { alpha: 0.0 },
+        BuiltinFitness::Additive { beta: 3.0 },
+        BuiltinFitness::Additive { beta: 0.0 },
+    ];
+    let slot_value: Vec<f64> = (0..150).map(|i| i as f64 / 149.0).collect();
+    let mut rng = Mt19937GenRand64::new(0x5e1ec7);
+    for n in [1, 63, 64, 65, 200] {
+        for kind in kinds {
+            for relation in 0..SIZE_STATES {
+                assert_random_relocations(kind, &slot_value, [relation], n, &mut rng);
+            }
+            assert_random_relocations(kind, &slot_value, [0, 1, 2], n, &mut rng);
+        }
+    }
+}
+#[test]
+fn select_in_word_finds_every_set_bit() {
+    let mut rng = Mt19937GenRand64::new(0xb175);
+    let mut words = vec![1, 1 << 63, u64::MAX, 0x8000_0000_0000_0001, 0x5555 << 30];
+    words.extend((0..300).map(|_| rng.r#gen::<u64>() & rng.r#gen::<u64>()));
+    words.extend((0..300).map(|_| rng.r#gen::<u64>() | rng.r#gen::<u64>()));
+    for word in words {
+        let bits: Vec<usize> = (0..64).filter(|&b| word >> b & 1 == 1).collect();
+        for (k, &b) in bits.iter().enumerate() {
+            assert_eq!(select_in_word(word, k), b, "{word:#x} k={k}");
         }
     }
 }
@@ -836,7 +958,7 @@ fn selection_thresholds_match_the_reference_on_the_whole_draw_grid() {
                     for (p, &v) in order.iter().enumerate() {
                         position[v] = p;
                     }
-                    let mut eo = Eo::new(
+                    let eo = Eo::new(
                         EngineFitness::Builtin(builtin_kind(&spec)),
                         &graph,
                         &state,
@@ -866,10 +988,11 @@ fn selection_thresholds_match_the_reference_on_the_whole_draw_grid() {
                         for (r, &v) in members.iter().enumerate() {
                             rank[v] = r;
                         }
-                        let total = eo.conditional_blocks(&state, o).unwrap();
+                        let (production_blocks, total) = eo.conditional_blocks(&state, o).unwrap();
                         let eligible =
                             eo_v2_reference::eligible_blocks(&order, &blocks, &cum, side, o);
-                        let production = |k: u64| rank[eo.second(&state, o, total, u_at(k))];
+                        let production =
+                            |k: u64| rank[eo.second(&state, &production_blocks, o, total, u_at(k))];
                         let reference = |k: u64| {
                             rank[eo_v2_reference::second_from(&eligible, &order, side, o, u_at(k))]
                         };

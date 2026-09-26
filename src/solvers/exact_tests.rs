@@ -5,6 +5,17 @@ use crate::experiment::config::{
 use rand::Rng;
 use std::sync::Arc;
 
+// Frozen copy of the smoothing module (`crate::smoothing`, non-test code) at
+// e4b6a1c. The frozen engine and runner import it instead of the live module,
+// so they stay an independent oracle when production smoothing is optimized.
+#[allow(clippy::too_many_arguments)]
+mod smoothing_e4b6a1c {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/solvers/test_reference/smoothing_e4b6a1c.rs"
+    ));
+}
+
 // Executable oracle for SA, HC, smoothing and the runner: production engine at
 // 51577f9, with Graph getter adapters. EO changed intentionally in algorithm v2
 // and is compared with `eo_v2` below instead.
@@ -25,6 +36,11 @@ mod reference {
                 (0..count).map(|_| tie.r#gen()).collect(),
                 (0..count).map(|_| smooth.r#gen()).collect(),
             )
+        }
+
+        /// The select, tie and smoothing streams, for exact state comparison.
+        pub(super) fn rngs(&self) -> [&Mt19937GenRand64; 3] {
+            [&self.select_rng, &self.tie_rng, &self.smooth_rng]
         }
     }
 
@@ -778,27 +794,37 @@ fn eo_cancellation_consumes_selection_draws_and_changes_nothing_else() {
     }
 }
 
+/// The Metropolis rule of real-objective SA through the memo of
+/// `(-delta / t).exp()`: improvements and temperature zero draw nothing, every
+/// other judgement draws exactly once, and the threshold has the bits of the
+/// expression on misses, hits, signed zeros, keys sharing a memo slot and
+/// underflow. The memo is fixed to the job's temperature, so each temperature
+/// has its own engine.
 #[test]
-fn sa_exp_cache_preserves_rng_shortcuts_bits_and_collisions() {
+fn sa_metropolis_memo_preserves_rng_shortcuts_bits_and_collisions() {
     let g = graph();
-    let c = condition(
-        Neighborhood::Flip,
-        SolverSpec::Sa {
-            temperature: 1.0,
-            smoothing: SmoothingSpec::None,
-        },
-        0.05,
-    );
     let cancel = CancellationToken::new();
     let registry = FitnessRegistry::default_registry();
-    let mut engine = Engine::new(&g, &c, 123, &registry, &cancel).unwrap();
-
+    let conditions = [1.0, 0.0, f64::MIN_POSITIVE].map(|temperature| {
+        condition(
+            Neighborhood::Flip,
+            SolverSpec::Sa {
+                temperature,
+                smoothing: SmoothingSpec::None,
+            },
+            0.05,
+        )
+    });
+    let [warm, cold, tiny] = &conditions;
+    let mut engine = Engine::new(&g, warm, 123, &registry, &cancel).unwrap();
     let untouched = engine.select_rng.clone();
     assert!(engine.sa_accept(-1.0, 1.0));
     assert!(engine.select_rng == untouched, "improvement must not draw");
-    assert!(!engine.sa_accept(1.0, 0.0));
+    let mut frozen = Engine::new(&g, cold, 123, &registry, &cancel).unwrap();
+    let untouched = frozen.select_rng.clone();
+    assert!(!frozen.sa_accept(1.0, 0.0));
     assert!(
-        engine.select_rng == untouched,
+        frozen.select_rng == untouched,
         "temperature zero must not draw"
     );
 
@@ -811,36 +837,169 @@ fn sa_exp_cache_preserves_rng_shortcuts_bits_and_collisions() {
         threshold
     };
 
-    let tiny = check(&mut engine, f64::MIN_POSITIVE, f64::MIN_POSITIVE);
-    assert_eq!(tiny.to_bits(), (-1.0f64).exp().to_bits());
-
-    for zero in [0.0, -0.0] {
-        let threshold = check(&mut engine, zero, 1.0);
-        let stored = engine
-            .sa_exp_cache
-            .iter()
-            .flatten()
-            .find(|(key, _)| *key == zero.to_bits())
-            .expect("each signed-zero bit pattern has an exact cache tag");
-        assert_eq!(stored.1.to_bits(), threshold.to_bits());
-    }
-    check(&mut engine, 0.0, 1.0); // exact-tag hit, with one draw as before
-
-    // Integer deltas 15 and 79 map to the same slot with the production mix.
-    // Replacing either tag must only turn the next lookup into an exact miss.
-    const COLLISION_SLOT: usize = 202;
-    for delta in [15.0, 15.0, 79.0, 15.0] {
-        let threshold = check(&mut engine, delta, 1.0);
-        let (tag, stored) = engine.sa_exp_cache[COLLISION_SLOT].unwrap();
-        assert_eq!(tag, delta.to_bits());
-        assert_eq!(stored.to_bits(), threshold.to_bits());
-    }
-
-    let underflow = check(&mut engine, f64::MAX, f64::MIN_POSITIVE);
+    let mut minute = Engine::new(&g, tiny, 123, &registry, &cancel).unwrap();
+    let threshold = check(&mut minute, f64::MIN_POSITIVE, f64::MIN_POSITIVE);
+    assert_eq!(threshold.to_bits(), (-1.0f64).exp().to_bits());
+    let underflow = check(&mut minute, f64::MAX, f64::MIN_POSITIVE);
     assert_eq!(underflow.to_bits(), 0.0f64.to_bits());
+
+    for zero in [0.0, -0.0, 0.0] {
+        check(&mut engine, zero, 1.0);
+    }
+    // Two integer deltas in one memo slot: replacing either key only turns
+    // the next lookup into an exact miss.
+    let slot = |x: f64| crate::solvers::metropolis::slot(x.to_bits());
+    let first = 15.0f64;
+    let second = (16..100_000u32)
+        .map(f64::from)
+        .find(|&x| slot(x) == slot(first))
+        .expect("an integer delta sharing the slot of 15");
+    for delta in [first, first, second, first, second, second] {
+        check(&mut engine, delta, 1.0);
+    }
 }
 
 // EO-SA (`eo_sa`): EO proposals judged by the Metropolis rule. Compared with an
 // independent naive reference built on the `eo_v2` selection oracle.
 #[path = "eo_sa_exact_tests.rs"]
 mod eo_sa;
+
+// Smoothing: production `crate::smoothing` compared with the frozen e4b6a1c
+// copy directly and through the frozen engine and runner.
+#[path = "smoothing_exact_tests.rs"]
+mod smoothing_exact;
+
+// Real-objective SA (Metropolis memo, cross-side swap score, specialized step
+// loop) against the frozen engine and runner, and `Engine::advance` against
+// the loop of `Engine::step` calls it replaces in the runner.
+#[path = "sa_exact_tests.rs"]
+mod sa_exact;
+
+// Independent review: non-smoothed HC (none / weighted_average k = 0) against the
+// frozen engine on graphs up to n = 100 and on alphas that bypass run_one
+// validation, including the non-finite search-evaluation error.
+#[test]
+fn hc_real_paths_match_frozen_engine_including_errors() {
+    let registry = FitnessRegistry::default_registry();
+    let reference_registry = frozen_registry();
+    let cancel = CancellationToken::new();
+    let mut rng = Mt19937GenRand64::new(99);
+    let mut graphs = vec![graph(), isolated_graph(), complete_graph(), eo_graph()];
+    for (n, p) in [
+        (2usize, 1.0),
+        (3, 0.5),
+        (20, 0.2),
+        (40, 0.1),
+        (64, 0.08),
+        (100, 0.05),
+    ] {
+        let mut edges = Vec::new();
+        for a in 0..n {
+            for b in a + 1..n {
+                if rng.r#gen::<f64>() < p {
+                    edges.push([a, b]);
+                }
+            }
+        }
+        graphs.push(Graph::from_edges(n, edges).unwrap());
+    }
+    let (mut errors, mut optima, mut steps_total) = (0, 0, 0);
+    for g in &graphs {
+        for neighborhood in [Neighborhood::Flip, Neighborhood::Swap] {
+            if neighborhood == Neighborhood::Swap && g.node_count() % 2 == 1 {
+                continue;
+            }
+            for smoothing in [SmoothingSpec::None, SmoothingSpec::WeightedAverage { k: 0 }] {
+                for alpha in [
+                    0.0,
+                    -0.0,
+                    0.05,
+                    0.125,
+                    1.0,
+                    1e17,
+                    1e300,
+                    1e306,
+                    1e308,
+                    f64::MAX,
+                    -1.0,
+                    -0.05,
+                    f64::INFINITY,
+                    f64::NEG_INFINITY,
+                    f64::NAN,
+                    5e-324,
+                ] {
+                    for seed in [0u64, 1, 2] {
+                        let c = condition_for(
+                            g,
+                            neighborhood,
+                            SolverSpec::Hc {
+                                smoothing: smoothing.clone(),
+                            },
+                            alpha,
+                        );
+                        let mut actual = Engine::new(g, &c, seed, &registry, &cancel).unwrap();
+                        let mut expected =
+                            reference::Engine::new(g, &c, seed, &reference_registry, &cancel)
+                                .unwrap();
+                        for step in 0..100_000 {
+                            let ctx = format!(
+                                "{neighborhood:?} {smoothing:?} a={alpha:e} seed={seed} n={} step={step}",
+                                g.node_count()
+                            );
+                            let a = actual.step(&cancel);
+                            let b = expected.step(&cancel);
+                            assert_eq!(
+                                actual.state.partition(),
+                                expected.state.partition(),
+                                "{ctx}"
+                            );
+                            assert_eq!(
+                                actual.search_evaluation.to_bits(),
+                                expected.search_evaluation.to_bits(),
+                                "{ctx}"
+                            );
+                            assert_eq!(
+                                actual.objective_evaluations, expected.objective_evaluations,
+                                "{ctx}"
+                            );
+                            assert_eq!(actual.applied_moves, expected.applied_moves, "{ctx}");
+                            assert_eq!(rng_probe(&actual, 3), expected.rng_probe(3), "{ctx}");
+                            steps_total += 1;
+                            match (a, b) {
+                                (Ok(x), Ok(y)) => {
+                                    assert_eq!(format!("{x:?}"), format!("{y:?}"), "{ctx}");
+                                    if x != StepStatus::Continue {
+                                        optima += 1;
+                                        break;
+                                    }
+                                }
+                                (Err(x), Err(y)) => {
+                                    assert_eq!(x.to_string(), y.to_string(), "{ctx}");
+                                    errors += 1;
+                                    break;
+                                }
+                                (x, y) => panic!("{ctx}: {x:?} vs {y:?}"),
+                            }
+                        }
+                        assert_eq!(rng_probe(&actual, 624), expected.rng_probe(624));
+                    }
+                }
+            }
+        }
+    }
+    assert!(errors > 0 && optima > 0 && steps_total > errors + optima);
+}
+
+// Independent review of the smoothing speedup: random differential tests against
+// the frozen copy (n up to 3000, under catch_unwind), asynchronous mid-call
+// cancellation followed by reuse, size sequences and parallel threads, checking
+// that the reusable scratch permutation is always restored.
+#[path = "smoothing_review_tests.rs"]
+mod smoothing_review;
+
+// Independent review of the SA step and partition-state speedup: HC and SA
+// runners against the frozen runner at every stop position, cancellation from
+// the observer of `Engine::advance`, memo collisions (including the slot of
+// +0.0) and exhaustive adjacency tests around the matrix cap.
+#[path = "sa_review_tests.rs"]
+mod sa_review;
