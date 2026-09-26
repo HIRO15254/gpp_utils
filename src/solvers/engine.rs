@@ -55,7 +55,9 @@ pub struct Engine<'a> {
     graph: &'a Graph,
     condition: &'a Condition,
     kind: Kind,
-    pub state: PartitionState,
+    /// Changed only by the steps: the HC descent data and the EO index track
+    /// it between steps (read it with [`Self::state`]).
+    state: PartitionState,
     pub search_evaluation: f64,
     select_rng: Mt19937GenRand64,
     tie_rng: Mt19937GenRand64,
@@ -214,6 +216,10 @@ impl<'a> Engine<'a> {
             SolverSpec::Hc { smoothing } | SolverSpec::Sa { smoothing, .. } => smoothing,
             SolverSpec::Eo { .. } | SolverSpec::EoSa { .. } => unreachable!(),
         }
+    }
+    /// The current partition state.
+    pub fn state(&self) -> &PartitionState {
+        &self.state
     }
     pub fn step(&mut self, cancel: &CancellationToken) -> Result<StepStatus> {
         match self.kind {

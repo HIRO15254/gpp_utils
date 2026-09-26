@@ -113,9 +113,9 @@ pub fn run_one(
             ..
         } | SolverSpec::EoSa { .. }
     );
-    let initial = engine.state.partition().to_vec();
+    let initial = engine.state().partition().to_vec();
     let mut best = initial.clone();
-    let mut best_score = engine.state.score(condition.alpha);
+    let mut best_score = engine.state().score(condition.alpha);
     let mut best_step = 0;
     let wanted = checkpoints(&condition.measurement, condition.budget.max_steps);
     let mut next = 0usize;
@@ -159,11 +159,11 @@ pub fn run_one(
             let real = if search_is_real {
                 engine.search_evaluation
             } else {
-                engine.state.score(condition.alpha)
+                engine.state().score(condition.alpha)
             };
             if real < best_score {
                 best_score = real;
-                best.copy_from_slice(engine.state.partition());
+                best.copy_from_slice(engine.state().partition());
                 best_step = completed
             }
         });
@@ -199,7 +199,7 @@ pub fn run_one(
                 termination = RunTermination::Cancelled;
                 raw.push(RawRecord::plain(
                     completed,
-                    engine.state.partition().to_vec(),
+                    engine.state().partition().to_vec(),
                     best.clone(),
                 ));
                 break;
@@ -243,7 +243,7 @@ pub fn run_one(
         if raw.last().map(|x| x.step) != Some(completed) {
             raw.push(RawRecord::plain(
                 completed,
-                engine.state.partition().to_vec(),
+                engine.state().partition().to_vec(),
                 best.clone(),
             ))
         }
@@ -277,7 +277,7 @@ pub fn run_one(
             }
         })
         .collect();
-    let final_solution = intern(engine.state.partition().to_vec());
+    let final_solution = intern(engine.state().partition().to_vec());
     let best_solution = intern(best);
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
     let diagnostics = condition.measurement.diagnostics.then_some(Diagnostics {
@@ -400,7 +400,7 @@ fn record(
             let tb = step.to_le_bytes();
             let mut rng = rng_for(&[hash.as_bytes(), &sb, &tb, b"measurement-smoothing"]);
             current_smoothed = Some(smoothing::evaluate(
-                &e.state,
+                e.state(),
                 graph,
                 c.alpha,
                 c.neighborhood,
@@ -419,7 +419,7 @@ fn record(
         c,
         seed,
         step,
-        &e.state,
+        e.state(),
         smoothing_spec,
         cancel,
         evals,
@@ -428,7 +428,7 @@ fn record(
     *ms += start.elapsed().as_secs_f64() * 1000.0;
     out.push(RawRecord {
         step,
-        current: e.state.partition().to_vec(),
+        current: e.state().partition().to_vec(),
         best: best.to_vec(),
         current_smoothed,
         search_evaluation,

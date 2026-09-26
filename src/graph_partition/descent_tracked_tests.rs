@@ -734,7 +734,7 @@ fn hc_engine_matches_the_frozen_engine_on_larger_graphs() {
                         let a = actual.step(&cancel);
                         let b = expected.step(&cancel);
                         assert_eq!(
-                            actual.state.partition(),
+                            actual.state().partition(),
                             expected.state.partition(),
                             "{context}"
                         );
