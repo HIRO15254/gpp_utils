@@ -732,3 +732,46 @@ fn eo_sa_runner_reports_reference_trajectory_and_counters() {
     // replace it.
     assert!(later_ties && worse_final);
 }
+
+/// Independent review of the EO index under EO-SA (rejected moves leave the
+/// index unchanged): the multi-group graph of
+/// `review_eo_v2_index_matches_reference_on_a_multi_group_graph` and a random
+/// graph with 200 vertices, with dense and with pooled cell bitsets; longer
+/// runs in the release regression.
+#[test]
+fn review_eo_sa_index_matches_reference_on_large_graphs() {
+    let registry = FitnessRegistry::default_registry();
+    let steps = if cfg!(debug_assertions) { 40 } else { 250 };
+    let random = GraphSpec {
+        kind: GraphKind::Random,
+        node_count: 200,
+        expected_degree: 20.0,
+        seed: 1,
+    };
+    let graphs = [
+        review_spread_graph(130, 129, 3),
+        Graph::generate(&random, &CancellationToken::new()).unwrap(),
+    ];
+    let mut tally = Tally::default();
+    for g in &graphs {
+        for pooled in [false, true] {
+            crate::solvers::eo::with_layout(pooled, || {
+                for spec in review_index_specs() {
+                    for neighborhood in [Neighborhood::Flip, Neighborhood::Swap] {
+                        for temperature in [0.0, 0.5] {
+                            let c =
+                                eo_sa_condition(g, neighborhood, 1.5, temperature, spec.clone());
+                            let t =
+                                assert_eo_sa_matches_reference(g, &c, 3, steps, &registry, true);
+                            tally.add(&t);
+                        }
+                    }
+                }
+            });
+        }
+    }
+    assert!(
+        tally.improvements > 0 && tally.frozen > 0 && tally.uphill_rejected > 0,
+        "{tally:?}"
+    );
+}

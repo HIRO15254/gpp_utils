@@ -597,9 +597,14 @@ fn canonical_keys_order_like_partial_cmp_then_side_then_vertex() {
     }
 }
 
-/// Members of `cell` in ascending order, read bit by bit from its bitset.
+/// Members of `cell` in ascending order, read bit by bit from its bitset (an
+/// empty cell may not hold a slot; `Rankings::assert_pool_consistent` checks
+/// that no other bits are set).
 fn cell_members(ranking: Ranking<'_>, cell: usize) -> Vec<usize> {
-    let words = &ranking.bits[cell * ranking.words..(cell + 1) * ranking.words];
+    if ranking.counts(cell / 2)[cell % 2] == 0 {
+        return Vec::new();
+    }
+    let words = ranking.members(cell);
     let mut members = Vec::new();
     for (w, &word) in words.iter().enumerate().filter(|&(_, &word)| word != 0) {
         members.extend((0..64).filter(|&b| word >> b & 1 == 1).map(|b| 64 * w + b));
@@ -674,7 +679,6 @@ fn assert_rankings_match_values(
 /// group totals and flags against the bucket sizes.
 fn assert_ranking_structures(ranking: Ranking<'_>, n: usize) {
     let buckets = GROUP * ranking.groups.len();
-    assert_eq!(ranking.bits.len(), 2 * buckets * ranking.words);
     let mut start = 0;
     let mut nonempty = Vec::new();
     for bucket in 0..buckets {
@@ -731,6 +735,11 @@ fn assert_ranking_structures(ranking: Ranking<'_>, n: usize) {
 
 #[test]
 fn index_matches_rebuild_and_direct_values_after_random_moves() {
+    with_layout(false, || assert_index_matches_after_random_moves(1500));
+    with_layout(true, || assert_index_matches_after_random_moves(400));
+}
+
+fn assert_index_matches_after_random_moves(moves: usize) {
     let graph = tie_graph();
     let n = graph.node_count();
     for spec in builtin_specs() {
@@ -753,12 +762,16 @@ fn index_matches_rebuild_and_direct_values_after_random_moves() {
                 &mut count,
             )
             .unwrap();
+            assert_eq!(
+                eo.is_pooled(),
+                FORCE_POOLED.with(std::cell::Cell::get).unwrap()
+            );
             let expected_rankings = match neighborhood {
                 Neighborhood::Flip if kind.depends_on_majority() => 3,
                 _ => 1,
             };
             let mut visited = [false; 3];
-            for _ in 0..1500 {
+            for _ in 0..moves {
                 let mv = match neighborhood {
                     Neighborhood::Flip => Move::Flip(rng.gen_range(0..n)),
                     Neighborhood::Swap => {
@@ -797,14 +810,16 @@ fn index_matches_rebuild_and_direct_values_after_random_moves() {
     }
 }
 
-/// Random relocations of `n` vertices among the keys of `slot_value`, ranked
-/// in the `R` size states `relations`; see
+/// `moves` random relocations of `n` vertices among the keys of
+/// `slot_value`, ranked in the `R` size states `relations` (in the bitset
+/// layout of the thread, see [`with_layout`]); see
 /// [`ranking_structures_match_naive_scans_after_random_relocations`].
 fn assert_random_relocations<const R: usize>(
     kind: BuiltinFitness,
     slot_value: &[f64],
     relations: [usize; R],
     n: usize,
+    moves: usize,
     rng: &mut Mt19937GenRand64,
 ) {
     let slots = slot_value.len();
@@ -830,26 +845,37 @@ fn assert_random_relocations<const R: usize>(
             rng.gen_range(0..keys)
         }
     };
+    let build = |key_of: &[u32]| {
+        let (mut rankings, cells) = Rankings::new(kind, slot_value, &majority, n).unwrap();
+        for (v, &key) in key_of.iter().enumerate() {
+            for &cell in &cells[key as usize * R..(key as usize + 1) * R] {
+                rankings.insert(v, cell);
+            }
+        }
+        (rankings, cells)
+    };
     let mut key_of: Vec<u32> = (0..n).map(|_| draw(rng)).collect();
-    let mut rankings = Rankings::new(kind, slot_value, &majority, &key_of).unwrap();
+    let (mut rankings, cells) = build(&key_of);
+    let row = |key: u32| -> [u32; R] { std::array::from_fn(|r| cells[key as usize * R + r]) };
     assert_eq!(rankings.count(), R);
-    for step in 0..=100 {
+    for step in 0..=moves {
         if step > 0 {
             let v = rng.gen_range(0..n);
             let key = draw(rng);
-            rankings.relocate::<R>(v, key_of[v] as usize, key as usize);
+            rankings.relocate_one(v, row(key_of[v]), row(key));
             key_of[v] = key;
         }
-        let context = format!("{kind:?} n={n} relations {relations:?} step {step}");
+        let context = format!(
+            "{kind:?} n={n} relations {relations:?} pooled {} step {step}",
+            rankings.pool.pooled
+        );
         for (r, &flags) in majority.iter().enumerate() {
             let ranking = rankings.get(r);
             assert_eq!(ranking_order(ranking), naive(&key_of, flags), "{context}");
             assert_ranking_structures(ranking, n);
         }
-        assert!(
-            rankings == Rankings::new(kind, slot_value, &majority, &key_of).unwrap(),
-            "{context}"
-        );
+        rankings.assert_pool_consistent();
+        assert!(rankings == build(&key_of).0, "{context}");
     }
 }
 
@@ -873,12 +899,161 @@ fn ranking_structures_match_naive_scans_after_random_relocations() {
     for n in [1, 63, 64, 65, 200] {
         for kind in kinds {
             for relation in 0..SIZE_STATES {
-                assert_random_relocations(kind, &slot_value, [relation], n, &mut rng);
+                assert_random_relocations(kind, &slot_value, [relation], n, 100, &mut rng);
             }
-            assert_random_relocations(kind, &slot_value, [0, 1, 2], n, &mut rng);
+            assert_random_relocations(kind, &slot_value, [0, 1, 2], n, 100, &mut rng);
         }
     }
 }
+
+/// The same with pooled bitsets: cells take a slot when they gain their first
+/// member and free it with their last one, including in one move (a vertex
+/// alone in its cell moving to an empty cell).
+#[test]
+fn pooled_ranking_structures_match_naive_scans_after_random_relocations() {
+    let kinds = [
+        BuiltinFitness::Default,
+        BuiltinFitness::Multiplicative { alpha: 0.5 },
+        BuiltinFitness::Additive { beta: 0.0 },
+    ];
+    let slot_value: Vec<f64> = (0..150).map(|i| i as f64 / 149.0).collect();
+    let mut rng = Mt19937GenRand64::new(0x5107);
+    with_layout(true, || {
+        for n in [1, 2, 65, 200] {
+            for kind in kinds {
+                assert_random_relocations(kind, &slot_value, [2], n, 100, &mut rng);
+                assert_random_relocations(kind, &slot_value, [0, 1, 2], n, 100, &mut rng);
+            }
+        }
+    });
+}
+
+/// Dense bitsets for the baseline graphs; pooled ones when dense bitsets would
+/// outgrow both 32 MiB and the pooled bound (degrees around 1000 make hundreds
+/// of thousands of buckets). On a graph with many degrees the pooled bitsets
+/// stay within `R * n` bitsets while moves empty and fill cells.
+#[test]
+fn bitset_layout_bounds_memory() {
+    // (vertices, buckets of all rankings, rankings): baseline-sized indexes and
+    // random graphs with n = 2000, d = 200 (28 MiB of dense bitsets).
+    for (n, buckets, count) in [
+        (124, 1152, 3),
+        (500, 1664, 3),
+        (500, 384, 1),
+        (2000, 56_832, 3),
+    ] {
+        assert!(!pooled_layout(buckets, n, count), "{n} {buckets} {count}");
+    }
+    // Random graphs with n = 4000, d = 1000 (595 MiB and 149 MiB dense) and
+    // n = 10000, d = 100 (55 MiB dense, above the pooled bound of 36 MiB).
+    for (n, buckets, count) in [(4000, 613_888, 3), (4000, 153_472, 1), (10_000, 22_720, 3)] {
+        assert!(pooled_layout(buckets, n, count), "{n} {buckets} {count}");
+    }
+    with_layout(true, assert_pooled_bitsets_stay_bounded);
+}
+
+fn assert_pooled_bitsets_stay_bounded() {
+    // Degrees 0 to 150 on 400 vertices.
+    let n = 400;
+    let mut edges = std::collections::BTreeSet::new();
+    for v in 0..n {
+        for k in 1..=v % 151 / 2 {
+            let u = (v + 7 * k) % n;
+            edges.insert([v.min(u), v.max(u)]);
+        }
+    }
+    let graph = Graph::from_edges(n, edges.into_iter().collect()).unwrap();
+    let mut state = random_state(&graph, 11);
+    let spec = spec("multiplicative", serde_json::json!({ "alpha": 0.5 }));
+    let [mut eo, _] = both_paths(&spec, &graph, &state, Neighborhood::Flip, 1.0);
+    let Ranker::Index(index) = &eo.ranker else {
+        unreachable!()
+    };
+    let pool = &index.rankings.pool;
+    let bitset = 8 * pool.words;
+    let dense = 2 * index.rankings.base[3] * bitset;
+    assert!(
+        pool.pooled && dense > 20 * 3 * n * bitset,
+        "{dense} bytes dense"
+    );
+    let mut rng = Mt19937GenRand64::new(5);
+    for step in 0..60 {
+        let mv = eo
+            .select(&graph, &state, Neighborhood::Flip, &mut rng, &mut 0)
+            .unwrap();
+        crate::smoothing::apply(&mut state, &graph, mv);
+        eo.applied(&graph, &state, mv, &mut 0);
+        if step % 20 == 19 {
+            eo.assert_index_consistent(&graph, &state, Neighborhood::Flip);
+        }
+    }
+    let Ranker::Index(index) = &eo.ranker else {
+        unreachable!()
+    };
+    let pool = &index.rankings.pool;
+    assert!(
+        pool.bits.len() * 8 <= 3 * n * bitset,
+        "{} bytes",
+        pool.bits.len() * 8
+    );
+}
+
+/// Independent review: synthetic rankings whose distinct value counts are
+/// exactly 1 to 4 whole groups (no padding) or one bucket off, with `n`
+/// around word boundaries, after every relocation.
+#[test]
+fn review_rankings_with_exact_group_multiples() {
+    let moves = 30;
+    let mut rng = Mt19937GenRand64::new(0x64);
+    for slots in [1usize, 2, 63, 64, 65, 127, 128, 129, 192, 255, 256] {
+        let slot_value: Vec<f64> = (0..slots)
+            .map(|i| {
+                if slots == 1 {
+                    0.5
+                } else {
+                    i as f64 / (slots - 1) as f64
+                }
+            })
+            .collect();
+        for n in [1usize, 2, 63, 64, 65, 128, 129] {
+            // Default: exactly `slots` buckets.
+            assert_random_relocations(
+                BuiltinFitness::Default,
+                &slot_value,
+                [2],
+                n,
+                moves,
+                &mut rng,
+            );
+            // Minority values all round to 1.0: `slots + 1` buckets.
+            assert_random_relocations(
+                BuiltinFitness::Additive { beta: 1.0e-17 },
+                &slot_value,
+                [0, 1, 2],
+                n,
+                moves,
+                &mut rng,
+            );
+            assert_random_relocations(
+                BuiltinFitness::Multiplicative { alpha: 0.5 },
+                &slot_value,
+                [0, 1, 2],
+                n,
+                moves,
+                &mut rng,
+            );
+            assert_random_relocations(
+                BuiltinFitness::Multiplicative { alpha: 5.0e-324 },
+                &slot_value,
+                [1],
+                n,
+                moves,
+                &mut rng,
+            );
+        }
+    }
+}
+
 #[test]
 fn select_in_word_finds_every_set_bit() {
     let mut rng = Mt19937GenRand64::new(0xb175);
@@ -1008,4 +1183,264 @@ fn selection_thresholds_match_the_reference_on_the_whole_draw_grid() {
             }
         }
     }
+}
+
+/// Swaps move every touched vertex at most once, on each path of
+/// `BuiltinIndex::refresh_swap`: two flips when the closed-neighborhood
+/// signatures of `a` and `b` are disjoint, otherwise the marked pass, for
+/// adjacent endpoints, common neighbors, and disjoint neighborhoods whose
+/// signatures collide (`n > 512` folds `v` and `v + 512` onto one bit). The
+/// rows moved are exactly those of the vertices whose cut count or side
+/// changed (common neighbors keep theirs), the index equals a rebuild after
+/// every swap, and the rows match the state (a debug assertion of
+/// `refresh_move`).
+#[test]
+fn swaps_rerank_every_touched_vertex_once_on_every_path() {
+    let n = 700;
+    let mut rng = Mt19937GenRand64::new(0x5a9);
+    let mut edges = std::collections::BTreeSet::new();
+    while edges.len() < 2 * n {
+        let (a, b) = (rng.gen_range(0..n), rng.gen_range(0..n));
+        if a != b {
+            edges.insert([a.min(b), a.max(b)]);
+        }
+    }
+    let graph = Graph::from_edges(n, edges.into_iter().collect()).unwrap();
+    let closed = |v: usize| {
+        let mut set: Vec<usize> = graph.neighbors(v).to_vec();
+        set.push(v);
+        set
+    };
+    let fold = |set: &[usize]| {
+        let mut bits = [0u64; 8];
+        for &u in set {
+            bits[u % 512 / 64] |= 1 << (u % 64);
+        }
+        bits
+    };
+    for spec in [
+        FitnessSpec::default(),
+        spec("additive", serde_json::json!({ "beta": 3.0 })),
+    ] {
+        for pooled in [false, true] {
+            with_layout(pooled, || {
+                let mut partition: Vec<bool> = (0..n).map(|v| v < n / 2).collect();
+                partition.shuffle(&mut rng);
+                let mut state = PartitionState::new(&graph, partition).unwrap();
+                let mut eo = Eo::new(
+                    EngineFitness::Builtin(builtin_kind(&spec)),
+                    &graph,
+                    &state,
+                    Neighborhood::Swap,
+                    1.0,
+                    &mut 0,
+                )
+                .unwrap();
+                // [disjoint, adjacent, common neighbor, colliding signatures]
+                let mut paths = [0; 4];
+                for step in 0..400 {
+                    let side = state.partition().to_vec();
+                    let a = loop {
+                        let a = rng.gen_range(0..n);
+                        if side[a] {
+                            break a;
+                        }
+                    };
+                    let opposite = |v: &usize| !side[*v];
+                    let neighbors = graph.neighbors(a);
+                    let second: Vec<usize> = neighbors
+                        .iter()
+                        .flat_map(|&u| graph.neighbors(u).iter().copied())
+                        .collect();
+                    let partner: Vec<usize> = [a.checked_add(512), a.checked_sub(512)]
+                        .into_iter()
+                        .flatten()
+                        .filter(|&v| v < n)
+                        .collect();
+                    let pick = |list: &[usize], rng: &mut Mt19937GenRand64| {
+                        let list: Vec<usize> = list.iter().copied().filter(opposite).collect();
+                        list.choose(rng).copied()
+                    };
+                    let b = match step % 4 {
+                        1 => pick(neighbors, &mut rng),
+                        2 => pick(&second, &mut rng),
+                        3 => pick(&partner, &mut rng),
+                        _ => None,
+                    }
+                    .unwrap_or_else(|| {
+                        loop {
+                            let b = rng.gen_range(0..n);
+                            if !side[b] {
+                                break b;
+                            }
+                        }
+                    });
+                    let (closed_a, closed_b) = (closed(a), closed(b));
+                    let collide = fold(&closed_a)
+                        .iter()
+                        .zip(&fold(&closed_b))
+                        .any(|(x, y)| x & y != 0);
+                    let adjacent = closed_a.contains(&b);
+                    let common = closed_a.iter().any(|u| *u != a && closed_b.contains(u));
+                    let path = match (collide, adjacent, common) {
+                        (false, ..) => 0,
+                        (true, true, _) => 1,
+                        (true, false, true) => 2,
+                        (true, false, false) => 3,
+                    };
+                    paths[path] += 1;
+                    let mv = Move::Swap(a, b);
+                    let mut touched: Vec<usize> =
+                        closed_a.iter().chain(&closed_b).copied().collect();
+                    touched.sort_unstable();
+                    touched.dedup();
+                    let vertex_state = |state: &PartitionState, u: usize| {
+                        (state.cuts_at()[u], state.partition()[u])
+                    };
+                    let before: Vec<_> = touched.iter().map(|&u| vertex_state(&state, u)).collect();
+                    crate::smoothing::apply(&mut state, &graph, mv);
+                    let changed = touched
+                        .iter()
+                        .zip(&before)
+                        .filter(|&(&u, &old)| vertex_state(&state, u) != old)
+                        .count() as u64;
+                    let mut count = 0;
+                    let moved = MOVED_ROWS.with(std::cell::Cell::get);
+                    eo.applied(&graph, &state, mv, &mut count);
+                    let moved = MOVED_ROWS.with(std::cell::Cell::get) - moved;
+                    assert_eq!(moved, changed, "rows moved by swapping {a} and {b}");
+                    assert_eq!(count, 2 + (graph.degree(a) + graph.degree(b)) as u64);
+                    eo.assert_index_consistent(&graph, &state, Neighborhood::Swap);
+                }
+                assert!(
+                    paths.iter().all(|&p| p > 0),
+                    "{spec:?} pooled {pooled}: {paths:?}"
+                );
+            });
+        }
+    }
+}
+
+/// Independent review (round 2): one relocation pass in which every relocated
+/// vertex leaves a cell that stays non-empty for a cell that was empty, in
+/// every ranking, so the pass takes `R` new pool slots per vertex. The pool
+/// before the pass holds `R * pairs` non-empty cells in as many slots as the
+/// build grew to, so the free stack is below, at and above what passes of
+/// 1 to `pairs` vertices take; the reservation of `Rankings::relocator` must
+/// cover each pass, and it may not grow the pool beyond `min(R * n, cells)`.
+#[test]
+fn review_pool_reserves_a_new_slot_per_relocated_vertex_and_ranking() {
+    fn check<const R: usize>(kind: BuiltinFitness, relations: [usize; R]) {
+        // Distinct values: every key of side `false` has its own cell in
+        // every ranking.
+        let slot_value: Vec<f64> = (0..300).map(|i| i as f64 / 299.0).collect();
+        let majority = relations.map(majority_flags);
+        for pairs in [1usize, 5, 6, 8, 11, 16, 21, 22, 32, 43, 48, 64] {
+            let n = 2 * pairs;
+            for moved in 0..=pairs {
+                let (mut rankings, cells) = Rankings::new(kind, &slot_value, &majority, n).unwrap();
+                let row = |key: usize| -> [u32; R] { std::array::from_fn(|r| cells[key * R + r]) };
+                // Vertices 2i and 2i + 1 share key i; vertex 2i of the first
+                // `moved` pairs moves to the unused key 150 + i.
+                let mut key_of: Vec<usize> = (0..n).map(|v| v / 2).collect();
+                let build = |key_of: &[usize]| {
+                    let (mut rankings, _) = Rankings::new(kind, &slot_value, &majority, n).unwrap();
+                    for (v, &key) in key_of.iter().enumerate() {
+                        for cell in row(key) {
+                            rankings.insert(v, cell);
+                        }
+                    }
+                    rankings
+                };
+                for (v, &key) in key_of.iter().enumerate() {
+                    for cell in row(key) {
+                        rankings.insert(v, cell);
+                    }
+                }
+                let before = rankings.pool.free.len() - 2 - rankings.pool.top;
+                assert_eq!(before, R * pairs);
+                {
+                    let mut relocator = rankings.relocator(moved);
+                    for i in 0..moved {
+                        relocator.relocate::<R, true>(2 * i, row(i), row(150 + i));
+                    }
+                }
+                for i in 0..moved {
+                    key_of[2 * i] = 150 + i;
+                }
+                let context = format!("{kind:?} pairs {pairs} moved {moved}");
+                rankings.assert_pool_consistent();
+                assert_eq!(
+                    rankings.pool.free.len() - 2 - rankings.pool.top,
+                    R * (pairs + moved),
+                    "{context}"
+                );
+                assert!(rankings == build(&key_of), "{context}");
+                // The largest possible reservation stays within the bound.
+                drop(rankings.relocator(n));
+                rankings.assert_pool_consistent();
+            }
+        }
+    }
+    with_layout(true, || {
+        check(BuiltinFitness::Default, [2]);
+        check(BuiltinFitness::Multiplicative { alpha: 0.5 }, [0, 1, 2]);
+    });
+}
+
+/// Independent review (round 2): the layout an index chooses by itself (no
+/// [`with_layout`]): dense for a baseline graph, pooled once majority-dependent
+/// rankings of a random graph with n = 2000 and d = 400 would need about
+/// 89 MiB of dense bitsets, where the pooled bitsets stay within `R * n` and
+/// the index follows a few EO moves exactly.
+#[test]
+fn review_indexes_choose_their_layout_without_override() {
+    use crate::experiment::config::{GraphKind, GraphSpec};
+    use crate::optimization::CancellationToken;
+    let generate = |node_count, expected_degree| {
+        let spec = GraphSpec {
+            kind: GraphKind::Random,
+            node_count,
+            expected_degree,
+            seed: 0,
+        };
+        Graph::generate(&spec, &CancellationToken::new()).unwrap()
+    };
+    let registry = FitnessRegistry::default();
+    let build = |spec: &FitnessSpec, graph: &Graph, state: &PartitionState| {
+        Eo::new(
+            registry.create_engine_fitness(spec).unwrap(),
+            graph,
+            state,
+            Neighborhood::Flip,
+            1.5,
+            &mut 0,
+        )
+        .unwrap()
+    };
+    let baseline = generate(500, 20.0);
+    let state = random_state(&baseline, 2);
+    for spec in builtin_specs() {
+        assert!(!build(&spec, &baseline, &state).is_pooled(), "{spec:?}");
+    }
+    let graph = generate(2000, 400.0);
+    let mut state = random_state(&graph, 3);
+    assert!(!build(&FitnessSpec::default(), &graph, &state).is_pooled());
+    let multiplicative = spec("multiplicative", serde_json::json!({ "alpha": 0.5 }));
+    let mut eo = build(&multiplicative, &graph, &state);
+    assert!(eo.is_pooled());
+    let mut rng = Mt19937GenRand64::new(9);
+    for _ in 0..3 {
+        let mv = eo
+            .select(&graph, &state, Neighborhood::Flip, &mut rng, &mut 0)
+            .unwrap();
+        crate::smoothing::apply(&mut state, &graph, mv);
+        eo.applied(&graph, &state, mv, &mut 0);
+    }
+    eo.assert_index_consistent(&graph, &state, Neighborhood::Flip);
+    let Ranker::Index(index) = &eo.ranker else {
+        unreachable!()
+    };
+    let pool = &index.rankings.pool;
+    assert!(pool.bits.len() <= 3 * 2000 * pool.words);
 }
