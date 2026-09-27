@@ -4,4 +4,5 @@
 
 mod engine;
 mod eo;
-pub(crate) use engine::{Engine, StepStatus};
+mod metropolis;
+pub(crate) use engine::{Advance, Engine, StepStatus};

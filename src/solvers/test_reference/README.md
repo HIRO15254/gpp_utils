@@ -2,7 +2,8 @@
 
 `engine_51577f9.rs` and `runner_51577f9.rs` are copies of the corresponding
 production sources from Git commit `51577f9`. The runner has one test-only
-import rewrite so that it calls the frozen engine. Its original module-level
+import rewrite so that it calls the frozen engine, and both fixtures call the
+frozen smoothing module described in "Smoothing" below. Its original module-level
 Clippy allowances are attached to the adapter module in `../exact_tests.rs`,
 because an inner attribute cannot be retained inside `include!`. The fixtures
 are compiled only by the solver's unit-test module and form an executable
@@ -75,3 +76,40 @@ accepted and rejected uphill draws, rejection without a draw at `T = 0`) is
 taken. The same file checks the limits (`T = 1e300` follows EO given the same
 select stream; `T = 0` and `-0.0` never draw and accept only strict
 improvements), cancellation and the runner's incumbent and diagnostics.
+
+## Smoothing
+
+`smoothing_e4b6a1c.rs` is a copy of the non-test code of
+`src/smoothing/mod.rs` at Git commit `e4b6a1c`, the smoothing that the frozen
+engine and runner called until then. Since `51577f9` that module had changed
+only by the `Graph` getter adapter described above. Its module-level
+`#![allow(clippy::too_many_arguments)]` is attached to the adapter module
+`smoothing_e4b6a1c` in `../exact_tests.rs`, because an inner attribute cannot
+be retained inside `include!`; the copy is otherwise verbatim.
+
+Production smoothing was then optimized without changing results: it no longer
+builds the move list or copies candidate states, replays the partial shuffle
+on a reused identity permutation with the same draws, and computes each score
+from the same integer counts with the same floating-point expression. So that
+the frozen fixtures do not share that code with production, each has one more
+test-only import rewrite, with no other change:
+
+- `engine_51577f9.rs`: `use crate::smoothing;` became
+  `use super::smoothing_e4b6a1c as smoothing;`
+- `runner_51577f9.rs`: `use crate::smoothing;` became
+  `use super::super::smoothing_e4b6a1c as smoothing;`
+
+The rewrite selects the code that the fixtures executed before, so their
+behavior is unchanged. `../smoothing_exact_tests.rs` (a child of
+`../exact_tests.rs`) compares production `smoothing::evaluate` directly with
+this copy: the returned bits or error message, the evaluation count and the
+complete RNG state afterwards, for Flip and Swap, every specification kind
+with `k` in the distance-one and distance-two ranges up to the maximum,
+tie-heavy, degenerate and random graphs up to 500 vertices, many states
+(balanced and unbalanced sides, successive states of a search), alphas
+including both zeros, `1e300`, the smallest normal value, infinity and NaN, a
+missing RNG, a cancelled token and the panics of irregular Swap distance-two
+inputs. It also compares the functions that other modules call unchanged and
+runs the production engine and runner against the frozen ones for every
+smoothing kind. Keep this copy frozen; a change of smoothing results needs a
+new algorithm version, not an update of this oracle.

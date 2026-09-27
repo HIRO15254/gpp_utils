@@ -9,7 +9,7 @@ use crate::experiment::result::{
 use crate::fitness::FitnessRegistry;
 use crate::graph_partition::{Graph, PartitionState};
 use crate::optimization::{CancellationToken, rng_for};
-use crate::smoothing;
+use super::super::smoothing_e4b6a1c as smoothing;
 use rand_mt::Mt19937GenRand64;
 use std::{
     collections::BTreeMap,

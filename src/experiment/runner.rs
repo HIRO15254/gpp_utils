@@ -8,10 +8,10 @@ use crate::experiment::result::{
     SolutionId,
 };
 use crate::fitness::FitnessRegistry;
-use crate::graph_partition::{Graph, PartitionState};
+use crate::graph_partition::{BestImprovement, Graph, Move, NonFinite, PartitionState};
 use crate::optimization::{CancellationToken, rng_for};
 use crate::smoothing;
-use crate::solvers::{Engine, StepStatus};
+use crate::solvers::{Advance, Engine, StepStatus};
 use rand_mt::Mt19937GenRand64;
 use std::{
     collections::BTreeMap,
@@ -113,9 +113,9 @@ pub fn run_one(
             ..
         } | SolverSpec::EoSa { .. }
     );
-    let initial = engine.state.partition().to_vec();
+    let initial = engine.state().partition().to_vec();
     let mut best = initial.clone();
-    let mut best_score = engine.state.score(condition.alpha);
+    let mut best_score = engine.state().score(condition.alpha);
     let mut best_step = 0;
     let wanted = checkpoints(&condition.measurement, condition.budget.max_steps);
     let mut next = 0usize;
@@ -148,29 +148,38 @@ pub fn run_one(
         }
     }
     while completed < condition.budget.max_steps && termination != RunTermination::Cancelled {
-        if cancel.is_cancelled() {
-            termination = RunTermination::Cancelled;
-            break;
-        }
-        let status = match engine.step(cancel) {
-            Ok(x) => x,
-            Err(_error) if cancel.is_cancelled() => {
+        // Per step: stop if cancelled, step, count it and track the best
+        // solution. `record_if_due` records nothing before the next
+        // checkpoint `wanted[next]` (which exists: `max_steps` is one and
+        // `next` is the first checkpoint after `completed`), so it is called
+        // only after that checkpoint's step or a stopping step.
+        let until = wanted[next];
+        debug_assert!(until > completed, "checkpoints increase past {completed}");
+        let advance = engine.advance(until, &mut completed, cancel, |engine, completed| {
+            let real = if search_is_real {
+                engine.search_evaluation
+            } else {
+                engine.state().score(condition.alpha)
+            };
+            if real < best_score {
+                best_score = real;
+                best.copy_from_slice(engine.state().partition());
+                best_step = completed
+            }
+        });
+        let status = match advance {
+            Advance::Reached => StepStatus::Continue,
+            Advance::Stopped(status) => status,
+            Advance::Cancelled => {
                 termination = RunTermination::Cancelled;
                 break;
             }
-            Err(e) => return Err(e),
+            Advance::Failed(_error) if cancel.is_cancelled() => {
+                termination = RunTermination::Cancelled;
+                break;
+            }
+            Advance::Failed(e) => return Err(e),
         };
-        completed += 1;
-        let real = if search_is_real {
-            engine.search_evaluation
-        } else {
-            engine.state.score(condition.alpha)
-        };
-        if real < best_score {
-            best_score = real;
-            best.copy_from_slice(engine.state.partition());
-            best_step = completed
-        }
         if let Err(error) = record_if_due(
             graph,
             condition,
@@ -190,7 +199,7 @@ pub fn run_one(
                 termination = RunTermination::Cancelled;
                 raw.push(RawRecord::plain(
                     completed,
-                    engine.state.partition().to_vec(),
+                    engine.state().partition().to_vec(),
                     best.clone(),
                 ));
                 break;
@@ -234,7 +243,7 @@ pub fn run_one(
         if raw.last().map(|x| x.step) != Some(completed) {
             raw.push(RawRecord::plain(
                 completed,
-                engine.state.partition().to_vec(),
+                engine.state().partition().to_vec(),
                 best.clone(),
             ))
         }
@@ -268,7 +277,7 @@ pub fn run_one(
             }
         })
         .collect();
-    let final_solution = intern(engine.state.partition().to_vec());
+    let final_solution = intern(engine.state().partition().to_vec());
     let best_solution = intern(best);
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
     let diagnostics = condition.measurement.diagnostics.then_some(Diagnostics {
@@ -391,7 +400,7 @@ fn record(
             let tb = step.to_le_bytes();
             let mut rng = rng_for(&[hash.as_bytes(), &sb, &tb, b"measurement-smoothing"]);
             current_smoothed = Some(smoothing::evaluate(
-                &e.state,
+                e.state(),
                 graph,
                 c.alpha,
                 c.neighborhood,
@@ -410,7 +419,7 @@ fn record(
         c,
         seed,
         step,
-        &e.state,
+        e.state(),
         smoothing_spec,
         cancel,
         evals,
@@ -419,7 +428,7 @@ fn record(
     *ms += start.elapsed().as_secs_f64() * 1000.0;
     out.push(RawRecord {
         step,
-        current: e.state.partition().to_vec(),
+        current: e.state().partition().to_vec(),
         best: best.to_vec(),
         current_smoothed,
         search_evaluation,
@@ -538,18 +547,15 @@ fn basin(
     let mut state = start.clone();
     let mut steps = 0;
     let fixed_rng = rng.as_ref().map(|source| (**source).clone());
-    let mut plan_rng = fixed_rng.clone();
-    let fixed_plan = spec
-        .map(|s| smoothing::plan(&state, graph, c.neighborhood, s, plan_rng.as_mut(), cancel))
-        .transpose()?;
     let mut current = if let Some(s) = spec {
-        smoothing::evaluate_with_plan(
+        let mut evaluation_rng = fixed_rng.clone();
+        smoothing::evaluate(
             &state,
             graph,
             c.alpha,
             c.neighborhood,
             s,
-            fixed_plan.as_ref().expect("smoothing plan exists"),
+            evaluation_rng.as_mut(),
             cancel,
             evals,
         )?
@@ -557,51 +563,41 @@ fn basin(
         *evals += 1;
         state.score(c.alpha)
     };
+    // Every real-objective scan of this descent works on data tracked from
+    // `state` and updated with each applied move.
+    let mut real_scan = BestImprovement::new(c.neighborhood, c.alpha, NonFinite::Compare);
+    if spec.is_none() {
+        real_scan.track(graph, &state);
+    }
     let termination = loop {
         if steps >= c.measurement.max_basin_steps {
             break BasinTermination::StepLimit;
         }
         steps += 1;
-        let mut choice = None;
-        let mut best = current;
-        let mut ties = 0u64;
-        let moves = smoothing::MoveSequence::new(&state, c.neighborhood, cancel)?;
-        for (i, mv) in moves.iter().enumerate() {
-            if i & 1023 == 0 {
-                cancel.check()?
-            }
-            let x = if let Some(s) = spec {
-                evaluate_smoothed_candidate_with_undo(
-                    &mut state,
-                    graph,
-                    c.alpha,
-                    c.neighborhood,
-                    s,
-                    fixed_plan.as_ref().expect("smoothing plan exists"),
-                    mv,
-                    cancel,
-                    evals,
-                )?
-            } else {
-                *evals += 1;
-                // Evaluate the same resulting integer cut/size counts without
-                // cloning or applying a move that will usually be discarded.
-                smoothing::move_score(&state, graph, mv, c.alpha)
-            };
-            if x < best {
-                best = x;
-                choice = Some(mv);
-                ties = 1;
-            } else if choice.is_some() && x == best {
-                ties += 1;
-                if rand::Rng::gen_range(tie_rng, 0..ties) == 0 {
-                    choice = Some(mv);
+        let found = match spec {
+            // The same candidates, rule, tie draws and evaluation count as
+            // scoring every move with `smoothing::move_score`.
+            None => real_scan.scan_tracked(graph, &state, current, tie_rng, cancel, evals)?,
+            Some(s) => smoothed_scan(
+                graph,
+                c,
+                &mut state,
+                s,
+                fixed_rng.as_ref(),
+                current,
+                tie_rng,
+                cancel,
+                evals,
+            )?,
+        };
+        match found {
+            Some((mv, best)) => {
+                if spec.is_none() {
+                    // `smoothing::apply` plus the tracked data.
+                    real_scan.apply(graph, &mut state, mv);
+                } else {
+                    smoothing::apply(&mut state, graph, mv);
                 }
-            }
-        }
-        match choice {
-            Some(mv) => {
-                smoothing::apply(&mut state, graph, mv);
                 current = best
             }
             None => break BasinTermination::LocalOptimum,
@@ -620,6 +616,62 @@ fn basin(
     ))
 }
 
+/// One best-improvement scan of [`basin`] on the smoothed objective `spec`:
+/// every move in canonical order, each candidate state evaluated with a fresh
+/// copy of `fixed_rng`. Returns the chosen move and its smoothed value.
+///
+/// Candidates are evaluated in place and undone
+/// ([`evaluate_smoothed_candidate_with_undo`]), so `state` is unchanged when
+/// the scan returns, including by an error.
+fn smoothed_scan(
+    graph: &Graph,
+    c: &Condition,
+    state: &mut PartitionState,
+    spec: &SmoothingSpec,
+    fixed_rng: Option<&Mt19937GenRand64>,
+    current: f64,
+    tie_rng: &mut Mt19937GenRand64,
+    cancel: &CancellationToken,
+    evals: &mut u64,
+) -> Result<Option<(Move, f64)>> {
+    let mut choice = None;
+    let mut best = current;
+    let mut ties = 0u64;
+    for (i, mv) in smoothing::moves_cancellable(state, c.neighborhood, cancel)?
+        .into_iter()
+        .enumerate()
+    {
+        if i & 1023 == 0 {
+            cancel.check()?
+        }
+        let x = evaluate_smoothed_candidate_with_undo(
+            state,
+            graph,
+            c.alpha,
+            c.neighborhood,
+            spec,
+            fixed_rng,
+            mv,
+            cancel,
+            evals,
+        )?;
+        if x < best {
+            best = x;
+            choice = Some(mv);
+            ties = 1;
+        } else if choice.is_some() && x == best {
+            ties += 1;
+            if rand::Rng::gen_range(tie_rng, 0..ties) == 0 {
+                choice = Some(mv);
+            }
+        }
+    }
+    Ok(choice.map(|mv| (mv, best)))
+}
+
+/// The smoothed value of `state` after `mv`, evaluated with a fresh copy of
+/// `fixed_rng`: the same value, draws and evaluation count as evaluating a
+/// modified clone, without copying the state.
 #[allow(clippy::too_many_arguments)]
 fn evaluate_smoothed_candidate_with_undo(
     state: &mut PartitionState,
@@ -627,14 +679,23 @@ fn evaluate_smoothed_candidate_with_undo(
     alpha: f64,
     neighborhood: Neighborhood,
     spec: &SmoothingSpec,
-    plan: &smoothing::SmoothingPlan,
-    mv: crate::graph_partition::Move,
+    fixed_rng: Option<&Mt19937GenRand64>,
+    mv: Move,
     cancel: &CancellationToken,
     evals: &mut u64,
 ) -> Result<f64> {
     smoothing::apply(state, graph, mv);
-    let evaluated =
-        smoothing::evaluate_with_plan(state, graph, alpha, neighborhood, spec, plan, cancel, evals);
+    let mut evaluation_rng = fixed_rng.cloned();
+    let evaluated = smoothing::evaluate(
+        state,
+        graph,
+        alpha,
+        neighborhood,
+        spec,
+        evaluation_rng.as_mut(),
+        cancel,
+        evals,
+    );
     // Every move is its own inverse. Undo before propagating an evaluation
     // error so cancellation leaves the last committed basin state intact.
     smoothing::apply(state, graph, mv);
@@ -661,11 +722,7 @@ mod best_basin_tests {
             let mut state = PartitionState::new(&graph, partition).unwrap();
             let before = state.clone();
             let spec = SmoothingSpec::WeightedAverage { k: 1 };
-            let active = CancellationToken::new();
-            let plan = smoothing::plan(&state, &graph, neighborhood, &spec, None, &active).unwrap();
-            let mv = smoothing::MoveSequence::new(&state, neighborhood, &active)
-                .unwrap()
-                .get(0);
+            let mv = smoothing::moves(&state, neighborhood)[0];
             let cancelled = CancellationToken::new();
             cancelled.cancel();
             let mut evaluations = 0;
@@ -676,7 +733,7 @@ mod best_basin_tests {
                     0.05,
                     neighborhood,
                     &spec,
-                    &plan,
+                    None,
                     mv,
                     &cancelled,
                     &mut evaluations,
