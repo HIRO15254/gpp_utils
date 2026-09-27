@@ -957,6 +957,9 @@ struct Relocator<'a> {
     free: &'a mut [u32],
     top: usize,
     pool_top: &'a mut usize,
+    /// Relocations left of those the pool reserved slots for.
+    #[cfg(debug_assertions)]
+    budget: usize,
 }
 
 impl Drop for Relocator<'_> {
@@ -975,6 +978,14 @@ impl Relocator<'_> {
         old: [u32; R],
         new: [u32; R],
     ) {
+        #[cfg(debug_assertions)]
+        {
+            assert!(
+                self.budget > 0,
+                "more relocations than the pool reserved slots for"
+            );
+            self.budget -= 1;
+        }
         let (word, bit) = (v / 64, 1u64 << (v % 64));
         for r in 0..R {
             let (old_cell, cell) = (old[r], new[r]);
@@ -1160,6 +1171,8 @@ impl Rankings {
             free: &mut self.pool.free,
             top: self.pool.top,
             pool_top: &mut self.pool.top,
+            #[cfg(debug_assertions)]
+            budget: vertices,
         }
     }
 }

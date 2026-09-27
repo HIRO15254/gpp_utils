@@ -1444,3 +1444,135 @@ fn review_indexes_choose_their_layout_without_override() {
     let pool = &index.rankings.pool;
     assert!(pool.bits.len() <= 3 * 2000 * pool.words);
 }
+/// Independent review (round 3): swaps whose endpoints share every neighbor,
+/// with and without the edge between them, isolated endpoints whose
+/// signatures collide (`v` and `v + 512`), an isolated endpoint colliding
+/// with a neighbor of the other one, a pendant edge, and endpoints of very
+/// different degrees with one common neighbor, in both directions and both
+/// layouts: each swap moves exactly the rows whose cut count or side changed,
+/// counts `2 + deg(a) + deg(b)` fitness values and leaves an index equal to a
+/// rebuild.
+#[test]
+fn review_swaps_with_shared_neighborhoods_and_isolated_endpoints() {
+    let n = 1030;
+    let mut edges = vec![
+        // 0 and 1 share their neighbors 2 and 3 and are not adjacent.
+        [0, 2],
+        [0, 3],
+        [1, 2],
+        [1, 3],
+        // 4 and 5 are adjacent and share their neighbors 6 and 7.
+        [4, 5],
+        [4, 6],
+        [4, 7],
+        [5, 6],
+        [5, 7],
+        // 521 (bit 9) has a neighbor; 9 is isolated.
+        [521, 10],
+        // 12 is adjacent to 523 (bit 11); 11 is isolated.
+        [12, 523],
+        // A pendant edge.
+        [13, 14],
+        // 15 has five neighbors, 21 one, 16 is common.
+        [15, 16],
+        [15, 17],
+        [15, 18],
+        [15, 19],
+        [15, 20],
+        [21, 16],
+    ];
+    // A sparse background, so that the fitness values vary.
+    let mut rng = Mt19937GenRand64::new(0x3e3);
+    let mut background = std::collections::BTreeSet::new();
+    while background.len() < 600 {
+        let (a, b) = (rng.gen_range(100..n), rng.gen_range(100..n));
+        if a != b && ![520, 521, 523].contains(&a) && ![520, 521, 523].contains(&b) {
+            background.insert([a.min(b), a.max(b)]);
+        }
+    }
+    edges.extend(background);
+    let graph = Graph::from_edges(n, edges).unwrap();
+    // [a, b] with `a` on side `true` and `b` on side `false`.
+    let pairs = [
+        [0, 1],
+        [4, 5],
+        [8, 520],
+        [9, 521],
+        [11, 12],
+        [13, 14],
+        [15, 21],
+    ];
+    let mut partition = vec![false; n];
+    for [a, _] in pairs {
+        partition[a] = true;
+    }
+    let mut assigned = pairs.len();
+    for (v, side) in partition.iter_mut().enumerate() {
+        if assigned < n / 2 && v >= 100 && !pairs.iter().any(|p| p.contains(&v)) {
+            *side = true;
+            assigned += 1;
+        }
+    }
+    assert_eq!(assigned, n / 2);
+    for spec in [
+        FitnessSpec::default(),
+        spec("additive", serde_json::json!({ "beta": 3.0 })),
+    ] {
+        for pooled in [false, true] {
+            with_layout(pooled, || {
+                let mut state = PartitionState::new(&graph, partition.clone()).unwrap();
+                let mut eo = Eo::new(
+                    EngineFitness::Builtin(builtin_kind(&spec)),
+                    &graph,
+                    &state,
+                    Neighborhood::Swap,
+                    1.0,
+                    &mut 0,
+                )
+                .unwrap();
+                assert_eq!(eo.is_pooled(), pooled);
+                // Each pair forth and back, in both argument orders.
+                for round in 0..4 {
+                    for [a, b] in pairs {
+                        let (a, b) = if round % 2 == 0 { (a, b) } else { (b, a) };
+                        let (a, b) = if round < 2 { (a, b) } else { (b, a) };
+                        assert_ne!(state.partition()[a], state.partition()[b]);
+                        let mut touched: Vec<usize> = [a, b]
+                            .iter()
+                            .flat_map(|&v| {
+                                std::iter::once(v).chain(graph.neighbors(v).iter().copied())
+                            })
+                            .collect();
+                        touched.sort_unstable();
+                        touched.dedup();
+                        let key = |state: &PartitionState, u: usize| {
+                            (state.cuts_at()[u], state.partition()[u])
+                        };
+                        let before: Vec<_> = touched.iter().map(|&u| key(&state, u)).collect();
+                        let mv = Move::Swap(a, b);
+                        crate::smoothing::apply(&mut state, &graph, mv);
+                        let changed = touched
+                            .iter()
+                            .zip(&before)
+                            .filter(|&(&u, &old)| key(&state, u) != old)
+                            .count() as u64;
+                        let mut count = 0;
+                        let moved = MOVED_ROWS.with(std::cell::Cell::get);
+                        eo.applied(&graph, &state, mv, &mut count);
+                        let moved = MOVED_ROWS.with(std::cell::Cell::get) - moved;
+                        let context = format!("{spec:?} pooled {pooled} swap {a} {b}");
+                        assert_eq!(moved, changed, "{context}");
+                        assert_eq!(
+                            count,
+                            2 + (graph.degree(a) + graph.degree(b)) as u64,
+                            "{context}"
+                        );
+                        eo.assert_index_consistent(&graph, &state, Neighborhood::Swap);
+                    }
+                }
+                // Four swaps of each pair restore the partition.
+                assert_eq!(state.partition(), &partition[..]);
+            });
+        }
+    }
+}
